@@ -1,0 +1,20 @@
+[package]
+name = "azimuth-daemon"
+version = "0.1.0"
+edition = "2021"
+authors = ["Azimuth <team@azimuth.day>"]
+description = "Azimuth positioning network daemon — SDR signal observation and submission"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.8"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
