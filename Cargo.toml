@@ -18,3 +18,12 @@ axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
+
+# SDR hardware access
+# NOTE: Linux cross-build may need libusb-dev in cross-rs container — see Cross.toml
+rtl-sdr-rs = { version = "0.3", features = ["rtl_sdr_blog"] }
+rusb = { version = "0.9", features = ["vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+# WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
+wdi-rs = "0.1"

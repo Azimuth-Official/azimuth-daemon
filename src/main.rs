@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         config.node.hardware_type.clone(),
     )));
 
-    // SDR capture (stub)
+    // SDR capture — handles driver install on Windows if needed
     let sdr = SdrCapture::new(
         config.sdr.device_index,
         config.sdr.sample_rate,
@@ -75,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut state = status_state.write().await;
         state.sdr_connected = sdr.is_connected();
+
+        #[cfg(target_os = "windows")]
+        {
+            state.driver_status =
+                sdr::driver_install::check_driver_status().to_string();
+        }
     }
 
     // Spawn status server
@@ -111,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(submit_interval).await;
 
-        let observations = sdr.capture_batch();
+        let observations = tokio::task::block_in_place(|| sdr.capture_batch());
         if observations.is_empty() {
             continue;
         }
