@@ -2,6 +2,7 @@ mod api_client;
 mod config;
 mod observation;
 mod sdr;
+mod setup;
 mod status_server;
 
 use std::path::PathBuf;
@@ -25,6 +26,26 @@ struct Cli {
     /// Path to config.toml
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+
+    /// Run interactive first-run setup wizard
+    #[arg(long)]
+    setup: bool,
+
+    /// API key (for automated setup)
+    #[arg(long)]
+    api_key: Option<String>,
+
+    /// Node name (for automated setup)
+    #[arg(long)]
+    node_name: Option<String>,
+
+    /// Latitude (for automated setup)
+    #[arg(long)]
+    lat: Option<f64>,
+
+    /// Longitude (for automated setup)
+    #[arg(long)]
+    lon: Option<f64>,
 }
 
 #[tokio::main]
@@ -32,11 +53,38 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    // Setup wizard mode
+    if cli.setup {
+        let args = setup::SetupArgs {
+            api_key: cli.api_key,
+            node_name: cli.node_name,
+            latitude: cli.lat,
+            longitude: cli.lon,
+            output_path: Some(cli.config.to_string_lossy().into_owned()),
+            base_url: None,
+        };
+        setup::run_setup(args).await?;
+        return Ok(());
+    }
+
     let mut config = Config::load(&cli.config)?;
     info!("Config loaded from {}", cli.config.display());
 
+    // Config validation
+    if let Err(errors) = config.validate() {
+        eprintln!("ERROR: Config validation failed ({} errors):", errors.len());
+        for e in &errors {
+            eprintln!("  * {}", e);
+        }
+        if config.has_placeholder_values() {
+            eprintln!("\nRun 'azimuth-daemon --setup' to configure.");
+        }
+        std::process::exit(1);
+    }
+
     if config.api.key.is_empty() {
-        anyhow::bail!("api.key is empty in config — register via POST /api/auth/register first, then paste the key into config.toml");
+        anyhow::bail!("api.key is empty — run 'azimuth-daemon --setup' to configure");
     }
 
     let client = Arc::new(ApiClient::new(&config.api.url, &config.api.key));

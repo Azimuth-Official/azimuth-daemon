@@ -2,9 +2,10 @@
 
 use crate::config::{DtvScanConfig, FmScanConfig, LteScanConfig, ScanningConfig};
 use crate::observation::Observation;
-use crate::sdr::{SdrManager, calculate_signal_power};
+use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Result from a single scan operation.
@@ -56,6 +57,8 @@ pub struct Scanner {
     dtv_config: DtvScanConfig,
     dbm_offset: f32,
     discovered: bool,
+    retune_delay_ms: u32,
+    capture_retries: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +103,8 @@ impl Scanner {
             dtv_config: config.dtv.clone(),
             dbm_offset,
             discovered: false,
+            retune_delay_ms: config.retune_delay_ms,
+            capture_retries: config.capture_retries,
         }
     }
 
@@ -127,6 +132,9 @@ impl Scanner {
         let mut freq = self.fm_config.sweep_start;
         while freq <= self.fm_config.sweep_end {
             if let Ok(()) = device.set_center_freq(freq) {
+                if self.retune_delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
+                }
                 if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
                     if dbfs > self.fm_config.sweep_threshold as f64 {
@@ -144,6 +152,9 @@ impl Scanner {
             let mut freq = band.start;
             while freq <= band.end {
                 if let Ok(()) = device.set_center_freq(freq) {
+                    if self.retune_delay_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
+                    }
                     if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                         let detections = super::lte::detect_lte_cells(&iq, device.sample_rate());
                         if !detections.is_empty() {
@@ -165,6 +176,9 @@ impl Scanner {
             // Tune to place pilot in capture window
             let pilot_tune = freq + 309_441; // Pilot offset from channel lower edge
             if let Ok(()) = device.set_center_freq(pilot_tune) {
+                if self.retune_delay_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
+                }
                 if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     if super::dtv::extract_atsc_pilot(&iq, device.sample_rate(), pilot_tune).is_some() {
                         info!(freq_mhz = freq as f64 / 1e6, "DTV channel found");
@@ -271,12 +285,17 @@ impl Scanner {
             return Vec::new();
         }
 
-        // Capture IQ data
-        let iq_bytes = match device.capture_raw(CAPTURE_BYTES) {
+        // PLL lock delay — RTL-SDR needs time to stabilize after retune
+        if self.retune_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
+        }
+
+        // Capture IQ data with retry on USB errors
+        let iq_bytes = match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
             Ok(b) if b.len() >= 4 => b,
             Ok(_) => return Vec::new(),
             Err(e) => {
-                warn!(freq, error = %e, "Capture failed");
+                warn!(freq, error = %e, "Capture failed after retries");
                 return Vec::new();
             }
         };
@@ -407,6 +426,35 @@ impl Scanner {
     pub fn interval_seconds(&self) -> u32 {
         self.interval_seconds
     }
+}
+
+/// Capture IQ data with exponential-backoff retry on USB errors.
+fn capture_with_retry(
+    device: &SdrDevice,
+    num_bytes: usize,
+    max_retries: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        match device.capture_raw(num_bytes) {
+            Ok(data) => return Ok(data),
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay_ms = 200 * 2u64.pow(attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        max = max_retries + 1,
+                        delay_ms,
+                        error = %e,
+                        "Capture failed, retrying"
+                    );
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap())
 }
 
 /// Convert ScanResult to Observation, aligning types with observation.rs.

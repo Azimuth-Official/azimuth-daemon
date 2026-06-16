@@ -62,6 +62,11 @@ interval_seconds = 30
 weight_lte = 3
 weight_dtv = 2
 weight_fm = 1
+# Delay in ms after frequency retune — gives RTL-SDR PLL time to lock.
+# Increase to 150-200 if you see USB pipe errors in logs.
+retune_delay_ms = 100
+# Number of capture retries on USB errors (exponential backoff: 200/400/800ms)
+capture_retries = 3
 
 [scanning.fm]
 # Known FM station frequencies in Hz. Add your local stations.
