@@ -24,6 +24,9 @@ anyhow = "1"
 rtl-sdr-rs = { version = "0.3", features = ["rtl_sdr_blog"] }
 rusb = { version = "0.9", features = ["vendored"] }
 
+# DSP: FFT for LTE PSS/SSS detection and signal analysis
+rustfft = "6"
+
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
 wdi-rs = "0.1"

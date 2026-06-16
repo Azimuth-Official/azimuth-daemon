@@ -1,24 +1,112 @@
+# =============================================================================
+# Azimuth Daemon Configuration
+# Copy this file to config.toml and edit before running.
+# =============================================================================
+
 [api]
-url = "http://localhost:3000"
+# Azimuth API endpoint
+url = "https://azimuth.day/api"
+# Your API key (get from azimuth.day dashboard after registration)
 key = "your-api-key-here"
 
 [node]
-id = "00000000-0000-0000-0000-000000000000"
+# Leave empty for auto-registration on first run
+id = ""
+# Hardware tier: "tier0_mobile", "tier1_rtlsdr", "tier2_gpsdo"
 hardware_type = "tier1_rtlsdr"
-label = "My Node"
+# Human-readable node name
+label = "my-azimuth-node"
 
 [node.location]
+# Node location (used for registration; Tier 1+ nodes are stationary)
 latitude = 0.0
 longitude = 0.0
 altitude_m = 0.0
 
 [daemon]
+# Heartbeat interval in seconds
 heartbeat_interval_secs = 15
+# Observation submission interval in seconds
 submit_interval_secs = 30
+# Status server bind address (GET /status for health check)
 status_bind = "127.0.0.1:8420"
 
 [sdr]
-device_index = 0
+# Device index: specific device number, or omit to enumerate all connected RTL-SDRs
+# device_index = 0
+# Sample rate in Hz. 2048000 is the standard for RTL-SDR.
 sample_rate = 2048000
+# Fallback center frequency for legacy mode (no [scanning] section)
 center_frequency = 100000000
-gain = 40
+# Gain: -1 for automatic gain control (AGC), or positive value in tenths of dB
+# AGC is recommended for most setups. Manual gain useful for known-good environments.
+gain = -1
+# dBm calibration offset. Adjusts dBFS readings to approximate dBm.
+# Default -30.0 is typical for RTL-SDR V3. Calibrate against a known signal for accuracy.
+dbm_offset = -30.0
+
+# =============================================================================
+# Scanning Configuration (optional — omit entire section for legacy single-freq mode)
+# =============================================================================
+
+[scanning]
+# Scan mode:
+#   "config" = use only the frequency lists below (fast, predictable)
+#   "sweep"  = auto-discover stations on first run (slower startup, finds everything)
+#   "both"   = auto-discover on first run, then use discovered + config lists
+mode = "both"
+# Seconds between full scan cycles
+interval_seconds = 30
+# Scheduling weights — higher weight = more scan time allocated to that signal type.
+# LTE is highest value for positioning (TDOA), so it gets the most weight by default.
+weight_lte = 3
+weight_dtv = 2
+weight_fm = 1
+
+[scanning.fm]
+# Known FM station frequencies in Hz. Add your local stations.
+# Example (Rochester MN area):
+# frequencies = [92_700_000, 96_100_000, 100_300_000, 101_700_000]
+frequencies = []
+# Auto-sweep parameters (used when mode = "sweep" or "both")
+sweep_start = 87_500_000
+sweep_end = 108_000_000
+sweep_step = 200_000
+# Power threshold for station detection during sweep (dBFS)
+sweep_threshold = -40.0
+
+[scanning.lte]
+# LTE downlink center frequencies in Hz.
+# Only low-band LTE works with RTL-SDR V3 (max ~1.766 GHz).
+# Defaults cover the three most common US low bands:
+#   Band 71 (T-Mobile 600 MHz): 617-652 MHz
+#   Band 12 (T-Mobile/AT&T 700 MHz): 729-746 MHz
+#   Band 5 (AT&T/US Cellular 850 MHz): 869-894 MHz
+frequencies = [631_000_000, 637_000_000, 737_000_000, 881_000_000]
+
+# Auto-sweep band ranges (used when mode = "sweep" or "both")
+[[scanning.lte.sweep_bands]]
+start = 617_000_000
+end = 652_000_000
+step = 5_000_000
+
+[[scanning.lte.sweep_bands]]
+start = 729_000_000
+end = 746_000_000
+step = 5_000_000
+
+[[scanning.lte.sweep_bands]]
+start = 869_000_000
+end = 894_000_000
+step = 5_000_000
+
+[scanning.dtv]
+# ATSC DTV channel center frequencies in Hz.
+# UHF channels 14-36 (post-repack range: 470-608 MHz)
+# Leave empty to rely on auto-sweep, or add known local channels.
+frequencies = []
+# Auto-sweep parameters
+sweep_start = 470_000_000
+sweep_end = 608_000_000
+sweep_step = 6_000_000
+sweep_threshold = -45.0

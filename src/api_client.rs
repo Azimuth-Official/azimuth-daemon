@@ -24,6 +24,12 @@ struct RegisterNodeResponse {
     node_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct HeartbeatRequest {
+    device_count: usize,
+    device_serials: Vec<String>,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str, api_key: &str) -> Self {
         Self {
@@ -69,12 +75,22 @@ impl ApiClient {
         Ok(data.node_id)
     }
 
-    pub async fn heartbeat(&self, node_id: &str) -> anyhow::Result<()> {
+    pub async fn heartbeat(
+        &self,
+        node_id: &str,
+        device_count: usize,
+        device_serials: Vec<String>,
+    ) -> anyhow::Result<()> {
         let url = format!("{}/api/nodes/{}/heartbeat", self.base_url, node_id);
+        let body = HeartbeatRequest {
+            device_count,
+            device_serials,
+        };
         let resp = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
             .send()
             .await?;
 

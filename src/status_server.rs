@@ -13,6 +13,7 @@ pub struct StatusInfo {
     pub observations_submitted: u64,
     pub last_heartbeat: Option<String>,
     pub sdr_connected: bool,
+    pub device_count: usize,
     pub driver_status: String,
 }
 
@@ -23,6 +24,7 @@ pub struct StatusState {
     pub observations_submitted: u64,
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
     pub sdr_connected: bool,
+    pub device_count: usize,
     pub driver_status: String,
 }
 
@@ -35,6 +37,7 @@ impl StatusState {
             observations_submitted: 0,
             last_heartbeat: None,
             sdr_connected: false,
+            device_count: 0,
             driver_status: "not_applicable".to_string(),
         }
     }
@@ -47,6 +50,7 @@ impl StatusState {
             observations_submitted: self.observations_submitted,
             last_heartbeat: self.last_heartbeat.map(|t| t.to_rfc3339()),
             sdr_connected: self.sdr_connected,
+            device_count: self.device_count,
             driver_status: self.driver_status.clone(),
         }
     }
