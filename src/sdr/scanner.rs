@@ -224,6 +224,17 @@ impl Scanner {
             return observations;
         }
 
+        // Prime USB pipes — device state goes stale during async sleep between cycles.
+        // A throwaway capture re-establishes the USB data stream.
+        let dc = sdr_manager.device_count();
+        for i in 0..dc {
+            if let Some(dev) = sdr_manager.device(i) {
+                if let Err(e) = dev.capture_raw(512) {
+                    warn!(device = i, error = %e, "USB pipe prime failed");
+                }
+            }
+        }
+
         // Multi-device: assign different scan types to different devices
         let device_count = sdr_manager.device_count();
         let scans_this_cycle: Vec<ScanType> = if device_count >= self.schedule.len() {
