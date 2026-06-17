@@ -91,7 +91,7 @@ impl Scanner {
             schedule.push(ScanType::Fm); // Fallback
         }
 
-        Scanner {
+        let mut scanner = Scanner {
             mode,
             interval_seconds: config.interval_seconds,
             schedule,
@@ -107,7 +107,11 @@ impl Scanner {
             retune_delay_ms: config.retune_delay_ms,
             capture_retries: config.capture_retries,
             max_observations_per_cycle: config.max_observations_per_cycle,
-        }
+        };
+        scanner.fm_frequencies.sort_unstable();
+        scanner.lte_frequencies.sort_unstable();
+        scanner.dtv_frequencies.sort_unstable();
+        scanner
     }
 
     /// Run first-time auto-discovery sweep. Updates frequency lists in memory.
@@ -119,13 +123,10 @@ impl Scanner {
             dtv_channels: Vec::new(),
         };
 
-        let device = match sdr_manager.device_mut(0) {
-            Some(d) => d,
-            None => {
-                warn!("No SDR device available for discovery sweep");
-                return result;
-            }
-        };
+        if sdr_manager.device_count() == 0 {
+            warn!("No SDR device available for discovery sweep");
+            return result;
+        }
 
         // FM sweep: 87.5-108 MHz
         info!("Sweeping FM band {}-{} MHz",
@@ -133,10 +134,8 @@ impl Scanner {
             self.fm_config.sweep_end / 1_000_000);
         let mut freq = self.fm_config.sweep_start;
         while freq <= self.fm_config.sweep_end {
-            if let Ok(()) = device.set_center_freq(freq) {
-                if self.retune_delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
-                }
+            if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
+                let device = sdr_manager.device_mut(0).unwrap();
                 if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
                     if dbfs > self.fm_config.sweep_threshold as f64 {
@@ -160,18 +159,16 @@ impl Scanner {
             info!("Sweeping LTE band {}-{} MHz", band.start / 1_000_000, band.end / 1_000_000);
             let mut freq = band.start;
             while freq <= band.end {
-                if let Ok(()) = device.set_center_freq(freq) {
-                    if self.retune_delay_ms > 0 {
-                        std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
-                    }
-                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
-                        let detections = super::lte::detect_lte_cells(&iq, device.sample_rate());
-                        if !detections.is_empty() {
-                            info!(freq_mhz = freq as f64 / 1e6, cells = detections.len(), "LTE cells detected");
-                            result.lte_cells.push(freq);
-                        }
+                if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
+                let device = sdr_manager.device_mut(0).unwrap();
+                if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
+                    let detections = super::lte::detect_lte_cells(&iq, device.sample_rate());
+                    if !detections.is_empty() {
+                        info!(freq_mhz = freq as f64 / 1e6, cells = detections.len(), "LTE cells detected");
+                        result.lte_cells.push(freq);
                     }
                 }
+            }
                 freq += band.step;
             }
         }
@@ -184,10 +181,8 @@ impl Scanner {
         while freq <= self.dtv_config.sweep_end {
             // Tune to place pilot in capture window
             let pilot_tune = freq + 309_441; // Pilot offset from channel lower edge
-            if let Ok(()) = device.set_center_freq(pilot_tune) {
-                if self.retune_delay_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
-                }
+            if self.tune_with_recovery(sdr_manager, 0, pilot_tune).is_some() {
+                let device = sdr_manager.device_mut(0).unwrap();
                 if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     if super::dtv::extract_atsc_pilot(&iq, device.sample_rate(), pilot_tune).is_some() {
                         info!(freq_mhz = freq as f64 / 1e6, "DTV channel found");
@@ -214,6 +209,10 @@ impl Scanner {
                 self.dtv_frequencies.push(*f);
             }
         }
+
+        self.fm_frequencies.sort_unstable();
+        self.lte_frequencies.sort_unstable();
+        self.dtv_frequencies.sort_unstable();
 
         self.discovered = true;
         info!(
@@ -301,35 +300,28 @@ impl Scanner {
         scan_type: ScanType,
         freq: u64,
     ) -> Vec<ScanResult> {
-        let device = match sdr_manager.device_mut(device_idx) {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-
-        // Tune to frequency
+        // Tune to frequency — handles pipe errors and band-aware delay internally
         let tune_freq = match scan_type {
             ScanType::Dtv => freq + 309_441, // Place ATSC pilot near center
             _ => freq,
         };
 
-        if let Err(e) = device.set_center_freq(tune_freq) {
-            warn!(freq, error = %e, "Failed to tune device");
+        if self.tune_with_recovery(sdr_manager, device_idx, tune_freq).is_none() {
             return Vec::new();
         }
 
-        // PLL lock delay — RTL-SDR needs time to stabilize after retune
-        if self.retune_delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(self.retune_delay_ms as u64));
-        }
+        let sample_rate = {
+            let device = match sdr_manager.device_mut(device_idx) {
+                Some(d) => d,
+                None => return Vec::new(),
+            };
+            device.sample_rate()
+        };
 
-        // Capture IQ data with retry on USB errors
-        let iq_bytes = match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
-            Ok(b) if b.len() >= 4 => b,
-            Ok(_) => return Vec::new(),
-            Err(e) => {
-                warn!(freq, error = %e, "Capture failed after retries");
-                return Vec::new();
-            }
+        // Capture IQ data with retry and auto-reset on persistent pipe errors
+        let iq_bytes = match self.capture_with_auto_reset(sdr_manager, device_idx, freq) {
+            Some(b) if b.len() >= 4 => b,
+            _ => return Vec::new(),
         };
 
         let (_dbfs, dbm) = calculate_signal_power(&iq_bytes, self.dbm_offset);
@@ -342,13 +334,13 @@ impl Scanner {
                 let mut snr: Option<f32> = None;
                 let mut source_id: Option<String> = None;
 
-                if let Some(demod) = super::fm_demod::demodulate_fm(&iq_bytes, device.sample_rate()) {
+                if let Some(demod) = super::fm_demod::demodulate_fm(&iq_bytes, sample_rate) {
                     snr = Some(demod.snr_db);
                     raw_data.insert("snr_db".to_string(), serde_json::json!(demod.snr_db));
                     raw_data.insert("signal_power_dbfs".to_string(), serde_json::json!(demod.signal_power_dbfs));
 
                     // Try RDS extraction
-                    if let Some(rds) = super::rds::extract_rds(&demod.audio_samples, device.sample_rate() / 10) {
+                    if let Some(rds) = super::rds::extract_rds(&demod.audio_samples, sample_rate / 10) {
                         source_id = Some(format!("pi_{:04X}", rds.pi_code));
                         raw_data.insert("pi_code".to_string(), serde_json::json!(rds.pi_code));
                         if let Some(ref cs) = rds.callsign {
@@ -378,7 +370,7 @@ impl Scanner {
             }
 
             ScanType::Lte => {
-                let detections = super::lte::detect_lte_cells(&iq_bytes, device.sample_rate());
+                let detections = super::lte::detect_lte_cells(&iq_bytes, sample_rate);
                 for det in detections {
                     let mut raw_data = serde_json::Map::new();
                     raw_data.insert("nid1".to_string(), serde_json::json!(det.nid1));
@@ -411,7 +403,7 @@ impl Scanner {
             }
 
             ScanType::Dtv => {
-                if let Some(pilot) = super::dtv::extract_atsc_pilot(&iq_bytes, device.sample_rate(), tune_freq) {
+                if let Some(pilot) = super::dtv::extract_atsc_pilot(&iq_bytes, sample_rate, tune_freq) {
                     let mut raw_data = serde_json::Map::new();
                     raw_data.insert("pilot_freq_hz".to_string(), serde_json::json!(pilot.pilot_frequency_hz));
                     raw_data.insert("pilot_snr_db".to_string(), serde_json::json!(pilot.pilot_snr_db));
@@ -458,6 +450,116 @@ impl Scanner {
     pub fn interval_seconds(&self) -> u32 {
         self.interval_seconds
     }
+
+    /// PLL settle delay. Large cross-band jumps (> 100 MHz) use 250 ms;
+    /// otherwise use the configured retune_delay_ms.
+    fn retune_delay(&self, device: &SdrDevice, freq: u64) -> Duration {
+        const LARGE_JUMP_HZ: u64 = 100_000_000;
+        const LARGE_JUMP_DELAY_MS: u64 = 250;
+
+        match device.last_tuned_freq_hz() {
+            Some(prev) if freq.abs_diff(prev) > LARGE_JUMP_HZ => {
+                Duration::from_millis(LARGE_JUMP_DELAY_MS)
+            }
+            _ => Duration::from_millis(self.retune_delay_ms as u64),
+        }
+    }
+
+    /// Tune a device, applying band-aware delay and recovering from pipe errors.
+    /// After three consecutive pipe errors on tune, the device is closed and reopened.
+    fn tune_with_recovery(
+        &self,
+        sdr_manager: &mut SdrManager,
+        device_idx: usize,
+        freq: u64,
+    ) -> Option<()> {
+        // Compute and apply delay based on *previous* tuned frequency, before we update it.
+        let delay = {
+            let device = sdr_manager.device_mut(device_idx)?;
+            self.retune_delay(device, freq)
+        };
+        if delay > Duration::ZERO {
+            std::thread::sleep(delay);
+        }
+
+        let result = {
+            let device = sdr_manager.device_mut(device_idx)?;
+            device.set_center_freq(freq)
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(device) = sdr_manager.device_mut(device_idx) {
+                    device.reset_pipe_errors();
+                    device.set_last_tuned_freq_hz(freq);
+                }
+                Some(())
+            }
+            Err(e) => {
+                if !is_pipe_error(&e) {
+                    warn!(device = device_idx, freq, error = %e, "Failed to tune device");
+                    if let Some(device) = sdr_manager.device_mut(device_idx) {
+                        device.reset_pipe_errors();
+                    }
+                    return None;
+                }
+
+                let should_reopen = {
+                    let device = sdr_manager.device_mut(device_idx)?;
+                    device.increment_pipe_errors();
+                    let count = device.consecutive_pipe_errors();
+                    warn!(
+                        device = device_idx,
+                        freq,
+                        consecutive_pipe_errors = count,
+                        "Pipe error during tune"
+                    );
+                    count >= 3
+                };
+
+                if !should_reopen {
+                    return None;
+                }
+
+                warn!(
+                    device = device_idx,
+                    freq,
+                    "3 consecutive pipe errors; reopening SDR device"
+                );
+                if let Err(e2) = sdr_manager.reopen_device(device_idx) {
+                    warn!(
+                        device = device_idx,
+                        freq,
+                        error = %e2,
+                        "Failed to reopen SDR device"
+                    );
+                    return None;
+                }
+
+                std::thread::sleep(Duration::from_millis(500));
+
+                let device = sdr_manager.device_mut(device_idx)?;
+                device.reset_pipe_errors();
+
+                match device.set_center_freq(freq) {
+                    Ok(()) => {
+                        device.set_last_tuned_freq_hz(freq);
+                        info!(device = device_idx, freq, "Tune succeeded after device reopen");
+                        Some(())
+                    }
+                    Err(e2) => {
+                        warn!(
+                            device = device_idx,
+                            freq,
+                            error = %e2,
+                            "Tune failed after device reopen"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Capture IQ data with exponential-backoff retry on USB errors.
@@ -487,6 +589,101 @@ fn capture_with_retry(
         }
     }
     Err(last_err.unwrap())
+}
+
+/// Detect whether an error is a USB pipe error ( stalls / corrupted bulk transfer ).
+fn is_pipe_error(err: &anyhow::Error) -> bool {
+    if let Some(rtl_err) = err.downcast_ref::<rtl_sdr_rs::error::RtlsdrError>() {
+        matches!(rtl_err, rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Pipe))
+    } else if let Some(usb_err) = err.downcast_ref::<rusb::Error>() {
+        *usb_err == rusb::Error::Pipe
+    } else {
+        false
+    }
+}
+
+impl Scanner {
+    /// Capture IQ data, retrying on transient errors and auto-resetting the
+    /// device after three consecutive USB pipe errors.
+    fn capture_with_auto_reset(
+        &self,
+        sdr_manager: &mut SdrManager,
+        device_idx: usize,
+        freq: u64,
+    ) -> Option<Vec<u8>> {
+        let result = {
+            let device = sdr_manager.device_mut(device_idx)?;
+            capture_with_retry(device, CAPTURE_BYTES, self.capture_retries)
+        };
+
+        match result {
+            Ok(buf) if buf.len() >= 4 => {
+                if let Some(device) = sdr_manager.device_mut(device_idx) {
+                    device.reset_pipe_errors();
+                }
+                Some(buf)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                if !is_pipe_error(&e) {
+                    if let Some(device) = sdr_manager.device_mut(device_idx) {
+                        device.reset_pipe_errors();
+                    }
+                    warn!(device = device_idx, freq, error = %e, "Capture failed after retries");
+                    return None;
+                }
+
+                let should_reopen = {
+                    let device = sdr_manager.device_mut(device_idx)?;
+                    device.increment_pipe_errors();
+                    let count = device.consecutive_pipe_errors();
+                    warn!(
+                        device = device_idx,
+                        freq,
+                        consecutive_pipe_errors = count,
+                        "Pipe error during capture"
+                    );
+                    count >= 3
+                };
+
+                if !should_reopen {
+                    return None;
+                }
+
+                warn!(
+                    device = device_idx,
+                    freq,
+                    "3 consecutive pipe errors; reopening SDR device"
+                );
+                if let Err(e2) = sdr_manager.reopen_device(device_idx) {
+                    warn!(device = device_idx, freq, error = %e2, "Failed to reopen SDR device");
+                    return None;
+                }
+
+                std::thread::sleep(Duration::from_millis(500));
+
+                let device = sdr_manager.device_mut(device_idx)?;
+                device.reset_pipe_errors();
+
+                match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
+                    Ok(buf) if buf.len() >= 4 => {
+                        info!(device = device_idx, freq, "Capture succeeded after device reopen");
+                        Some(buf)
+                    }
+                    Ok(_) => None,
+                    Err(e2) => {
+                        warn!(
+                            device = device_idx,
+                            freq,
+                            error = %e2,
+                            "Capture failed after device reopen"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Convert ScanResult to Observation, aligning types with observation.rs.

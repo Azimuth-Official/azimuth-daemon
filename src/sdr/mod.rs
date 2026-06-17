@@ -30,12 +30,22 @@ impl GainSetting {
     }
 }
 
+/// Stored configuration for an opened SDR device, used for reopen/reset.
+#[derive(Debug, Clone)]
+pub struct SdrDeviceConfig {
+    pub sample_rate: u32,
+    pub gain: GainSetting,
+    pub freq_correction_ppm: i32,
+}
+
 /// Individual SDR device handle.
 pub struct SdrDevice {
     device: RtlSdr,
     index: u32,
     serial: String,
-    sample_rate: u32,
+    config: SdrDeviceConfig,
+    last_tuned_freq_hz: Option<u64>,
+    consecutive_pipe_errors: u32,
 }
 
 impl SdrDevice {
@@ -48,7 +58,31 @@ impl SdrDevice {
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.config.sample_rate
+    }
+
+    pub fn config(&self) -> &SdrDeviceConfig {
+        &self.config
+    }
+
+    pub fn last_tuned_freq_hz(&self) -> Option<u64> {
+        self.last_tuned_freq_hz
+    }
+
+    pub fn set_last_tuned_freq_hz(&mut self, freq_hz: u64) {
+        self.last_tuned_freq_hz = Some(freq_hz);
+    }
+
+    pub fn consecutive_pipe_errors(&self) -> u32 {
+        self.consecutive_pipe_errors
+    }
+
+    pub fn increment_pipe_errors(&mut self) {
+        self.consecutive_pipe_errors += 1;
+    }
+
+    pub fn reset_pipe_errors(&mut self) {
+        self.consecutive_pipe_errors = 0;
     }
 
     /// Set center frequency with u64→u32 range check.
@@ -97,9 +131,26 @@ impl SdrDevice {
     }
 }
 
+impl Drop for SdrDevice {
+    fn drop(&mut self) {
+        info!(index = self.index, serial = %self.serial, "Closing SDR device");
+        if let Err(e) = self.device.close() {
+            warn!(index = self.index, serial = %self.serial, error = %e, "Failed to close SDR device cleanly");
+        }
+    }
+}
+
 /// Manages all connected RTL-SDR devices.
 pub struct SdrManager {
     devices: Vec<SdrDevice>,
+}
+
+impl Drop for SdrManager {
+    fn drop(&mut self) {
+        let count = self.devices.len();
+        info!(count, "Dropping SDR manager and connected devices");
+        self.devices.clear();
+    }
 }
 
 impl SdrManager {
@@ -151,7 +202,7 @@ impl SdrManager {
         };
 
         for idx in indices {
-            match Self::open_device(idx, sample_rate, &gain_setting) {
+            match Self::open_device(idx, sample_rate, &gain_setting, 0) {
                 Ok(dev) => {
                     info!(index = idx, serial = %dev.serial, "SDR device opened");
                     devices.push(dev);
@@ -173,6 +224,7 @@ impl SdrManager {
         index: u32,
         sample_rate: u32,
         gain: &GainSetting,
+        freq_correction_ppm: i32,
     ) -> anyhow::Result<SdrDevice> {
         let mut device = RtlSdr::open_with_index(index as usize)
             .map_err(|e| anyhow::anyhow!("open device {}: {}", index, e))?;
@@ -180,6 +232,10 @@ impl SdrManager {
         device
             .set_sample_rate(sample_rate)
             .map_err(|e| anyhow::anyhow!("set_sample_rate({} Hz): {}", sample_rate, e))?;
+
+        device
+            .set_freq_correction(freq_correction_ppm)
+            .map_err(|e| anyhow::anyhow!("set_freq_correction({} ppm): {}", freq_correction_ppm, e))?;
 
         let tuner_gain = match gain {
             GainSetting::Auto => TunerGain::Auto,
@@ -200,7 +256,13 @@ impl SdrManager {
             device,
             index,
             serial,
-            sample_rate,
+            config: SdrDeviceConfig {
+                sample_rate,
+                gain: gain.clone(),
+                freq_correction_ppm,
+            },
+            last_tuned_freq_hz: None,
+            consecutive_pipe_errors: 0,
         })
     }
 
@@ -226,6 +288,38 @@ impl SdrManager {
 
     pub fn is_connected(&self) -> bool {
         !self.devices.is_empty()
+    }
+
+    /// Close, wait, and reopen a device using its stored configuration.
+    /// The old handle is dropped (calling its `Drop::drop`). If reopen fails,
+    /// the device is removed from the manager so the scanner skips it.
+    pub fn reopen_device(&mut self, index: usize) -> anyhow::Result<()> {
+        let pos = self
+            .devices
+            .iter()
+            .position(|d| d.index == index as u32)
+            .ok_or_else(|| anyhow::anyhow!("Device index {} not found for reopen", index))?;
+
+        let config = self.devices[pos].config().clone();
+        let serial = self.devices[pos].serial().to_string();
+
+        let old_device = self.devices.remove(pos);
+        drop(old_device);
+
+        info!(index, serial = %serial, "Reopening SDR device after repeated pipe errors");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let new_device = Self::open_device(
+            index as u32,
+            config.sample_rate,
+            &config.gain,
+            config.freq_correction_ppm,
+        )
+        .map_err(|e| anyhow::anyhow!("Reopen device {} failed: {}", index, e))?;
+
+        self.devices.insert(pos, new_device);
+        info!(index, serial = %serial, "SDR device reopened successfully");
+        Ok(())
     }
 }
 
