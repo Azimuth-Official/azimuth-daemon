@@ -131,12 +131,16 @@ impl RecoveryManager {
                 self.level3_failures += 1;
                 warn!(
                     level3_failures = self.level3_failures,
+                    threshold = LEVEL_FAILURE_THRESHOLD,
                     "Level 3 recovery (OS device restart) failed"
                 );
-                // Terminal escalation: a single Level 3 failure is enough to give up
-                // and let the service manager restart the whole process.
-                info!("Level 3 failed; escalating to Level 4 (process exit)");
-                return Some(RecoveryAction::ProcessExit(42));
+                if self.level3_failures >= LEVEL_FAILURE_THRESHOLD {
+                    self.level3_failures = 0;
+                    info!(
+                        "Level 3 failure threshold reached; escalating to Level 4 (process exit)"
+                    );
+                    return Some(RecoveryAction::ProcessExit(42));
+                }
             }
             RecoveryAction::ProcessExit(code) => {
                 // Already terminal; propagate unchanged.
