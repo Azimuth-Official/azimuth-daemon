@@ -3,6 +3,7 @@
 use crate::config::{DtvScanConfig, FmScanConfig, LteScanConfig, ScanningConfig};
 use crate::observation::Observation;
 use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
+use crate::sdr::recovery::{RecoveryAction, RecoveryManager, reset_usb_bus_device, restart_os_device};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -60,6 +61,7 @@ pub struct Scanner {
     retune_delay_ms: u32,
     capture_retries: u32,
     max_observations_per_cycle: u32,
+    recovery_manager: RecoveryManager,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,6 +109,7 @@ impl Scanner {
             retune_delay_ms: config.retune_delay_ms,
             capture_retries: config.capture_retries,
             max_observations_per_cycle: config.max_observations_per_cycle,
+            recovery_manager: RecoveryManager::new(),
         };
         scanner.fm_frequencies.sort_unstable();
         scanner.lte_frequencies.sort_unstable();
@@ -155,7 +158,8 @@ impl Scanner {
         }
 
         // LTE sweep: configured band ranges
-        for band in &self.lte_config.sweep_bands {
+        let lte_bands = self.lte_config.sweep_bands.clone();
+        for band in lte_bands {
             info!("Sweeping LTE band {}-{} MHz", band.start / 1_000_000, band.end / 1_000_000);
             let mut freq = band.start;
             while freq <= band.end {
@@ -260,17 +264,17 @@ impl Scanner {
 
         for (dev_idx, scan_type) in scans_this_cycle.iter().enumerate() {
             let actual_dev = dev_idx % device_count;
-            let freqs: &[u64] = match scan_type {
-                ScanType::Fm => &self.fm_frequencies,
-                ScanType::Lte => &self.lte_frequencies,
-                ScanType::Dtv => &self.dtv_frequencies,
+            let freqs: Vec<u64> = match scan_type {
+                ScanType::Fm => self.fm_frequencies.clone(),
+                ScanType::Lte => self.lte_frequencies.clone(),
+                ScanType::Dtv => self.dtv_frequencies.clone(),
             };
 
             if freqs.is_empty() {
                 continue;
             }
 
-            for &freq in freqs {
+            for freq in freqs {
                 let results = self.scan_frequency(sdr_manager, actual_dev, *scan_type, freq);
                 for result in results {
                     observations.push(scan_result_to_observation(&result, freq));
@@ -294,7 +298,7 @@ impl Scanner {
     }
 
     fn scan_frequency(
-        &self,
+        &mut self,
         sdr_manager: &mut SdrManager,
         device_idx: usize,
         scan_type: ScanType,
@@ -465,10 +469,10 @@ impl Scanner {
         }
     }
 
-    /// Tune a device, applying band-aware delay and recovering from pipe errors.
-    /// After three consecutive pipe errors on tune, the device is closed and reopened.
+    /// Tune a device, applying band-aware delay and recovering from pipe errors
+    /// using the 4-level escalation ladder.
     fn tune_with_recovery(
-        &self,
+        &mut self,
         sdr_manager: &mut SdrManager,
         device_idx: usize,
         freq: u64,
@@ -490,73 +494,97 @@ impl Scanner {
         match result {
             Ok(()) => {
                 if let Some(device) = sdr_manager.device_mut(device_idx) {
-                    device.reset_pipe_errors();
                     device.set_last_tuned_freq_hz(freq);
                 }
+                self.recovery_manager.record_recovery_success();
                 Some(())
             }
             Err(e) => {
                 if !is_pipe_error(&e) {
                     warn!(device = device_idx, freq, error = %e, "Failed to tune device");
-                    if let Some(device) = sdr_manager.device_mut(device_idx) {
-                        device.reset_pipe_errors();
-                    }
+                    self.recovery_manager.record_recovery_success();
                     return None;
                 }
 
-                let should_reopen = {
-                    let device = sdr_manager.device_mut(device_idx)?;
-                    device.increment_pipe_errors();
-                    let count = device.consecutive_pipe_errors();
-                    warn!(
-                        device = device_idx,
-                        freq,
-                        consecutive_pipe_errors = count,
-                        "Pipe error during tune"
-                    );
-                    count >= 3
-                };
-
-                if !should_reopen {
-                    return None;
-                }
-
+                let mut action = self.recovery_manager.record_pipe_error()?;
                 warn!(
                     device = device_idx,
                     freq,
-                    "3 consecutive pipe errors; reopening SDR device"
+                    ?action,
+                    "Pipe error during tune; executing recovery action"
                 );
-                if let Err(e2) = sdr_manager.reopen_device(device_idx) {
-                    warn!(
-                        device = device_idx,
-                        freq,
-                        error = %e2,
-                        "Failed to reopen SDR device"
-                    );
-                    return None;
-                }
 
+                loop {
+                    match self.execute_recovery_action(sdr_manager, device_idx, action) {
+                        Ok(()) => {
+                            self.recovery_manager.record_recovery_success();
+                            let device = sdr_manager.device_mut(device_idx)?;
+                            match device.set_center_freq(freq) {
+                                Ok(()) => {
+                                    device.set_last_tuned_freq_hz(freq);
+                                    info!(device = device_idx, freq, "Tune succeeded after recovery");
+                                    return Some(());
+                                }
+                                Err(e2) => {
+                                    warn!(
+                                        device = device_idx,
+                                        freq,
+                                        error = %e2,
+                                        "Tune failed after recovery"
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                device = device_idx,
+                                freq,
+                                error = %err,
+                                ?action,
+                                "Recovery action failed"
+                            );
+                            match self.recovery_manager.record_recovery_failure(action) {
+                                Some(next_action) => action = next_action,
+                                None => return None,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute_recovery_action(
+        &mut self,
+        sdr_manager: &mut SdrManager,
+        device_idx: usize,
+        action: RecoveryAction,
+    ) -> anyhow::Result<()> {
+        match action {
+            RecoveryAction::ReopenHandle => {
+                info!(device = device_idx, "Executing Level 1 recovery: reopen handle");
+                sdr_manager.reopen_device(device_idx)?;
                 std::thread::sleep(Duration::from_millis(500));
-
-                let device = sdr_manager.device_mut(device_idx)?;
-                device.reset_pipe_errors();
-
-                match device.set_center_freq(freq) {
-                    Ok(()) => {
-                        device.set_last_tuned_freq_hz(freq);
-                        info!(device = device_idx, freq, "Tune succeeded after device reopen");
-                        Some(())
-                    }
-                    Err(e2) => {
-                        warn!(
-                            device = device_idx,
-                            freq,
-                            error = %e2,
-                            "Tune failed after device reopen"
-                        );
-                        None
-                    }
-                }
+                Ok(())
+            }
+            RecoveryAction::UsbBusReset => {
+                info!(device = device_idx, "Executing Level 2 recovery: USB bus reset");
+                reset_usb_bus_device(device_idx)?;
+                std::thread::sleep(Duration::from_millis(500));
+                sdr_manager.reopen_device(device_idx)?;
+                Ok(())
+            }
+            RecoveryAction::OsDeviceRestart => {
+                info!(device = device_idx, "Executing Level 3 recovery: OS device restart");
+                restart_os_device(self.recovery_manager.os_device_id(), device_idx)?;
+                std::thread::sleep(Duration::from_millis(2000));
+                sdr_manager.reopen_device(device_idx)?;
+                Ok(())
+            }
+            RecoveryAction::ProcessExit(code) => {
+                warn!(exit_code = code, "Executing Level 4 recovery: process exit");
+                std::process::exit(code)
             }
         }
     }
@@ -603,10 +631,10 @@ fn is_pipe_error(err: &anyhow::Error) -> bool {
 }
 
 impl Scanner {
-    /// Capture IQ data, retrying on transient errors and auto-resetting the
-    /// device after three consecutive USB pipe errors.
+    /// Capture IQ data, retrying on transient errors and escalating through the
+    /// recovery ladder on persistent USB pipe errors.
     fn capture_with_auto_reset(
-        &self,
+        &mut self,
         sdr_manager: &mut SdrManager,
         device_idx: usize,
         freq: u64,
@@ -618,67 +646,60 @@ impl Scanner {
 
         match result {
             Ok(buf) if buf.len() >= 4 => {
-                if let Some(device) = sdr_manager.device_mut(device_idx) {
-                    device.reset_pipe_errors();
-                }
+                self.recovery_manager.record_recovery_success();
                 Some(buf)
             }
             Ok(_) => None,
             Err(e) => {
                 if !is_pipe_error(&e) {
-                    if let Some(device) = sdr_manager.device_mut(device_idx) {
-                        device.reset_pipe_errors();
-                    }
                     warn!(device = device_idx, freq, error = %e, "Capture failed after retries");
+                    self.recovery_manager.record_recovery_success();
                     return None;
                 }
 
-                let should_reopen = {
-                    let device = sdr_manager.device_mut(device_idx)?;
-                    device.increment_pipe_errors();
-                    let count = device.consecutive_pipe_errors();
-                    warn!(
-                        device = device_idx,
-                        freq,
-                        consecutive_pipe_errors = count,
-                        "Pipe error during capture"
-                    );
-                    count >= 3
-                };
-
-                if !should_reopen {
-                    return None;
-                }
-
+                let mut action = self.recovery_manager.record_pipe_error()?;
                 warn!(
                     device = device_idx,
                     freq,
-                    "3 consecutive pipe errors; reopening SDR device"
+                    ?action,
+                    "Pipe error during capture; executing recovery action"
                 );
-                if let Err(e2) = sdr_manager.reopen_device(device_idx) {
-                    warn!(device = device_idx, freq, error = %e2, "Failed to reopen SDR device");
-                    return None;
-                }
 
-                std::thread::sleep(Duration::from_millis(500));
-
-                let device = sdr_manager.device_mut(device_idx)?;
-                device.reset_pipe_errors();
-
-                match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
-                    Ok(buf) if buf.len() >= 4 => {
-                        info!(device = device_idx, freq, "Capture succeeded after device reopen");
-                        Some(buf)
-                    }
-                    Ok(_) => None,
-                    Err(e2) => {
-                        warn!(
-                            device = device_idx,
-                            freq,
-                            error = %e2,
-                            "Capture failed after device reopen"
-                        );
-                        None
+                loop {
+                    match self.execute_recovery_action(sdr_manager, device_idx, action) {
+                        Ok(()) => {
+                            self.recovery_manager.record_recovery_success();
+                            let device = sdr_manager.device_mut(device_idx)?;
+                            match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
+                                Ok(buf) if buf.len() >= 4 => {
+                                    info!(device = device_idx, freq, "Capture succeeded after recovery");
+                                    return Some(buf);
+                                }
+                                Ok(_) => return None,
+                                Err(e2) => {
+                                    warn!(
+                                        device = device_idx,
+                                        freq,
+                                        error = %e2,
+                                        "Capture failed after recovery"
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                device = device_idx,
+                                freq,
+                                error = %err,
+                                ?action,
+                                "Recovery action failed"
+                            );
+                            match self.recovery_manager.record_recovery_failure(action) {
+                                Some(next_action) => action = next_action,
+                                None => return None,
+                            }
+                        }
                     }
                 }
             }

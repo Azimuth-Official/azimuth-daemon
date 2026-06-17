@@ -18,7 +18,7 @@ use config::Config;
 use observation::SubmitObservationsRequest;
 use sdr::SdrManager;
 use sdr::scanner::Scanner;
-use status_server::{StatusState, run_status_server};
+use status_server::{AppState, StatusState, run_status_server};
 
 #[derive(Parser)]
 #[command(name = "azimuth-daemon", about = "Azimuth positioning network daemon")]
@@ -109,10 +109,15 @@ async fn main() -> anyhow::Result<()> {
     let node_id = config.node.id.clone();
 
     // Status server state
-    let status_state = Arc::new(RwLock::new(StatusState::new(
-        node_id.clone(),
-        config.node.hardware_type.clone(),
-    )));
+    let app_state = Arc::new(AppState {
+        status: Arc::new(RwLock::new(StatusState::new(
+            node_id.clone(),
+            config.node.hardware_type.clone(),
+        ))),
+        scanning_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        scanner_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        config_path: cli.config.clone(),
+    });
 
     // SDR manager — handles driver install on Windows, enumerates all devices
     let mut sdr_manager = SdrManager::new(
@@ -121,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
         config.sdr.gain,
     );
     {
-        let mut state = status_state.write().await;
+        let mut state = app_state.status.write().await;
         state.sdr_connected = sdr_manager.is_connected();
         state.device_count = sdr_manager.device_count();
 
@@ -140,9 +145,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn status server
     let status_bind = config.daemon.status_bind.clone();
-    let status_state_clone = Arc::clone(&status_state);
+    let app_state_clone = Arc::clone(&app_state);
     tokio::spawn(async move {
-        run_status_server(&status_bind, status_state_clone).await;
+        run_status_server(&status_bind, app_state_clone).await;
     });
 
     // Spawn heartbeat loop with device info
@@ -151,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_interval = config.daemon.heartbeat_interval_secs;
     let heartbeat_device_count = sdr_manager.device_count();
     let heartbeat_serials = sdr_manager.device_serials();
-    let status_state_hb = Arc::clone(&status_state);
+    let app_state_hb = Arc::clone(&app_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_interval));
         info!(interval_secs = heartbeat_interval, "Heartbeat loop started");
@@ -166,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
             {
                 Ok(()) => {
-                    let mut state = status_state_hb.write().await;
+                    let mut state = app_state_hb.status.write().await;
                     state.last_heartbeat = Some(chrono::Utc::now());
                 }
                 Err(e) => error!(error = %e, "Heartbeat failed"),
@@ -195,12 +200,20 @@ async fn main() -> anyhow::Result<()> {
         }
 
         info!("Scanner observation loop started (interval {}s)", scanner.interval_seconds());
+        let scanning_enabled = Arc::clone(&app_state.scanning_enabled);
+        let scanner_active = Arc::clone(&app_state.scanner_active);
         loop {
             tokio::time::sleep(scan_interval).await;
 
+            if !scanning_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
+            scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);
             let observations = tokio::task::block_in_place(|| {
                 scanner.run_cycle(&mut sdr_manager)
             });
+            scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
 
             if observations.is_empty() {
                 continue;
@@ -214,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
 
             match client.submit_observations(&request).await {
                 Ok(accepted) => {
-                    let mut state = status_state.write().await;
+                    let mut state = app_state.status.write().await;
                     state.observations_submitted += accepted as u64;
                     info!(submitted = count, accepted, total = state.observations_submitted, "Batch submitted");
                 }
@@ -285,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
 
             match client.submit_observations(&request).await {
                 Ok(accepted) => {
-                    let mut state = status_state.write().await;
+                    let mut state = app_state.status.write().await;
                     state.observations_submitted += accepted as u64;
                     info!(accepted, total = state.observations_submitted, "Batch submitted");
                 }

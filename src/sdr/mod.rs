@@ -6,6 +6,7 @@ pub mod fm_demod;
 pub mod lte;
 pub mod rds;
 pub mod scanner;
+pub mod recovery;
 
 use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{info, warn};
@@ -45,7 +46,6 @@ pub struct SdrDevice {
     serial: String,
     config: SdrDeviceConfig,
     last_tuned_freq_hz: Option<u64>,
-    consecutive_pipe_errors: u32,
 }
 
 impl SdrDevice {
@@ -73,18 +73,6 @@ impl SdrDevice {
         self.last_tuned_freq_hz = Some(freq_hz);
     }
 
-    pub fn consecutive_pipe_errors(&self) -> u32 {
-        self.consecutive_pipe_errors
-    }
-
-    pub fn increment_pipe_errors(&mut self) {
-        self.consecutive_pipe_errors += 1;
-    }
-
-    pub fn reset_pipe_errors(&mut self) {
-        self.consecutive_pipe_errors = 0;
-    }
-
     /// Set center frequency with u64→u32 range check.
     /// RTL-SDR max frequency is ~1.766 GHz (u32::MAX).
     pub fn set_center_freq(&mut self, freq_hz: u64) -> anyhow::Result<()> {
@@ -96,7 +84,7 @@ impl SdrDevice {
         }
         self.device
             .set_center_freq(freq_hz as u32)
-            .map_err(|e| anyhow::anyhow!("set_center_freq({} Hz): {}", freq_hz, e))
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
     }
 
     /// Set gain (Auto or Manual).
@@ -107,7 +95,7 @@ impl SdrDevice {
         };
         self.device
             .set_tuner_gain(tuner_gain)
-            .map_err(|e| anyhow::anyhow!("set_tuner_gain: {}", e))
+            .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))
     }
 
     /// Capture raw IQ bytes. num_bytes should be even (2 bytes per sample).
@@ -120,7 +108,7 @@ impl SdrDevice {
         let n_read = self
             .device
             .read_sync(&mut buf)
-            .map_err(|e| anyhow::anyhow!("read_sync failed: {}", e))?;
+            .map_err(|e| anyhow::Error::new(e).context("read_sync"))?;
 
         buf.truncate(n_read);
         Ok(buf)
@@ -227,15 +215,15 @@ impl SdrManager {
         freq_correction_ppm: i32,
     ) -> anyhow::Result<SdrDevice> {
         let mut device = RtlSdr::open_with_index(index as usize)
-            .map_err(|e| anyhow::anyhow!("open device {}: {}", index, e))?;
+            .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
 
         device
             .set_sample_rate(sample_rate)
-            .map_err(|e| anyhow::anyhow!("set_sample_rate({} Hz): {}", sample_rate, e))?;
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_sample_rate({} Hz)", sample_rate)))?;
 
         device
             .set_freq_correction(freq_correction_ppm)
-            .map_err(|e| anyhow::anyhow!("set_freq_correction({} ppm): {}", freq_correction_ppm, e))?;
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_freq_correction({} ppm)", freq_correction_ppm)))?;
 
         let tuner_gain = match gain {
             GainSetting::Auto => TunerGain::Auto,
@@ -243,11 +231,11 @@ impl SdrManager {
         };
         device
             .set_tuner_gain(tuner_gain)
-            .map_err(|e| anyhow::anyhow!("set_tuner_gain: {}", e))?;
+            .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))?;
 
         device
             .reset_buffer()
-            .map_err(|e| anyhow::anyhow!("reset_buffer: {}", e))?;
+            .map_err(|e| anyhow::Error::new(e).context("reset_buffer"))?;
 
         // Generate serial: use index as fallback (rtl-sdr-rs v0.3 doesn't expose USB strings)
         let serial = format!("SDR-{:04}", index);
@@ -262,7 +250,6 @@ impl SdrManager {
                 freq_correction_ppm,
             },
             last_tuned_freq_hz: None,
-            consecutive_pipe_errors: 0,
         })
     }
 
@@ -315,7 +302,7 @@ impl SdrManager {
             &config.gain,
             config.freq_correction_ppm,
         )
-        .map_err(|e| anyhow::anyhow!("Reopen device {} failed: {}", index, e))?;
+        .map_err(|e| e.context(format!("Reopen device {}", index)))?;
 
         self.devices.insert(pos, new_device);
         info!(index, serial = %serial, "SDR device reopened successfully");
