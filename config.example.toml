@@ -67,6 +67,8 @@ weight_fm = 1
 retune_delay_ms = 100
 # Number of capture retries on USB errors (exponential backoff: 200/400/800ms)
 capture_retries = 3
+# Maximum observations submitted per scan cycle (strongest signals first)
+max_observations_per_cycle = 20
 
 [scanning.fm]
 # Known FM station frequencies in Hz. Add your local stations.
@@ -77,8 +79,10 @@ frequencies = []
 sweep_start = 87_500_000
 sweep_end = 108_000_000
 sweep_step = 200_000
-# Power threshold for station detection during sweep (dBFS)
-sweep_threshold = -40.0
+# Power threshold for station detection during sweep (dBFS, -20 filters noise)
+sweep_threshold = -20.0
+# Minimum SNR for FM station validation during sweep (dB)
+sweep_min_snr_db = 8.0
 
 [scanning.lte]
 # LTE downlink center frequencies in Hz.

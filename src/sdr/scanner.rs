@@ -59,6 +59,7 @@ pub struct Scanner {
     discovered: bool,
     retune_delay_ms: u32,
     capture_retries: u32,
+    max_observations_per_cycle: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,6 +106,7 @@ impl Scanner {
             discovered: false,
             retune_delay_ms: config.retune_delay_ms,
             capture_retries: config.capture_retries,
+            max_observations_per_cycle: config.max_observations_per_cycle,
         }
     }
 
@@ -138,8 +140,15 @@ impl Scanner {
                 if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
                     if dbfs > self.fm_config.sweep_threshold as f64 {
-                        info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), "FM station found");
-                        result.fm_stations.push(freq);
+                        // SNR gate — verify real station, not noise spike
+                        if let Some(demod) = super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
+                            if demod.snr_db >= self.fm_config.sweep_min_snr_db {
+                                info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
+                                result.fm_stations.push(freq);
+                            } else {
+                                debug!(freq_mhz = freq as f64 / 1e6, snr = format!("{:.1}", demod.snr_db), "Power OK but SNR too low");
+                            }
+                        }
                     }
                 }
             }
@@ -268,6 +277,18 @@ impl Scanner {
                     observations.push(scan_result_to_observation(&result, freq));
                 }
             }
+        }
+
+        // Cap observations per cycle — strongest signals first
+        let cap = self.max_observations_per_cycle as usize;
+        if cap > 0 && observations.len() > cap {
+            observations.sort_by(|a, b| {
+                let sa = a.signal_strength_dbm.unwrap_or(f64::MIN);
+                let sb = b.signal_strength_dbm.unwrap_or(f64::MIN);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            info!(collected = observations.len(), cap, "Capping observations");
+            observations.truncate(cap);
         }
 
         observations

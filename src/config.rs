@@ -75,6 +75,8 @@ pub struct ScanningConfig {
     pub retune_delay_ms: u32,
     #[serde(default = "default_capture_retries")]
     pub capture_retries: u32,
+    #[serde(default = "default_max_obs_per_cycle")]
+    pub max_observations_per_cycle: u32,
     #[serde(default)]
     pub fm: FmScanConfig,
     #[serde(default)]
@@ -104,6 +106,9 @@ fn default_retune_delay() -> u32 {
 fn default_capture_retries() -> u32 {
     3
 }
+fn default_max_obs_per_cycle() -> u32 {
+    20
+}
 
 impl Default for ScanningConfig {
     fn default() -> Self {
@@ -115,6 +120,7 @@ impl Default for ScanningConfig {
             weight_fm: default_weight_fm(),
             retune_delay_ms: default_retune_delay(),
             capture_retries: default_capture_retries(),
+            max_observations_per_cycle: default_max_obs_per_cycle(),
             fm: FmScanConfig::default(),
             lte: LteScanConfig::default(),
             dtv: DtvScanConfig::default(),
@@ -134,6 +140,8 @@ pub struct FmScanConfig {
     pub sweep_step: u64,
     #[serde(default = "default_fm_sweep_threshold")]
     pub sweep_threshold: f32,
+    #[serde(default = "default_fm_sweep_min_snr")]
+    pub sweep_min_snr_db: f32,
 }
 
 impl Default for FmScanConfig {
@@ -144,8 +152,13 @@ impl Default for FmScanConfig {
             sweep_end: default_fm_sweep_end(),
             sweep_step: default_fm_sweep_step(),
             sweep_threshold: default_fm_sweep_threshold(),
+            sweep_min_snr_db: default_fm_sweep_min_snr(),
         }
     }
+}
+
+fn default_fm_sweep_min_snr() -> f32 {
+    8.0
 }
 
 fn default_fm_sweep_start() -> u64 {
@@ -158,7 +171,7 @@ fn default_fm_sweep_step() -> u64 {
     200_000
 }
 fn default_fm_sweep_threshold() -> f32 {
-    -40.0
+    -20.0
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -225,7 +238,7 @@ fn default_dtv_sweep_step() -> u64 {
     6_000_000
 }
 fn default_dtv_sweep_threshold() -> f32 {
-    -45.0
+    -25.0
 }
 
 impl Config {
