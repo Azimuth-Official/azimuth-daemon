@@ -283,3 +283,96 @@ fn discover_linux_sysfs_path(device_index: usize) -> anyhow::Result<std::path::P
         device_index
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_full_escalation_ladder() {
+        let mut rm = RecoveryManager::new();
+
+        // Level 0 -> Level 1: three consecutive pipe errors trigger reopen.
+        assert_eq!(rm.record_pipe_error(), None);
+        assert_eq!(rm.record_pipe_error(), None);
+        assert_eq!(
+            rm.record_pipe_error(),
+            Some(RecoveryAction::ReopenHandle)
+        );
+
+        // Level 1 -> Level 2: three failed reopen attempts trigger USB bus reset.
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::ReopenHandle),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::ReopenHandle),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::ReopenHandle),
+            Some(RecoveryAction::UsbBusReset)
+        );
+
+        // Level 2 -> Level 3: three failed bus resets trigger OS device restart.
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::UsbBusReset),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::UsbBusReset),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::UsbBusReset),
+            Some(RecoveryAction::OsDeviceRestart)
+        );
+
+        // Level 3 -> Level 4: three failed OS restarts trigger process exit.
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::OsDeviceRestart),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::OsDeviceRestart),
+            None
+        );
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::OsDeviceRestart),
+            Some(RecoveryAction::ProcessExit(42))
+        );
+
+        // Level 4 is terminal; the manager propagates it unchanged.
+        assert_eq!(
+            rm.record_recovery_failure(RecoveryAction::ProcessExit(42)),
+            Some(RecoveryAction::ProcessExit(42))
+        );
+    }
+
+    #[test]
+    fn test_recovery_success_resets_all_counters() {
+        let mut rm = RecoveryManager::new();
+
+        // Partially build up every counter.
+        rm.record_pipe_error();
+        rm.record_pipe_error();
+        rm.record_recovery_failure(RecoveryAction::ReopenHandle);
+        rm.record_recovery_failure(RecoveryAction::UsbBusReset);
+        rm.record_recovery_failure(RecoveryAction::OsDeviceRestart);
+
+        // Success should wipe the slate clean.
+        rm.record_recovery_success();
+
+        // We should need the full threshold again, not a single remaining failure.
+        assert_eq!(rm.record_pipe_error(), None);
+        assert_eq!(rm.record_pipe_error(), None);
+        assert_eq!(rm.record_pipe_error(), Some(RecoveryAction::ReopenHandle));
+    }
+
+    #[test]
+    fn test_pipe_error_threshold_constant() {
+        // Guard against accidental constant changes that would break the ladder contract.
+        assert_eq!(PIPE_ERROR_THRESHOLD, 3);
+        assert_eq!(LEVEL_FAILURE_THRESHOLD, 3);
+    }
+}
