@@ -119,10 +119,11 @@ pub fn demodulate_fm(iq_bytes: &[u8], _sample_rate: u32) -> Option<FmDemodResult
         .sum::<f32>()
         / decimated.len() as f32;
 
-    // Estimate noise as variance of differences (high-frequency noise energy)
-    let mut noise_samples = Vec::with_capacity(decimated.len() - 1);
-    for i in 1..decimated.len() {
-        noise_samples.push(decimated[i] - decimated[i - 1]);
+    // Estimate noise as variance of a high-pass residual (second-difference)
+    // so low-frequency signal slope is not counted as noise.
+    let mut noise_samples = Vec::with_capacity(decimated.len().saturating_sub(2));
+    for i in 2..decimated.len() {
+        noise_samples.push(decimated[i] - 2.0 * decimated[i - 1] + decimated[i - 2]);
     }
 
     let noise_power: f32 = if !noise_samples.is_empty() {
@@ -188,12 +189,14 @@ mod tests {
 
     #[test]
     fn test_valid_input() {
-        // Create synthetic IQ pairs with some variation
+        // Create synthetic FM IQ pairs with a phase-modulated tone so the
+        // demodulated output is not near-DC and has meaningful signal power.
         let mut iq = Vec::new();
         for i in 0..1024 {
-            let i_val = (127.5 + 50.0 * (2.0 * std::f32::consts::PI * i as f32 / 100.0).sin()) as u8;
-            let q_val =
-                (127.5 + 50.0 * (2.0 * std::f32::consts::PI * i as f32 / 100.0).cos()) as u8;
+            let phase = 2.0 * std::f32::consts::PI * i as f32 / 100.0
+                + 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 400.0).sin();
+            let i_val = (127.5 + 50.0 * phase.sin()) as u8;
+            let q_val = (127.5 + 50.0 * phase.cos()) as u8;
             iq.push(i_val);
             iq.push(q_val);
         }
