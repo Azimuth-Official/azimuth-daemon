@@ -517,22 +517,36 @@ impl Scanner {
                 loop {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
-                            self.recovery_manager.record_recovery_success();
                             let device = sdr_manager.device_mut(device_idx)?;
                             match device.set_center_freq(freq) {
                                 Ok(()) => {
                                     device.set_last_tuned_freq_hz(freq);
+                                    self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Tune succeeded after recovery");
                                     return Some(());
                                 }
                                 Err(e2) => {
-                                    warn!(
-                                        device = device_idx,
-                                        freq,
-                                        error = %e2,
-                                        "Tune failed after recovery"
-                                    );
-                                    return None;
+                                    if is_pipe_error(&e2) {
+                                        warn!(
+                                            device = device_idx,
+                                            freq,
+                                            error = %e2,
+                                            "Tune still failing with pipe error after recovery; escalating"
+                                        );
+                                        match self.recovery_manager.record_recovery_failure(action) {
+                                            Some(next_action) => action = next_action,
+                                            None => return None,
+                                        }
+                                    } else {
+                                        warn!(
+                                            device = device_idx,
+                                            freq,
+                                            error = %e2,
+                                            "Tune failed after recovery"
+                                        );
+                                        self.recovery_manager.record_recovery_success();
+                                        return None;
+                                    }
                                 }
                             }
                         }
@@ -668,22 +682,39 @@ impl Scanner {
                 loop {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
-                            self.recovery_manager.record_recovery_success();
                             let device = sdr_manager.device_mut(device_idx)?;
                             match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
                                 Ok(buf) if buf.len() >= 4 => {
+                                    self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Capture succeeded after recovery");
                                     return Some(buf);
                                 }
-                                Ok(_) => return None,
-                                Err(e2) => {
-                                    warn!(
-                                        device = device_idx,
-                                        freq,
-                                        error = %e2,
-                                        "Capture failed after recovery"
-                                    );
+                                Ok(_) => {
+                                    self.recovery_manager.record_recovery_success();
                                     return None;
+                                }
+                                Err(e2) => {
+                                    if is_pipe_error(&e2) {
+                                        warn!(
+                                            device = device_idx,
+                                            freq,
+                                            error = %e2,
+                                            "Capture still failing with pipe error after recovery; escalating"
+                                        );
+                                        match self.recovery_manager.record_recovery_failure(action) {
+                                            Some(next_action) => action = next_action,
+                                            None => return None,
+                                        }
+                                    } else {
+                                        warn!(
+                                            device = device_idx,
+                                            freq,
+                                            error = %e2,
+                                            "Capture failed after recovery"
+                                        );
+                                        self.recovery_manager.record_recovery_success();
+                                        return None;
+                                    }
                                 }
                             }
                         }
