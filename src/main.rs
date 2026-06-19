@@ -15,10 +15,52 @@ use tracing::{error, info, warn};
 
 use api_client::ApiClient;
 use config::Config;
-use observation::SubmitObservationsRequest;
+use observation::{Observation, SubmitObservationsRequest};
 use sdr::SdrManager;
 use sdr::scanner::Scanner;
-use status_server::{AppState, StatusState, run_status_server};
+use status_server::{AppState, RecentSignal, StatusState, run_status_server};
+
+fn category_for_signal_type(signal_type: &str) -> &str {
+    if signal_type.starts_with("lte_") {
+        "lte"
+    } else if signal_type.starts_with("fm_") {
+        "fm"
+    } else if signal_type.starts_with("dtv_") {
+        "dtv"
+    } else {
+        "other"
+    }
+}
+
+fn update_status_from_observations(state: &mut StatusState, observations: &[Observation]) {
+    let count = observations.len() as u64;
+    state.signals_found += count;
+
+    for obs in observations {
+        match category_for_signal_type(&obs.signal_type) {
+            "lte" => state.signal_breakdown.lte += 1,
+            "fm" => state.signal_breakdown.fm += 1,
+            "dtv" => state.signal_breakdown.dtv += 1,
+            _ => {}
+        }
+    }
+
+    let mut recent: Vec<RecentSignal> = observations
+        .iter()
+        .map(|obs| RecentSignal {
+            id: uuid::Uuid::new_v4().to_string(),
+            signal_type: obs.signal_type.clone(),
+            frequency_hz: obs.frequency_hz.unwrap_or(0),
+            source_id: obs.source_id.clone(),
+            snr_db: obs.snr_db,
+            status: "Detected".to_string(),
+        })
+        .collect();
+
+    recent.reverse();
+    recent.truncate(20);
+    state.recent_signals = recent;
+}
 
 #[derive(Parser)]
 #[command(name = "azimuth-daemon", about = "Azimuth positioning network daemon")]
@@ -129,6 +171,12 @@ async fn main() -> anyhow::Result<()> {
         let mut state = app_state.status.write().await;
         state.sdr_connected = sdr_manager.is_connected();
         state.device_count = sdr_manager.device_count();
+        state.sdr_name = sdr_manager
+            .device_serials()
+            .into_iter()
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "RTL-SDR".to_string());
 
         #[cfg(target_os = "windows")]
         {
@@ -215,6 +263,11 @@ async fn main() -> anyhow::Result<()> {
             });
             scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
 
+            if !observations.is_empty() {
+                let mut state = app_state.status.write().await;
+                update_status_from_observations(&mut state, &observations);
+            }
+
             if observations.is_empty() {
                 continue;
             }
@@ -274,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
                     "IQ batch captured (legacy)"
                 );
 
-                vec![observation::Observation {
+                vec![Observation {
                     signal_type: "fm_rds".to_string(),
                     observed_at: chrono::Utc::now(),
                     frequency_hz: Some(config.sdr.center_frequency),
@@ -286,6 +339,11 @@ async fn main() -> anyhow::Result<()> {
                     raw_data: None,
                 }]
             });
+
+            if !observations.is_empty() {
+                let mut state = app_state.status.write().await;
+                update_status_from_observations(&mut state, &observations);
+            }
 
             if observations.is_empty() {
                 continue;

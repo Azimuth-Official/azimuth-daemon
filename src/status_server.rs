@@ -22,6 +22,24 @@ const RTL_SDR_VID: u16 = 0x0BDA;
 const RTL_SDR_PID: u16 = 0x2832;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SignalBreakdown {
+    pub lte: u64,
+    pub fm: u64,
+    pub dtv: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentSignal {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub signal_type: String,
+    pub frequency_hz: u64,
+    pub source_id: Option<String>,
+    pub snr_db: Option<f64>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusInfo {
     pub node_id: String,
     pub hardware_type: String,
@@ -29,10 +47,15 @@ pub struct StatusInfo {
     pub observations_submitted: u64,
     pub last_heartbeat: Option<String>,
     pub sdr_connected: bool,
+    pub sdr_name: String,
+    pub sdr_multiplier: f64,
     pub device_count: usize,
     pub driver_status: String,
     pub scanning_enabled: bool,
     pub scanner_active: bool,
+    pub signals_found: u64,
+    pub signal_breakdown: SignalBreakdown,
+    pub recent_signals: Vec<RecentSignal>,
 }
 
 pub struct StatusState {
@@ -42,8 +65,13 @@ pub struct StatusState {
     pub observations_submitted: u64,
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
     pub sdr_connected: bool,
+    pub sdr_name: String,
+    pub sdr_multiplier: f64,
     pub device_count: usize,
     pub driver_status: String,
+    pub signals_found: u64,
+    pub signal_breakdown: SignalBreakdown,
+    pub recent_signals: Vec<RecentSignal>,
 }
 
 impl StatusState {
@@ -55,8 +83,14 @@ impl StatusState {
             observations_submitted: 0,
             last_heartbeat: None,
             sdr_connected: false,
+            sdr_name: "No device".to_string(),
+            // TODO: fetch actual multiplier from web API
+            sdr_multiplier: 1.0,
             device_count: 0,
             driver_status: "not_applicable".to_string(),
+            signals_found: 0,
+            signal_breakdown: SignalBreakdown { lte: 0, fm: 0, dtv: 0 },
+            recent_signals: Vec::new(),
         }
     }
 
@@ -71,10 +105,15 @@ impl StatusState {
             observations_submitted: self.observations_submitted,
             last_heartbeat: self.last_heartbeat.map(|t| t.to_rfc3339()),
             sdr_connected: self.sdr_connected,
+            sdr_name: self.sdr_name.clone(),
+            sdr_multiplier: self.sdr_multiplier,
             device_count: self.device_count,
             driver_status: self.driver_status.clone(),
             scanning_enabled,
             scanner_active,
+            signals_found: self.signals_found,
+            signal_breakdown: self.signal_breakdown.clone(),
+            recent_signals: self.recent_signals.clone(),
         }
     }
 }
