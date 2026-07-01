@@ -179,15 +179,18 @@ async fn sdr_test_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SdrTestRequest>,
 ) -> impl IntoResponse {
-    if state.scanner_active.load(Ordering::Relaxed) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(MessageResponse {
-                message: "Scanner is currently active".to_string(),
-            }),
-        ));
+    // When the scanner holds the device handle, opening a second WinUSB handle
+    // fails with "Access denied". Use the scanner's cached connection state instead.
+    if state.scanning_enabled.load(Ordering::Relaxed) {
+        let s = state.status.read().await;
+        let connected = s.sdr_connected && s.device_count > req.index as usize;
+        return Ok((StatusCode::OK, Json(SdrTestResponse {
+            index: req.index,
+            opened: connected,
+        })));
     }
 
+    // Scanner not enabled — safe to open a test handle (no contention).
     let result = tokio::task::block_in_place(move || test_sdr_device(req.index));
     match result {
         Ok(opened) => Ok((StatusCode::OK, Json(SdrTestResponse {
