@@ -581,16 +581,25 @@ impl Scanner {
             }
             RecoveryAction::UsbBusReset => {
                 info!(device = device_idx, "Executing Level 2 recovery: USB bus reset");
+                // Close rtl-sdr handle first — WinUSB rejects concurrent handles
+                let closed = sdr_manager.close_device(device_idx);
+                std::thread::sleep(Duration::from_millis(200));
                 reset_usb_bus_device(device_idx)?;
                 std::thread::sleep(Duration::from_millis(500));
-                sdr_manager.reopen_device(device_idx)?;
+                if let Some((pos, config, _serial)) = closed {
+                    sdr_manager.reopen_device_at(device_idx, pos, &config)?;
+                }
                 Ok(())
             }
             RecoveryAction::OsDeviceRestart => {
                 info!(device = device_idx, "Executing Level 3 recovery: OS device restart");
+                // Close handle before OS-level device restart
+                let closed = sdr_manager.close_device(device_idx);
                 restart_os_device(self.recovery_manager.os_device_id(), device_idx)?;
                 std::thread::sleep(Duration::from_millis(2000));
-                sdr_manager.reopen_device(device_idx)?;
+                if let Some((pos, config, _serial)) = closed {
+                    sdr_manager.reopen_device_at(device_idx, pos, &config)?;
+                }
                 Ok(())
             }
             RecoveryAction::ProcessExit(code) => {

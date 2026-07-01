@@ -277,6 +277,44 @@ impl SdrManager {
         !self.devices.is_empty()
     }
 
+    /// Close a device handle without reopening. Used by L2 recovery to release
+    /// the WinUSB handle before rusb can open its own for a bus reset.
+    /// Returns the stored config so the caller can reopen later.
+    pub fn close_device(&mut self, index: usize) -> Option<(usize, SdrDeviceConfig, String)> {
+        let pos = self
+            .devices
+            .iter()
+            .position(|d| d.index == index as u32)?;
+
+        let config = self.devices[pos].config().clone();
+        let serial = self.devices[pos].serial().to_string();
+
+        let old_device = self.devices.remove(pos);
+        drop(old_device);
+
+        info!(index, serial = %serial, "SDR device closed for recovery");
+        Some((pos, config, serial))
+    }
+
+    /// Reopen a previously closed device at the given vec position.
+    pub fn reopen_device_at(&mut self, index: usize, pos: usize, config: &SdrDeviceConfig) -> anyhow::Result<()> {
+        let serial = format!("SDR-{:04}", index);
+        info!(index, serial = %serial, "Reopening SDR device");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let new_device = Self::open_device(
+            index as u32,
+            config.sample_rate,
+            &config.gain,
+            config.freq_correction_ppm,
+        )
+        .map_err(|e| e.context(format!("Reopen device {}", index)))?;
+
+        self.devices.insert(pos, new_device);
+        info!(index, serial = %serial, "SDR device reopened successfully");
+        Ok(())
+    }
+
     /// Close, wait, and reopen a device using its stored configuration.
     /// The old handle is dropped (calling its `Drop::drop`). If reopen fails,
     /// the device is removed from the manager so the scanner skips it.

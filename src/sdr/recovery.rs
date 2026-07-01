@@ -187,8 +187,9 @@ pub fn reset_usb_bus_device(device_index: usize) -> anyhow::Result<()> {
     );
 }
 
-/// Restart the OS-level USB device. On Windows this restarts the PnP device;
-/// on Linux it toggles the sysfs `authorized` flag for the matching VID/PID.
+/// Restart the OS-level USB device. On Windows this disables then re-enables
+/// the PnP device via PowerShell cmdlets (harder reset than pnputil).
+/// On Linux it toggles the sysfs `authorized` flag for the matching VID/PID.
 pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -196,15 +197,52 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
             Some(id) => id.to_string(),
             None => discover_windows_pnp_instance_id()?,
         };
-        info!(instance_id, "Restarting Windows PnP device");
-        let output = Command::new("pnputil")
-            .args(["/restart-device", &instance_id])
+        info!(instance_id, "Disabling Windows PnP device for hard reset");
+
+        // Disable device
+        let disable = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Disable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
+                    instance_id
+                ),
+            ])
             .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("pnputil /restart-device failed: {}", stderr);
+        if !disable.status.success() {
+            let stdout = String::from_utf8_lossy(&disable.stdout);
+            let stderr = String::from_utf8_lossy(&disable.stderr);
+            anyhow::bail!(
+                "Disable-PnpDevice failed: stdout={} stderr={}",
+                stdout.trim(),
+                stderr.trim()
+            );
         }
-        info!(instance_id, "Windows PnP device restart completed");
+        info!(instance_id, "Device disabled, waiting before re-enable");
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+
+        // Re-enable device
+        let enable = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Enable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
+                    instance_id
+                ),
+            ])
+            .output()?;
+        if !enable.status.success() {
+            let stdout = String::from_utf8_lossy(&enable.stdout);
+            let stderr = String::from_utf8_lossy(&enable.stderr);
+            anyhow::bail!(
+                "Enable-PnpDevice failed: stdout={} stderr={}",
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        info!(instance_id, "Windows PnP device re-enabled successfully");
         return Ok(());
     }
 
@@ -240,8 +278,13 @@ fn discover_windows_pnp_instance_id() -> anyhow::Result<String> {
         .output()?;
 
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("PowerShell PnP discovery failed: {}", stderr);
+        anyhow::bail!(
+            "PowerShell PnP discovery failed: stdout={} stderr={}",
+            stdout.trim(),
+            stderr.trim()
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
