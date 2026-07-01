@@ -53,6 +53,7 @@ pub struct StatusInfo {
     pub driver_status: String,
     pub scanning_enabled: bool,
     pub scanner_active: bool,
+    pub network_support_enabled: bool,
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
@@ -69,6 +70,7 @@ pub struct StatusState {
     pub sdr_multiplier: f64,
     pub device_count: usize,
     pub driver_status: String,
+    pub network_support_enabled: bool,
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
@@ -88,6 +90,7 @@ impl StatusState {
             sdr_multiplier: 1.0,
             device_count: 0,
             driver_status: "not_applicable".to_string(),
+            network_support_enabled: false,
             signals_found: 0,
             signal_breakdown: SignalBreakdown { lte: 0, fm: 0, dtv: 0 },
             recent_signals: Vec::new(),
@@ -111,6 +114,7 @@ impl StatusState {
             driver_status: self.driver_status.clone(),
             scanning_enabled,
             scanner_active,
+            network_support_enabled: self.network_support_enabled,
             signals_found: self.signals_found,
             signal_breakdown: self.signal_breakdown.clone(),
             recent_signals: self.recent_signals.clone(),
@@ -243,6 +247,23 @@ async fn scanner_start_handler(State(state): State<Arc<AppState>>) -> impl IntoR
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct NetworkSupportRequest {
+    enabled: bool,
+}
+
+async fn network_support_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<NetworkSupportRequest>,
+) -> impl IntoResponse {
+    let mut s = state.status.write().await;
+    s.network_support_enabled = req.enabled;
+    info!(enabled = req.enabled, "Network support toggled via HTTP");
+    Json(MessageResponse {
+        message: format!("Network support {}", if req.enabled { "enabled" } else { "disabled" }),
+    })
+}
+
 async fn scanner_stop_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.scanning_enabled.store(false, Ordering::Relaxed);
     info!("Scanner disabled via HTTP request");
@@ -293,6 +314,7 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/config/write", post(config_write_handler))
         .route("/scanner/start", post(scanner_start_handler))
         .route("/scanner/stop", post(scanner_stop_handler))
+        .route("/network-support", post(network_support_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

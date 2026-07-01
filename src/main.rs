@@ -210,11 +210,16 @@ async fn main() -> anyhow::Result<()> {
         info!(interval_secs = heartbeat_interval, "Heartbeat loop started");
         loop {
             interval.tick().await;
+            let net_support = {
+                let s = app_state_hb.status.read().await;
+                s.network_support_enabled
+            };
             match heartbeat_client
                 .heartbeat(
                     &heartbeat_node_id,
                     heartbeat_device_count,
                     heartbeat_serials.clone(),
+                    net_support,
                 )
                 .await
             {

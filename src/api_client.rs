@@ -28,6 +28,8 @@ struct RegisterNodeResponse {
 struct HeartbeatRequest {
     device_count: usize,
     device_serials: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    network_support_enabled: bool,
 }
 
 impl ApiClient {
@@ -80,11 +82,13 @@ impl ApiClient {
         node_id: &str,
         device_count: usize,
         device_serials: Vec<String>,
+        network_support_enabled: bool,
     ) -> anyhow::Result<()> {
         let url = format!("{}/api/nodes/{}/heartbeat", self.base_url, node_id);
         let body = HeartbeatRequest {
             device_count,
             device_serials,
+            network_support_enabled,
         };
         let resp = self
             .client
