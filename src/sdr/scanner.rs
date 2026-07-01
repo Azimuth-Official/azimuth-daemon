@@ -496,13 +496,11 @@ impl Scanner {
                 if let Some(device) = sdr_manager.device_mut(device_idx) {
                     device.set_last_tuned_freq_hz(freq);
                 }
-                self.recovery_manager.record_recovery_success();
                 Some(())
             }
             Err(e) => {
                 if !is_pipe_error(&e) {
                     warn!(device = device_idx, freq, error = %e, "Failed to tune device");
-                    self.recovery_manager.record_recovery_success();
                     return None;
                 }
 
@@ -544,7 +542,6 @@ impl Scanner {
                                             error = %e2,
                                             "Tune failed after recovery"
                                         );
-                                        self.recovery_manager.record_recovery_success();
                                         return None;
                                     }
                                 }
@@ -633,12 +630,17 @@ fn capture_with_retry(
     Err(last_err.unwrap())
 }
 
-/// Detect whether an error is a USB pipe error ( stalls / corrupted bulk transfer ).
+/// Detect whether an error is a USB transport error (pipe stall or I/O failure).
+/// Both `Pipe` and `Io` are USB-level failures that the recovery ladder should handle.
 fn is_pipe_error(err: &anyhow::Error) -> bool {
     if let Some(rtl_err) = err.downcast_ref::<rtl_sdr_rs::error::RtlsdrError>() {
-        matches!(rtl_err, rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Pipe))
+        matches!(
+            rtl_err,
+            rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Pipe)
+                | rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Io)
+        )
     } else if let Some(usb_err) = err.downcast_ref::<rusb::Error>() {
-        *usb_err == rusb::Error::Pipe
+        matches!(usb_err, rusb::Error::Pipe | rusb::Error::Io)
     } else {
         false
     }
@@ -659,15 +661,11 @@ impl Scanner {
         };
 
         match result {
-            Ok(buf) if buf.len() >= 4 => {
-                self.recovery_manager.record_recovery_success();
-                Some(buf)
-            }
+            Ok(buf) if buf.len() >= 4 => Some(buf),
             Ok(_) => None,
             Err(e) => {
                 if !is_pipe_error(&e) {
                     warn!(device = device_idx, freq, error = %e, "Capture failed after retries");
-                    self.recovery_manager.record_recovery_success();
                     return None;
                 }
 
@@ -712,7 +710,6 @@ impl Scanner {
                                             error = %e2,
                                             "Capture failed after recovery"
                                         );
-                                        self.recovery_manager.record_recovery_success();
                                         return None;
                                     }
                                 }
