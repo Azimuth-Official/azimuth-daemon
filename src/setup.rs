@@ -173,6 +173,7 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
             mode: scan_mode,
             ..Default::default()
         }),
+        ntrip: None,
     };
 
     // Write config

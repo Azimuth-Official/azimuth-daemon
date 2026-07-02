@@ -30,6 +30,10 @@ struct HeartbeatRequest {
     device_serials: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     network_support_enabled: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    rtk_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtk_provider: Option<String>,
 }
 
 impl ApiClient {
@@ -83,12 +87,16 @@ impl ApiClient {
         device_count: usize,
         device_serials: Vec<String>,
         network_support_enabled: bool,
+        rtk_enabled: bool,
+        rtk_provider: Option<String>,
     ) -> anyhow::Result<()> {
         let url = format!("{}/api/nodes/{}/heartbeat", self.base_url, node_id);
         let body = HeartbeatRequest {
             device_count,
             device_serials,
             network_support_enabled,
+            rtk_enabled,
+            rtk_provider,
         };
         let resp = self
             .client

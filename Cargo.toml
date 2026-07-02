@@ -27,6 +27,9 @@ rusb = { version = "0.9", features = ["vendored"] }
 # DSP: FFT for LTE PSS/SSS detection and signal analysis
 rustfft = "6"
 
+# Serial port access for RTK GPS receiver forwarding
+tokio-serial = "5.5"
+
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
 wdi-rs = "0.1"

@@ -15,7 +15,7 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, NtripConfig};
 use crate::sdr::SdrManager;
 
 const RTL_SDR_VID: u16 = 0x0BDA;
@@ -54,6 +54,11 @@ pub struct StatusInfo {
     pub scanning_enabled: bool,
     pub scanner_active: bool,
     pub network_support_enabled: bool,
+    pub rtk_enabled: bool,
+    pub rtk_connected: bool,
+    pub rtk_provider: Option<String>,
+    pub rtk_messages_received: u64,
+    pub rtk_last_correction: Option<String>,
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
@@ -71,6 +76,12 @@ pub struct StatusState {
     pub device_count: usize,
     pub driver_status: String,
     pub network_support_enabled: bool,
+    pub rtk_enabled: bool,
+    pub rtk_connected: bool,
+    pub rtk_provider: Option<String>,
+    pub rtk_messages_received: u64,
+    pub rtk_last_correction: Option<chrono::DateTime<chrono::Utc>>,
+    pub rtk_config: Option<NtripConfig>,
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
@@ -91,6 +102,12 @@ impl StatusState {
             device_count: 0,
             driver_status: "not_applicable".to_string(),
             network_support_enabled: false,
+            rtk_enabled: false,
+            rtk_connected: false,
+            rtk_provider: None,
+            rtk_messages_received: 0,
+            rtk_last_correction: None,
+            rtk_config: None,
             signals_found: 0,
             signal_breakdown: SignalBreakdown { lte: 0, fm: 0, dtv: 0 },
             recent_signals: Vec::new(),
@@ -115,6 +132,11 @@ impl StatusState {
             scanning_enabled,
             scanner_active,
             network_support_enabled: self.network_support_enabled,
+            rtk_enabled: self.rtk_enabled,
+            rtk_connected: self.rtk_connected,
+            rtk_provider: self.rtk_provider.clone(),
+            rtk_messages_received: self.rtk_messages_received,
+            rtk_last_correction: self.rtk_last_correction.map(|t| t.to_rfc3339()),
             signals_found: self.signals_found,
             signal_breakdown: self.signal_breakdown.clone(),
             recent_signals: self.recent_signals.clone(),
@@ -264,6 +286,76 @@ async fn network_support_handler(
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RtkConfigRequest {
+    enabled: bool,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    caster_url: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    mountpoint: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+async fn rtk_config_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RtkConfigRequest>,
+) -> impl IntoResponse {
+    let mut s = state.status.write().await;
+    s.rtk_enabled = req.enabled;
+    if let Some(provider) = req.provider.clone() {
+        s.rtk_provider = Some(provider);
+    }
+    // Build NtripConfig from request fields if provided
+    if let (Some(caster_url), Some(mountpoint)) = (req.caster_url.clone(), req.mountpoint.clone()) {
+        if !caster_url.is_empty() && !mountpoint.is_empty() {
+            s.rtk_config = Some(NtripConfig {
+                caster_url,
+                port: req.port.unwrap_or(2101),
+                mountpoint,
+                username: req.username.clone(),
+                password: req.password.clone(),
+                gga_interval_secs: 10,
+                serial_port: None,
+                baud_rate: 115200,
+            });
+        }
+    }
+    if !req.enabled {
+        s.rtk_connected = false;
+    }
+    info!(enabled = req.enabled, provider = ?req.provider, "RTK config updated via HTTP");
+    Json(MessageResponse {
+        message: format!("RTK {}", if req.enabled { "enabled" } else { "disabled" }),
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RtkStatusResponse {
+    enabled: bool,
+    connected: bool,
+    provider: Option<String>,
+    messages_received: u64,
+    last_correction: Option<String>,
+}
+
+async fn rtk_status_handler(State(state): State<Arc<AppState>>) -> Json<RtkStatusResponse> {
+    let s = state.status.read().await;
+    Json(RtkStatusResponse {
+        enabled: s.rtk_enabled,
+        connected: s.rtk_connected,
+        provider: s.rtk_provider.clone(),
+        messages_received: s.rtk_messages_received,
+        last_correction: s.rtk_last_correction.map(|t| t.to_rfc3339()),
+    })
+}
+
 async fn scanner_stop_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.scanning_enabled.store(false, Ordering::Relaxed);
     info!("Scanner disabled via HTTP request");
@@ -315,6 +407,8 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/scanner/start", post(scanner_start_handler))
         .route("/scanner/stop", post(scanner_stop_handler))
         .route("/network-support", post(network_support_handler))
+        .route("/rtk-config", post(rtk_config_handler))
+        .route("/rtk/status", get(rtk_status_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

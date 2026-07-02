@@ -9,6 +9,8 @@ pub struct Config {
     pub sdr: SdrConfig,
     #[serde(default)]
     pub scanning: Option<ScanningConfig>,
+    #[serde(default)]
+    pub ntrip: Option<NtripConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -239,6 +241,34 @@ fn default_dtv_sweep_step() -> u64 {
 }
 fn default_dtv_sweep_threshold() -> f32 {
     -25.0
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NtripConfig {
+    pub caster_url: String,
+    #[serde(default = "default_ntrip_port")]
+    pub port: u16,
+    pub mountpoint: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default = "default_gga_interval")]
+    pub gga_interval_secs: u32,
+    #[serde(default)]
+    pub serial_port: Option<String>,
+    #[serde(default = "default_baud_rate")]
+    pub baud_rate: u32,
+}
+
+fn default_ntrip_port() -> u16 {
+    2101
+}
+fn default_gga_interval() -> u32 {
+    10
+}
+fn default_baud_rate() -> u32 {
+    115200
 }
 
 impl Config {

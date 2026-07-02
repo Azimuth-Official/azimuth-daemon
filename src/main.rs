@@ -3,6 +3,7 @@ mod config;
 mod observation;
 mod sdr;
 mod setup;
+mod ntrip;
 mod status_server;
 
 use std::path::PathBuf;
@@ -210,9 +211,9 @@ async fn main() -> anyhow::Result<()> {
         info!(interval_secs = heartbeat_interval, "Heartbeat loop started");
         loop {
             interval.tick().await;
-            let net_support = {
+            let (net_support, rtk_enabled, rtk_provider) = {
                 let s = app_state_hb.status.read().await;
-                s.network_support_enabled
+                (s.network_support_enabled, s.rtk_enabled, s.rtk_provider.clone())
             };
             match heartbeat_client
                 .heartbeat(
@@ -220,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
                     heartbeat_device_count,
                     heartbeat_serials.clone(),
                     net_support,
+                    rtk_enabled,
+                    rtk_provider,
                 )
                 .await
             {
@@ -229,6 +232,39 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => error!(error = %e, "Heartbeat failed"),
             }
+        }
+    });
+
+    // Initialize RTK config from config.toml if present
+    if let Some(ref ntrip_cfg) = config.ntrip {
+        let mut s = app_state.status.write().await;
+        s.rtk_config = Some(ntrip_cfg.clone());
+    }
+
+    // Spawn NTRIP client task
+    let app_state_ntrip = Arc::clone(&app_state);
+    let node_lat = config.node.location.latitude;
+    let node_lon = config.node.location.longitude;
+    let node_alt = config.node.location.altitude_m;
+    tokio::spawn(async move {
+        loop {
+            let enabled = {
+                let s = app_state_ntrip.status.read().await;
+                s.rtk_enabled && s.rtk_config.is_some()
+            };
+            if enabled {
+                if let Err(e) = ntrip::run_ntrip_client(
+                    Arc::clone(&app_state_ntrip.status),
+                    node_lat,
+                    node_lon,
+                    node_alt,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "NTRIP client error, will retry");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
