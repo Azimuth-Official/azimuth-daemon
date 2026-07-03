@@ -1,5 +1,6 @@
 mod api_client;
 mod config;
+mod gps;
 mod observation;
 mod sdr;
 mod setup;
@@ -241,11 +242,19 @@ async fn main() -> anyhow::Result<()> {
         s.rtk_config = Some(ntrip_cfg.clone());
     }
 
+    // GPS reader task — provides RTCM3 channel and auto-detection
+    let (rtcm_tx, rtcm_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let app_state_gps = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        gps::run_gps_task(Arc::clone(&app_state_gps.status), rtcm_rx).await;
+    });
+
     // Spawn NTRIP client task
     let app_state_ntrip = Arc::clone(&app_state);
     let node_lat = config.node.location.latitude;
     let node_lon = config.node.location.longitude;
     let node_alt = config.node.location.altitude_m;
+    let rtcm_tx_ntrip = rtcm_tx.clone();
     tokio::spawn(async move {
         loop {
             let enabled = {
@@ -258,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
                     node_lat,
                     node_lon,
                     node_alt,
+                    Some(rtcm_tx_ntrip.clone()),
                 )
                 .await
                 {

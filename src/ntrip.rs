@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use crate::status_server::StatusState;
 
 /// Run the NTRIP v1 client loop. Connects to the configured caster, streams
-/// RTCM3 correction data, counts frames, optionally forwards to a serial port,
+/// RTCM3 correction data, counts frames, optionally forwards to a serial port or RTCM channel,
 /// and periodically sends GGA position reports back to the caster.
 ///
 /// Loops until `rtk_enabled` is set to false in shared state.
@@ -18,6 +18,7 @@ pub async fn run_ntrip_client(
     node_lat: f64,
     node_lon: f64,
     node_alt: f64,
+    rtcm_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 ) -> anyhow::Result<()> {
     let config = {
         let s = state.read().await;
@@ -58,7 +59,21 @@ pub async fn run_ntrip_client(
     }
 
     // Send GGA sentence as body for casters that require initial position
-    let gga = generate_gga(node_lat, node_lon, node_alt);
+    // Use GPS coordinates if available, otherwise use static node coordinates
+    let (lat, lon, alt) = {
+        let s = state.read().await;
+        if s.gps_fix_quality > 0 {
+            (
+                s.gps_latitude.unwrap_or(node_lat),
+                s.gps_longitude.unwrap_or(node_lon),
+                s.gps_altitude_m.unwrap_or(node_alt),
+            )
+        } else {
+            (node_lat, node_lon, node_alt)
+        }
+    };
+
+    let gga = generate_gga(lat, lon, alt);
     request = request.header("Ntrip-GGA", &gga);
 
     let resp = request.send().await?;
@@ -129,11 +144,19 @@ pub async fn run_ntrip_client(
                     }
 
                     frame_count += 1;
+                    let frame_data = buf[..frame_len].to_vec();
 
-                    // Forward raw frame to serial port if available
+                    // Forward via RTCM3 channel if available
+                    if let Some(ref tx) = rtcm_tx {
+                        if let Err(e) = tx.send(frame_data.clone()).await {
+                            warn!(error = %e, "RTCM3 channel send failed");
+                        }
+                    }
+
+                    // Also forward to serial port if available (backward compat)
                     if let Some(ref mut port) = serial_port {
                         use tokio::io::AsyncWriteExt;
-                        if let Err(e) = port.write_all(&buf[..frame_len]).await {
+                        if let Err(e) = port.write_all(&frame_data).await {
                             warn!(error = %e, "Serial write failed");
                         }
                     }
@@ -161,10 +184,23 @@ pub async fn run_ntrip_client(
             }
         }
 
-        // Periodic GGA injection (some casters require this to keep streaming)
+        // Periodic GGA re-generation (re-send with updated GPS coords if available)
         if last_gga.elapsed() >= gga_interval {
             last_gga = tokio::time::Instant::now();
-            debug!("GGA injection interval elapsed (would send on reconnect)");
+            let (lat, lon, alt) = {
+                let s = state.read().await;
+                if s.gps_fix_quality > 0 {
+                    (
+                        s.gps_latitude.unwrap_or(node_lat),
+                        s.gps_longitude.unwrap_or(node_lon),
+                        s.gps_altitude_m.unwrap_or(node_alt),
+                    )
+                } else {
+                    (node_lat, node_lon, node_alt)
+                }
+            };
+            let _gga = generate_gga(lat, lon, alt);
+            debug!("GGA re-generated with current position");
         }
     }
 

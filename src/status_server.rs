@@ -17,6 +17,8 @@ use tracing::{info, warn};
 
 use crate::config::{Config, NtripConfig};
 use crate::sdr::SdrManager;
+use crate::gps::AccuracyPoint;
+use std::collections::VecDeque;
 
 const RTL_SDR_VID: u16 = 0x0BDA;
 const RTL_SDR_PID: u16 = 0x2832;
@@ -62,6 +64,9 @@ pub struct StatusInfo {
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
+    pub gps_detected: bool,
+    pub gps_fix_quality: u8,
+    pub gps_hdop: Option<f32>,
 }
 
 pub struct StatusState {
@@ -85,6 +90,20 @@ pub struct StatusState {
     pub signals_found: u64,
     pub signal_breakdown: SignalBreakdown,
     pub recent_signals: Vec<RecentSignal>,
+    pub gps_detected: bool,
+    pub gps_port: Option<String>,
+    pub gps_device_name: Option<String>,
+    pub gps_fix_quality: u8,
+    pub gps_satellites: u8,
+    pub gps_hdop: Option<f32>,
+    pub gps_latitude: Option<f64>,
+    pub gps_longitude: Option<f64>,
+    pub gps_altitude_m: Option<f64>,
+    pub gps_speed_knots: Option<f32>,
+    pub gps_lat_error_m: Option<f32>,
+    pub gps_lon_error_m: Option<f32>,
+    pub gps_last_fix: Option<String>,
+    pub gps_accuracy_history: VecDeque<AccuracyPoint>,
 }
 
 impl StatusState {
@@ -111,6 +130,20 @@ impl StatusState {
             signals_found: 0,
             signal_breakdown: SignalBreakdown { lte: 0, fm: 0, dtv: 0 },
             recent_signals: Vec::new(),
+            gps_detected: false,
+            gps_port: None,
+            gps_device_name: None,
+            gps_fix_quality: 0,
+            gps_satellites: 0,
+            gps_hdop: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude_m: None,
+            gps_speed_knots: None,
+            gps_lat_error_m: None,
+            gps_lon_error_m: None,
+            gps_last_fix: None,
+            gps_accuracy_history: VecDeque::new(),
         }
     }
 
@@ -140,6 +173,9 @@ impl StatusState {
             signals_found: self.signals_found,
             signal_breakdown: self.signal_breakdown.clone(),
             recent_signals: self.recent_signals.clone(),
+            gps_detected: self.gps_detected,
+            gps_fix_quality: self.gps_fix_quality,
+            gps_hdop: self.gps_hdop,
         }
     }
 }
@@ -356,6 +392,49 @@ async fn rtk_status_handler(State(state): State<Arc<AppState>>) -> Json<RtkStatu
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct GpsStatusResponse {
+    detected: bool,
+    port: Option<String>,
+    device_name: Option<String>,
+    fix_quality: u8,
+    satellites: u8,
+    hdop: Option<f32>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    altitude_m: Option<f64>,
+    speed_knots: Option<f32>,
+    lat_error_m: Option<f32>,
+    lon_error_m: Option<f32>,
+    last_fix: Option<String>,
+    accuracy_history: Vec<AccuracyPoint>,
+}
+
+async fn gps_status_handler(State(state): State<Arc<AppState>>) -> Json<GpsStatusResponse> {
+    let s = state.status.read().await;
+    Json(GpsStatusResponse {
+        detected: s.gps_detected,
+        port: s.gps_port.clone(),
+        device_name: s.gps_device_name.clone(),
+        fix_quality: s.gps_fix_quality,
+        satellites: s.gps_satellites,
+        hdop: s.gps_hdop,
+        latitude: s.gps_latitude,
+        longitude: s.gps_longitude,
+        altitude_m: s.gps_altitude_m,
+        speed_knots: s.gps_speed_knots,
+        lat_error_m: s.gps_lat_error_m,
+        lon_error_m: s.gps_lon_error_m,
+        last_fix: s.gps_last_fix.clone(),
+        accuracy_history: s.gps_accuracy_history.iter().cloned().collect(),
+    })
+}
+
+async fn serial_ports_handler(State(_state): State<Arc<AppState>>) -> Json<Vec<crate::gps::SerialPortInfo>> {
+    let ports = crate::gps::list_serial_ports();
+    Json(ports)
+}
+
 async fn scanner_stop_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.scanning_enabled.store(false, Ordering::Relaxed);
     info!("Scanner disabled via HTTP request");
@@ -409,6 +488,8 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/network-support", post(network_support_handler))
         .route("/rtk-config", post(rtk_config_handler))
         .route("/rtk/status", get(rtk_status_handler))
+        .route("/gps/status", get(gps_status_handler))
+        .route("/serial/ports", get(serial_ports_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)

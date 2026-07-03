@@ -29,6 +29,8 @@ rustfft = "6"
 
 # Serial port access for RTK GPS receiver forwarding
 tokio-serial = "5.5"
+nmea = "0.7"
+serialport = "4"
 
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)

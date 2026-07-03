@@ -11,6 +11,8 @@ pub struct Config {
     pub scanning: Option<ScanningConfig>,
     #[serde(default)]
     pub ntrip: Option<NtripConfig>,
+    #[serde(default)]
+    pub gps: Option<GpsConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -269,6 +271,26 @@ fn default_gga_interval() -> u32 {
 }
 fn default_baud_rate() -> u32 {
     115200
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct GpsConfig {
+    #[serde(default = "default_gps_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub port: Option<String>,
+    #[serde(default)]
+    pub baud_rate: Option<u32>,
+    #[serde(default = "default_sample_interval")]
+    pub sample_interval_secs: u64,
+}
+
+fn default_gps_enabled() -> bool {
+    true
+}
+
+fn default_sample_interval() -> u64 {
+    10
 }
 
 impl Config {

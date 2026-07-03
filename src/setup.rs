@@ -174,6 +174,7 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
             ..Default::default()
         }),
         ntrip: None,
+        gps: None,
     };
 
     // Write config
