@@ -126,7 +126,16 @@ pub async fn run_ntrip_client(
             }
         }
 
-        match response.chunk().await {
+        // Guard against a stalled caster that holds the socket open but sends no data:
+        // bound each read so we break out and let the parent task reconnect.
+        let chunk = match tokio::time::timeout(Duration::from_secs(120), response.chunk()).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("NTRIP stream stalled (no data for 120s) — reconnecting");
+                break;
+            }
+        };
+        match chunk {
             Ok(Some(chunk)) => {
                 buf.extend_from_slice(&chunk);
 
