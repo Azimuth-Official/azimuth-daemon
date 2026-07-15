@@ -1,3 +1,15 @@
 /target/
 config.toml
+config.toml.*
+config_*_test.toml
 .env
+*.bak.*
+*.log
+.serena/
+.azimuth-fix-backups/
+installer/*.exe
+src.bak*/
+src/sdr.bak*/
+config.smoke*.toml
+smoke_*.log
+smoke2_*.log

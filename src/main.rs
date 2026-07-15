@@ -1,6 +1,7 @@
 mod api_client;
 mod config;
 mod gps;
+mod identity;
 mod observation;
 mod sdr;
 mod setup;
@@ -112,56 +113,175 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = Config::load(&cli.config)?;
-    info!("Config loaded from {}", cli.config.display());
-
-    // Config validation
-    if let Err(errors) = config.validate() {
-        eprintln!("ERROR: Config validation failed ({} errors):", errors.len());
-        for e in &errors {
-            eprintln!("  * {}", e);
+    // Config load failure must NOT kill the daemon: under NSSM that means a
+    // silent restart loop, under the desktop sidecar a dead app. Fall back to
+    // defaults and surface the error through /status instead.
+    let (mut config, config_load_error) = match Config::load(&cli.config) {
+        Ok(c) => {
+            info!("Config loaded from {}", cli.config.display());
+            (c, None)
         }
-        if config.has_placeholder_values() {
-            eprintln!("\nRun 'azimuth-daemon --setup' to configure.");
+        Err(e) => {
+            error!(error = %e, path = %cli.config.display(),
+                "Config load failed — starting with defaults; run 'azimuth-daemon --setup'");
+            (Config::default(), Some(format!("Config load failed: {e}")))
         }
-        std::process::exit(1);
-    }
+    };
 
-    if config.api.key.is_empty() {
-        anyhow::bail!("api.key is empty — run 'azimuth-daemon --setup' to configure");
-    }
-
-    let client = Arc::new(ApiClient::new(&config.api.url, &config.api.key));
-
-    // Auto-register node if no node_id
-    if config.node.id.is_empty() {
-        info!("No node_id — registering node via API");
-        let node_id = client
-            .register_node(
-                &config.node.hardware_type,
-                &config.node.label,
-                config.node.location.latitude,
-                config.node.location.longitude,
-                config.node.location.altitude_m,
-            )
-            .await?;
-        config.node.id = node_id;
-        config.save(&cli.config)?;
-        info!(node_id = %config.node.id, "Node registered and saved to config");
-    }
-
-    let node_id = config.node.id.clone();
-
-    // Status server state
+    // Status server state — create early so we can report config errors via HTTP
     let app_state = Arc::new(AppState {
         status: Arc::new(RwLock::new(StatusState::new(
-            node_id.clone(),
+            "pending".to_string(),
             config.node.hardware_type.clone(),
         ))),
         scanning_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         scanner_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config_path: cli.config.clone(),
     });
+
+    // Spawn status server early so sidecar can always query it
+    let status_bind = config.daemon.status_bind.clone();
+    let app_state_clone = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        run_status_server(&status_bind, app_state_clone).await;
+    });
+
+    // Collect config problems and surface them all via /status.
+    let mut config_errors: Vec<String> = Vec::new();
+    if let Some(e) = config_load_error {
+        config_errors.push(e);
+    }
+
+    // Config validation — log errors but don't exit hard
+    if let Err(errors) = config.validate() {
+        error!("Config validation failed ({} errors):", errors.len());
+        for e in &errors {
+            error!("  * {}", e);
+        }
+        config_errors.push(format!("Validation failed: {}", errors.join("; ")));
+    }
+
+    // Check API key separately — this is critical for operation
+    let has_valid_api_key = !config.api.key.is_empty() && config.api.key != "YOUR_API_KEY_HERE";
+    if !has_valid_api_key {
+        let msg = "api.key is not configured — run 'azimuth-daemon --setup' to configure";
+        error!("{}", msg);
+        config_errors.push(msg.to_string());
+    }
+
+    if !config_errors.is_empty() {
+        let mut state = app_state.status.write().await;
+        state.config_error = Some(config_errors.join(" | "));
+    }
+
+    let client = Arc::new(ApiClient::new(&config.api.url, &config.api.key));
+
+    // Machine-scoped identity + fingerprinted registration keep reinstalls
+    // from creating duplicate nodes. Registration goes first: the server
+    // dedupes on (user, fingerprint), which is correctly account-scoped. The
+    // local identity file is the offline fallback only — it is not bound to an
+    // account, so it is trusted only when the API cannot be reached.
+    let fingerprint = identity::machine_fingerprint();
+    if !config.node.id.is_empty() {
+        // Config already has an id — make sure the identity file exists too.
+        identity::save(&cli.config, &config.node.id);
+    } else if has_valid_api_key {
+        info!("No node_id — attempting registration via API");
+        match client
+            .register_node(
+                &config.node.hardware_type,
+                &config.node.label,
+                config.node.location.latitude,
+                config.node.location.longitude,
+                config.node.location.altitude_m,
+                Some(&fingerprint),
+            )
+            .await
+        {
+            Ok(node_id) => {
+                config.node.id = node_id;
+                if let Err(e) = config.save(&cli.config) {
+                    warn!(error = %e, "Failed to save node_id to config");
+                }
+                identity::save(&cli.config, &config.node.id);
+                info!(node_id = %config.node.id, "Node registered");
+            }
+            Err(e) => {
+                if let Some(saved) = identity::load(&cli.config) {
+                    warn!(error = %e, node_id = %saved.node_id,
+                        "Registration unreachable — adopting persisted node identity; \
+                         if this machine changed accounts, re-run 'azimuth-daemon --setup'");
+                    config.node.id = saved.node_id;
+                    if let Err(e) = config.save(&cli.config) {
+                        warn!(error = %e, "Failed to save adopted node_id to config");
+                    }
+                } else {
+                    warn!(error = %e, "Node registration failed — will use placeholder and retry in background");
+                    config.node.id = format!("placeholder-{}", uuid::Uuid::new_v4());
+                }
+            }
+        }
+    } else {
+        // No API key yet (fresh install before setup) — placeholder keeps the
+        // daemon alive and visible; heartbeats are suppressed for placeholders.
+        config.node.id = format!("placeholder-{}", uuid::Uuid::new_v4());
+    }
+
+    let node_id = config.node.id.clone();
+
+    // Update node_id in app_state
+    {
+        let mut state = app_state.status.write().await;
+        state.node_id = node_id.clone();
+    }
+
+    // Background registration retry — a placeholder id means the first
+    // registration attempt failed (offline install, API blip). Retry until it
+    // succeeds so the node eventually joins without a manual restart.
+    if node_id.starts_with("placeholder-") && has_valid_api_key {
+        let retry_client = Arc::clone(&client);
+        let retry_config_path = cli.config.clone();
+        let retry_node = config.node.clone();
+        let retry_fingerprint = fingerprint.clone();
+        let app_state_retry = Arc::clone(&app_state);
+        tokio::spawn(async move {
+            const RETRY_INTERVAL_SECS: u64 = 300;
+            const MAX_RETRIES: u32 = 288; // ~24h
+            for attempt in 1..=MAX_RETRIES {
+                tokio::time::sleep(Duration::from_secs(RETRY_INTERVAL_SECS)).await;
+                info!(attempt, "Retrying node registration");
+                match retry_client
+                    .register_node(
+                        &retry_node.hardware_type,
+                        &retry_node.label,
+                        retry_node.location.latitude,
+                        retry_node.location.longitude,
+                        retry_node.location.altitude_m,
+                        Some(&retry_fingerprint),
+                    )
+                    .await
+                {
+                    Ok(real_id) => {
+                        info!(node_id = %real_id, "Deferred registration succeeded");
+                        if let Ok(mut cfg) = Config::load(&retry_config_path) {
+                            cfg.node.id = real_id.clone();
+                            if let Err(e) = cfg.save(&retry_config_path) {
+                                warn!(error = %e, "Failed to save node_id after deferred registration");
+                            }
+                        }
+                        identity::save(&retry_config_path, &real_id);
+                        let mut state = app_state_retry.status.write().await;
+                        state.node_id = real_id;
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, attempt, "Deferred registration failed; will retry");
+                    }
+                }
+            }
+            error!("Deferred registration exhausted after 24h; restart the daemon to retry");
+        });
+    }
 
     // SDR manager — handles driver install on Windows, enumerates all devices
     let mut sdr_manager = SdrManager::new(
@@ -193,16 +313,10 @@ async fn main() -> anyhow::Result<()> {
         "SDR devices initialized"
     );
 
-    // Spawn status server
-    let status_bind = config.daemon.status_bind.clone();
-    let app_state_clone = Arc::clone(&app_state);
-    tokio::spawn(async move {
-        run_status_server(&status_bind, app_state_clone).await;
-    });
-
-    // Spawn heartbeat loop with device info
+    // Spawn heartbeat loop with device info. The node id is re-read from
+    // shared state every tick so a deferred registration is picked up, and
+    // placeholder ids are never sent (they can only 404).
     let heartbeat_client = Arc::clone(&client);
-    let heartbeat_node_id = node_id.clone();
     let heartbeat_interval = config.daemon.heartbeat_interval_secs;
     let heartbeat_device_count = sdr_manager.device_count();
     let heartbeat_serials = sdr_manager.device_serials();
@@ -212,13 +326,17 @@ async fn main() -> anyhow::Result<()> {
         info!(interval_secs = heartbeat_interval, "Heartbeat loop started");
         loop {
             interval.tick().await;
-            let (net_support, rtk_enabled, rtk_provider) = {
+            let (current_node_id, net_support, rtk_enabled, rtk_provider) = {
                 let s = app_state_hb.status.read().await;
-                (s.network_support_enabled, s.rtk_enabled, s.rtk_provider.clone())
+                (s.node_id.clone(), s.network_support_enabled, s.rtk_enabled, s.rtk_provider.clone())
             };
+            if current_node_id.is_empty() || current_node_id.starts_with("placeholder-") {
+                tracing::debug!("Skipping heartbeat — node not yet registered");
+                continue;
+            }
             match heartbeat_client
                 .heartbeat(
-                    &heartbeat_node_id,
+                    &current_node_id,
                     heartbeat_device_count,
                     heartbeat_serials.clone(),
                     net_support,

@@ -97,7 +97,14 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
 
     println!("  Registering node...");
     let node_id = client
-        .register_node("tier1_rtlsdr", &node_name, lat, lon, 0.0)
+        .register_node(
+            "tier1_rtlsdr",
+            &node_name,
+            lat,
+            lon,
+            0.0,
+            Some(&crate::identity::machine_fingerprint()),
+        )
         .await
         .map_err(|e| {
             anyhow::anyhow!(

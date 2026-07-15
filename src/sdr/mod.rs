@@ -53,6 +53,7 @@ impl SdrDevice {
         &self.serial
     }
 
+    #[allow(dead_code)]
     pub fn index(&self) -> u32 {
         self.index
     }
@@ -87,7 +88,7 @@ impl SdrDevice {
             .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
     }
 
-    /// Set gain (Auto or Manual).
+    #[allow(dead_code)]
     pub fn set_gain(&mut self, gain: &GainSetting) -> anyhow::Result<()> {
         let tuner_gain = match gain {
             GainSetting::Auto => TunerGain::Auto,
@@ -114,6 +115,7 @@ impl SdrDevice {
         Ok(buf)
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         true // If we have a handle, it's connected
     }
@@ -257,6 +259,7 @@ impl SdrManager {
         self.devices.len()
     }
 
+    #[allow(dead_code)]
     pub fn devices(&self) -> &[SdrDevice] {
         &self.devices
     }

@@ -97,10 +97,8 @@ pub fn extract_rds(audio_samples: &[f32], audio_rate: u32) -> Option<RdsData> {
     let mut pi_code = None;
 
     for block in &blocks {
-        if block.offset == RDS_OFFSET_A {
-            if pi_code.is_none() {
-                pi_code = Some(block.data as u16);
-            }
+        if block.offset == RDS_OFFSET_A && pi_code.is_none() {
+            pi_code = Some(block.data as u16);
         }
     }
 
@@ -264,9 +262,9 @@ fn derive_callsign(pi: u16) -> Option<String> {
 
     // W-stations: PI codes typically >= 0x54A8 for eastern US
     // K-stations: PI codes typically >= 0x1000 and < 0x54A8 for western US
-    let (prefix, base_val) = if pi_val >= 0x54A8 && pi_val <= 0x9FFF {
+    let (prefix, base_val) = if (0x54A8..=0x9FFF).contains(&pi_val) {
         ('W', pi_val - 0x54A8)
-    } else if pi_val >= 0x1000 && pi_val < 0x54A8 {
+    } else if (0x1000..0x54A8).contains(&pi_val) {
         ('K', pi_val - 0x1000)
     } else {
         return None;

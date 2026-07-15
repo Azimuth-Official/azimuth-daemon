@@ -54,7 +54,7 @@ fn generate_pss_template(nid2: usize) -> Vec<Complex<f32>> {
 
     // LTE PSS placement: subcarriers -31..-1, 1..31 (skip DC at index 0)
     // In FFT indexing: [97..127] and [1..31]
-    let start_idx = (PSS_FFT_SIZE - PSS_SEQ_LEN / 2) as usize; // 97
+    let start_idx = PSS_FFT_SIZE - PSS_SEQ_LEN / 2; // 97
     for (i, &val) in zc.iter().enumerate() {
         if i < PSS_SEQ_LEN / 2 {
             freq_domain[start_idx + i] = val;
@@ -114,7 +114,7 @@ fn fft_correlate(capture: &[Complex<f32>], template: &[Complex<f32>]) -> Vec<f32
     // Compute FFT(capture) * conj(FFT(template))
     for i in 0..fft_size {
         let temp_conj = Complex::new(tpl_fft[i].re, -tpl_fft[i].im);
-        cap_fft[i] = cap_fft[i] * temp_conj;
+        cap_fft[i] *= temp_conj;
     }
 
     // IFFT back to time domain
@@ -122,12 +122,11 @@ fn fft_correlate(capture: &[Complex<f32>], template: &[Complex<f32>]) -> Vec<f32
     ifft.process(&mut cap_fft);
 
     // Normalize and extract magnitudes
-    let mut result = Vec::with_capacity(capture.len());
-    for i in 0..capture.len() {
-        let magnitude = cap_fft[i].norm() / (fft_size as f32);
-        result.push(magnitude);
-    }
-    result
+    cap_fft
+        .iter()
+        .take(capture.len())
+        .map(|c| c.norm() / (fft_size as f32))
+        .collect()
 }
 
 /// Compute template energy (sum of squared magnitudes).
@@ -243,11 +242,7 @@ fn detect_nid1(
     // SSS is in the OFDM symbol before PSS
     // In LTE, each OFDM symbol is ~2048 samples at 2 MHz rate
     // For simplicity, assume SSS starts ~128 samples before PSS
-    let sss_start = if pss_peak_idx >= 128 {
-        pss_peak_idx - 128
-    } else {
-        0
-    };
+    let sss_start = pss_peak_idx.saturating_sub(128);
     let sss_end = sss_start + 62;
 
     if sss_end > iq_capture.len() {
@@ -293,15 +288,14 @@ fn estimate_frequency_offset(pss_template: &[Complex<f32>], sample_rate: u32) ->
     let mut cross_corr = Complex::new(0.0, 0.0);
     for (a, b) in first_half.iter().zip(second_half.iter()) {
         let product = a * b.conj();
-        cross_corr = cross_corr + product;
+        cross_corr += product;
     }
 
     // Frequency offset is derived from the phase angle
     let angle = cross_corr.arg(); // angle in radians [-PI, PI]
     let t_half = (half as f32) / (sample_rate as f32);
-    let freq_offset = angle / (PI * t_half);
 
-    freq_offset
+    angle / (PI * t_half)
 }
 
 /// Detect LTE cells in raw IQ capture by correlating PSS sequences.

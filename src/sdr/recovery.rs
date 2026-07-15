@@ -42,6 +42,7 @@ impl RecoveryManager {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn with_os_device_id(os_device_id: Option<String>) -> Self {
         Self {
             os_device_id,
@@ -53,6 +54,7 @@ impl RecoveryManager {
         self.os_device_id.as_deref()
     }
 
+    #[allow(dead_code)]
     pub fn set_os_device_id(&mut self, id: Option<String>) {
         self.os_device_id = id;
     }
@@ -243,7 +245,7 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
             );
         }
         info!(instance_id, "Windows PnP device re-enabled successfully");
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

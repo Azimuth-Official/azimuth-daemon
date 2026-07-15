@@ -1,0 +1,22 @@
+[Unit]
+Description=Azimuth positioning network daemon (Tier 1 SDR node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/azimuth-daemon --config /etc/azimuth/config.toml
+Restart=on-failure
+RestartSec=10
+# Exit 0 = daemon yielded to a sibling instance on the status port; do not
+# restart, or the pair flaps forever. Any other non-zero exit restarts.
+SuccessExitStatus=0
+RestartPreventExitStatus=0
+# Machine-scoped identity lives in /var/lib/azimuth (survives reinstall).
+StateDirectory=azimuth
+ConfigurationDirectory=azimuth
+# USB access for the RTL-SDR is granted via the udev rule shipped alongside.
+DevicePolicy=auto
+
+[Install]
+WantedBy=multi-user.target

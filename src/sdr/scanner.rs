@@ -138,8 +138,8 @@ impl Scanner {
         let mut freq = self.fm_config.sweep_start;
         while freq <= self.fm_config.sweep_end {
             if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
-                let device = sdr_manager.device_mut(0).unwrap();
-                if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
+                if let Some(device) = sdr_manager.device_mut(0) {
+                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
                     let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
                     if dbfs > self.fm_config.sweep_threshold as f64 {
                         // SNR gate — verify real station, not noise spike
@@ -151,6 +151,7 @@ impl Scanner {
                                 debug!(freq_mhz = freq as f64 / 1e6, snr = format!("{:.1}", demod.snr_db), "Power OK but SNR too low");
                             }
                         }
+                    }
                     }
                 }
             }
@@ -164,15 +165,16 @@ impl Scanner {
             let mut freq = band.start;
             while freq <= band.end {
                 if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
-                let device = sdr_manager.device_mut(0).unwrap();
-                if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
-                    let detections = super::lte::detect_lte_cells(&iq, device.sample_rate());
-                    if !detections.is_empty() {
-                        info!(freq_mhz = freq as f64 / 1e6, cells = detections.len(), "LTE cells detected");
-                        result.lte_cells.push(freq);
+                    if let Some(device) = sdr_manager.device_mut(0) {
+                        if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
+                            let detections = super::lte::detect_lte_cells(&iq, device.sample_rate());
+                            if !detections.is_empty() {
+                                info!(freq_mhz = freq as f64 / 1e6, cells = detections.len(), "LTE cells detected");
+                                result.lte_cells.push(freq);
+                            }
+                        }
                     }
                 }
-            }
                 freq += band.step;
             }
         }
@@ -186,11 +188,12 @@ impl Scanner {
             // Tune to place pilot in capture window
             let pilot_tune = freq + 309_441; // Pilot offset from channel lower edge
             if self.tune_with_recovery(sdr_manager, 0, pilot_tune).is_some() {
-                let device = sdr_manager.device_mut(0).unwrap();
-                if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
-                    if super::dtv::extract_atsc_pilot(&iq, device.sample_rate(), pilot_tune).is_some() {
-                        info!(freq_mhz = freq as f64 / 1e6, "DTV channel found");
-                        result.dtv_channels.push(freq);
+                if let Some(device) = sdr_manager.device_mut(0) {
+                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
+                        if super::dtv::extract_atsc_pilot(&iq, device.sample_rate(), pilot_tune).is_some() {
+                            info!(freq_mhz = freq as f64 / 1e6, "DTV channel found");
+                            result.dtv_channels.push(freq);
+                        }
                     }
                 }
             }
@@ -636,7 +639,7 @@ fn capture_with_retry(
             }
         }
     }
-    Err(last_err.unwrap())
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("capture failed with no recorded error")))
 }
 
 /// Detect whether an error is a USB transport error (pipe stall or I/O failure).

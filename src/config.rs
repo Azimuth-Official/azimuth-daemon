@@ -21,7 +21,7 @@ pub struct ApiConfig {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
     pub id: String,
     pub hardware_type: String,
@@ -29,7 +29,7 @@ pub struct NodeConfig {
     pub location: LocationConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocationConfig {
     pub latitude: f64,
     pub longitude: f64,
@@ -53,6 +53,45 @@ pub struct SdrConfig {
     pub gain: i32,
     #[serde(default = "default_dbm_offset")]
     pub dbm_offset: f32,
+}
+
+impl Default for Config {
+    /// Safe in-memory defaults used when config.toml is missing or corrupt.
+    /// The daemon starts, reports the problem via /status config_error, and
+    /// waits for setup instead of crash-looping under the service manager.
+    fn default() -> Self {
+        Self {
+            api: ApiConfig {
+                url: "https://azimuth.day".to_string(),
+                key: String::new(),
+            },
+            node: NodeConfig {
+                id: String::new(),
+                hardware_type: "tier1_rtlsdr".to_string(),
+                label: String::new(),
+                location: LocationConfig {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    altitude_m: 0.0,
+                },
+            },
+            daemon: DaemonConfig {
+                heartbeat_interval_secs: 15,
+                submit_interval_secs: 30,
+                status_bind: "127.0.0.1:8420".to_string(),
+            },
+            sdr: SdrConfig {
+                device_index: None,
+                sample_rate: 2_048_000,
+                center_frequency: default_center_frequency(),
+                gain: -1,
+                dbm_offset: default_dbm_offset(),
+            },
+            scanning: None,
+            ntrip: None,
+            gps: None,
+        }
+    }
 }
 
 fn default_center_frequency() -> u64 {
@@ -380,6 +419,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_placeholder_values(&self) -> bool {
         self.api.key.is_empty()
             || self.api.key == "YOUR_API_KEY_HERE"

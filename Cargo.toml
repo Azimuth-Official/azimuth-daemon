@@ -1,6 +1,6 @@
 [package]
 name = "azimuth-daemon"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"
@@ -18,6 +18,7 @@ axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
+sha2 = "0.10"
 
 # SDR hardware access
 # NOTE: Linux cross-build may need libusb-dev in cross-rs container — see Cross.toml

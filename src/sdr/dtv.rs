@@ -50,7 +50,7 @@ fn atsc_pilot_frequency(channel: u32) -> f64 {
 /// # Arguments
 ///
 /// * `iq_bytes` - Raw RTL-SDR IQ data (interleaved unsigned 8-bit I, Q pairs).
-///                Minimum 4096 bytes required; returns None if shorter.
+///   Minimum 4096 bytes required; returns None if shorter.
 /// * `sample_rate` - SDR sample rate in Hz (typically 2,048,000 for RTL-SDR).
 /// * `center_freq_hz` - RTL-SDR center frequency in Hz.
 ///
@@ -192,15 +192,14 @@ pub fn extract_atsc_pilot(
     let nominal_pilot_freq = atsc_pilot_frequency(best_channel);
 
     // Step 9: Compute pilot SNR
-    let peak_bin_usize = peak_bin as usize;
-    let mut pilot_power = power_spectrum[peak_bin_usize] as f64;
+    let mut pilot_power = power_spectrum[peak_bin] as f64;
 
     // Add leakage from adjacent bins
-    if peak_bin_usize > 0 {
-        pilot_power += power_spectrum[peak_bin_usize - 1] as f64;
+    if peak_bin > 0 {
+        pilot_power += power_spectrum[peak_bin - 1] as f64;
     }
-    if peak_bin_usize < fft_size - 1 {
-        pilot_power += power_spectrum[peak_bin_usize + 1] as f64;
+    if peak_bin < fft_size - 1 {
+        pilot_power += power_spectrum[peak_bin + 1] as f64;
     }
 
     // Compute noise floor: mean of ±50 bins, excluding ±5 around peak

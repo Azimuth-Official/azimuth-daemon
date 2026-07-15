@@ -52,6 +52,14 @@ Section "Azimuth Daemon" SecDaemon
         CopyFiles /SILENT "$INSTDIR\config.example.toml" "$INSTDIR\config.toml"
     skip_config:
 
+    ; Machine-scoped identity dir: %ProgramData%\Azimuth holds node-identity.json
+    ; so the node keeps its identity across uninstall/reinstall. Grant Users
+    ; Modify so the user-context desktop sidecar writes the SAME file as the
+    ; SYSTEM-context service (one identity per machine — no split-brain).
+    ReadEnvStr $0 "ProgramData"
+    CreateDirectory "$0\Azimuth"
+    nsExec::ExecToLog 'icacls "$0\Azimuth" /grant "*S-1-5-32-545:(OI)(CI)M"'
+
     ; Install NSSM service
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" install AzimuthDaemon "$INSTDIR\azimuth-daemon.exe"'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppDirectory "$INSTDIR"'
@@ -62,6 +70,10 @@ Section "Azimuth Daemon" SecDaemon
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppStderr "$INSTDIR\logs\daemon-error.log"'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppRotateFiles 1'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppRotateBytes 10485760'
+    ; Exit-code policy: 0 = daemon yielded to a sibling instance on the status
+    ; port (do NOT restart, or the pair flaps forever); anything else restarts.
+    nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppExit Default Restart'
+    nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppExit 0 Exit'
 
     ; Start Menu shortcuts
     CreateDirectory "$SMPROGRAMS\Azimuth"
@@ -109,4 +121,7 @@ Section "Uninstall"
 
     ; Remove install dir only if empty (config.toml preserved)
     RMDir "$INSTDIR"
+
+    ; INVARIANT: never delete %ProgramData%\Azimuth or node-identity.json.
+    ; That file is what prevents duplicate node registrations after reinstall.
 SectionEnd

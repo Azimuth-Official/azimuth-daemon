@@ -17,6 +17,8 @@ struct RegisterNodeRequest {
     latitude: f64,
     longitude: f64,
     altitude_m: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,7 +41,10 @@ struct HeartbeatRequest {
 impl ApiClient {
     pub fn new(base_url: &str, api_key: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
         }
@@ -52,6 +57,7 @@ impl ApiClient {
         lat: f64,
         lon: f64,
         alt: f64,
+        machine_fingerprint: Option<&str>,
     ) -> anyhow::Result<String> {
         let url = format!("{}/api/nodes/register", self.base_url);
         let body = RegisterNodeRequest {
@@ -60,6 +66,7 @@ impl ApiClient {
             latitude: lat,
             longitude: lon,
             altitude_m: alt,
+            machine_fingerprint: machine_fingerprint.map(|s| s.to_string()),
         };
 
         let resp = self

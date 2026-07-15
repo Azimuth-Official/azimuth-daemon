@@ -1,0 +1,12 @@
+# Azimuth — RTL-SDR (RTL2832U) USB access for the daemon.
+# Grants non-root read/write to the SDR so azimuth-daemon can open it.
+# Install to /etc/udev/rules.d/99-azimuth-rtlsdr.rules then:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Realtek RTL2832U (0bda:2832 DVB-T, 0bda:2838 RTL-SDR blog, and common clones)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# The kernel DVB driver claims the dongle and blocks SDR use. Blacklist it:
+#   echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/blacklist-azimuth-rtlsdr.conf
+#   sudo modprobe -r dvb_usb_rtl28xxu   (or reboot)

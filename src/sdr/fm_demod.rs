@@ -36,7 +36,7 @@ pub fn demodulate_fm(iq_bytes: &[u8], _sample_rate: u32) -> Option<FmDemodResult
     }
 
     // Must have even number of bytes (I,Q pairs)
-    if iq_bytes.len() % 2 != 0 {
+    if !iq_bytes.len().is_multiple_of(2) {
         return None;
     }
 

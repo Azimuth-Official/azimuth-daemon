@@ -67,6 +67,10 @@ pub struct StatusInfo {
     pub gps_detected: bool,
     pub gps_fix_quality: u8,
     pub gps_hdop: Option<f32>,
+    /// Non-null when the daemon started with a config problem (missing file,
+    /// validation failure, unconfigured API key). The desktop app surfaces
+    /// this as a "setup needed" state instead of appearing dead.
+    pub config_error: Option<String>,
 }
 
 pub struct StatusState {
@@ -104,6 +108,7 @@ pub struct StatusState {
     pub gps_lon_error_m: Option<f32>,
     pub gps_last_fix: Option<String>,
     pub gps_accuracy_history: VecDeque<AccuracyPoint>,
+    pub config_error: Option<String>,
 }
 
 impl StatusState {
@@ -144,6 +149,7 @@ impl StatusState {
             gps_lon_error_m: None,
             gps_last_fix: None,
             gps_accuracy_history: VecDeque::new(),
+            config_error: None,
         }
     }
 
@@ -176,6 +182,7 @@ impl StatusState {
             gps_detected: self.gps_detected,
             gps_fix_quality: self.gps_fix_quality,
             gps_hdop: self.gps_hdop,
+            config_error: self.config_error.clone(),
         }
     }
 }
@@ -222,7 +229,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusInfo> 
 }
 
 async fn sdr_list_handler(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let entries = tokio::task::block_in_place(|| enumerate_sdr_devices());
+    let entries = tokio::task::block_in_place(enumerate_sdr_devices);
     match entries {
         Ok(list) => Ok(Json(list)),
         Err(e) => {
@@ -273,9 +280,30 @@ async fn sdr_test_handler(
 
 async fn config_write_handler(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<Config>,
+    Json(mut config): Json<Config>,
 ) -> impl IntoResponse {
     let config_path = state.config_path.clone();
+
+    // Identity preservation chokepoint: the setup wizard (and any other
+    // writer) sends node.id = "" — re-running setup must NOT discard an
+    // already-registered node identity, or every reinstall creates a
+    // duplicate node. Fill an empty incoming id from the on-disk config,
+    // then from the machine identity file. Explicit non-empty ids are
+    // honored unchanged.
+    if config.node.id.is_empty() {
+        let existing_id = Config::load(&config_path)
+            .ok()
+            .map(|c| c.node.id)
+            .filter(|id| !id.is_empty() && !id.starts_with("placeholder-"));
+        let adopted = existing_id.or_else(|| {
+            crate::identity::load(&config_path).map(|i| i.node_id)
+        });
+        if let Some(id) = adopted {
+            info!(node_id = %id, "Preserving existing node identity through config write");
+            config.node.id = id;
+        }
+    }
+
     let config_path_for_save = config_path.clone();
     let result = tokio::task::block_in_place(move || config.save(&config_path_for_save));
     match result {
@@ -492,9 +520,65 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/serial/ports", get(serial_ports_handler))
         .with_state(Arc::clone(&state));
 
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .expect("Failed to bind status server");
-    info!(addr = bind_addr, "Status server listening");
-    axum::serve(listener, app).await.expect("Status server error");
+    // Bind with retry: transient TIME_WAIT or a just-exiting old instance
+    // resolves within seconds. A daemon without its status server is invisible
+    // to the desktop app ("never fully loads"), so if the port stays taken we
+    // exit rather than run headless:
+    //   - a sibling Azimuth daemon already serves the port -> exit 0 (the app
+    //     talks to that one; NSSM AppExit for 0 is configured to Exit)
+    //   - anything else -> exit 42 (NSSM restarts us; sidecar exit is visible)
+    const MAX_BIND_ATTEMPTS: u32 = 10;
+    let mut listener = None;
+    for attempt in 1..=MAX_BIND_ATTEMPTS {
+        match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(l) => {
+                info!(addr = bind_addr, "Status server listening");
+                listener = Some(l);
+                break;
+            }
+            Err(e) if attempt < MAX_BIND_ATTEMPTS => {
+                let backoff_ms = std::cmp::min(100u64 * (1 << attempt), 5_000);
+                tracing::warn!(
+                    error = %e, addr = bind_addr, attempt, backoff_ms,
+                    "Status server bind failed, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, addr = bind_addr, "Status server bind failed after retries");
+                let probe_url = format!("http://{bind_addr}/status");
+                let sibling = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build()
+                    .ok();
+                let is_sibling = match sibling {
+                    Some(c) => match c.get(&probe_url).send().await {
+                        Ok(resp) => resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .map(|v| v.get("node_id").is_some())
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+                if is_sibling {
+                    tracing::warn!(
+                        addr = bind_addr,
+                        "Another Azimuth daemon already serves this port — exiting (it stays in charge)"
+                    );
+                    std::process::exit(0);
+                }
+                tracing::error!(
+                    addr = bind_addr,
+                    "Port is held by a non-Azimuth process — exiting 42 for service restart"
+                );
+                std::process::exit(42);
+            }
+        }
+    }
+    let listener = listener.expect("bind loop guarantees a listener or an exit");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(error = %e, "Status server error");
+    }
 }
