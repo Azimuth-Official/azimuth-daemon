@@ -1,49 +1,51 @@
 [target.x86_64-unknown-linux-gnu]
 # Debian stable-based image
-image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest"
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
+
+# Cross-compile note: the C-linked deps (libudev-sys via serialport) resolve through
+# pkg-config. cross-rs does NOT set container env from an inline `env = {...}` table;
+# the working mechanism is `[target.<t>.env] passthrough = [...]` PLUS setting those
+# vars on the HOST before `cross build`. The pre-build installs the :<arch> dev libs so
+# the .pc files exist at /usr/lib/<multiarch-tuple>/pkgconfig (verified for aarch64).
 
 [target.aarch64-unknown-linux-gnu]
-# ARM64 Linux target
-image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:latest"
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
 pre-build = [
   "dpkg --add-architecture arm64",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev:arm64 libudev-dev:arm64 libssl-dev:arm64"
+  "apt-get install -y libusb-1.0-0-dev:arm64 libudev-dev:arm64 libssl-dev:arm64",
 ]
-build-command = "cross"
-env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" }
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
 
 [target.armv7-unknown-linux-gnueabihf]
-# ARMv7 (32-bit ARM) Linux target with hardware floats
-image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:latest"
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
 pre-build = [
   "dpkg --add-architecture armhf",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf"
+  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf",
 ]
-build-command = "cross"
-env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig" }
+[target.armv7-unknown-linux-gnueabihf.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
 
 [target.arm-unknown-linux-gnueabihf]
-# ARMv6 (Raspberry Pi 1, Zero) with hardware floats
-# Best-effort: may require custom image if standard cross-rs image unavailable
-image = "ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:latest"
+# ARMv6 (Pi 1 / Zero) — best-effort
+image = "ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:0.2.5"
 pre-build = [
   "dpkg --add-architecture armhf",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf"
+  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf",
 ]
-build-command = "cross"
-env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig" }
+[target.arm-unknown-linux-gnueabihf.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
 
 [target.riscv64gc-unknown-linux-gnu]
-# RISC-V 64-bit Linux target
-# Best-effort: no standard cross-rs image; may need custom container
-image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:latest"
+# RISC-V 64-bit — best-effort
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:0.2.5"
 pre-build = [
   "dpkg --add-architecture riscv64",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev:riscv64 libudev-dev:riscv64 libssl-dev:riscv64"
+  "apt-get install -y libusb-1.0-0-dev:riscv64 libudev-dev:riscv64 libssl-dev:riscv64",
 ]
-build-command = "cross"
-env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig" }
+[target.riscv64gc-unknown-linux-gnu.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
