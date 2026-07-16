@@ -10,6 +10,7 @@ pub mod recovery;
 
 use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{info, warn};
+use crate::identity;
 
 /// Gain configuration for SDR tuner.
 /// Auto: AGC mode (tuner controls gain).
@@ -29,6 +30,15 @@ impl GainSetting {
             GainSetting::Manual(gain)
         }
     }
+}
+
+/// Generate machine-scoped SDR serial number from fingerprint and index.
+/// Format: SDR-{fingerprint_prefix}-{index:04}
+/// Example: SDR-a1b2c3d4-0001
+fn generate_sdr_serial(index: u32) -> String {
+    let fp = identity::machine_fingerprint();
+    let prefix = fp.chars().take(8).collect::<String>();
+    format!("SDR-{}-{:04}", prefix, index)
 }
 
 /// Stored configuration for an opened SDR device, used for reopen/reset.
@@ -239,8 +249,8 @@ impl SdrManager {
             .reset_buffer()
             .map_err(|e| anyhow::Error::new(e).context("reset_buffer"))?;
 
-        // Generate serial: use index as fallback (rtl-sdr-rs v0.3 doesn't expose USB strings)
-        let serial = format!("SDR-{:04}", index);
+        // Generate serial: machine-scoped with fingerprint prefix for unique identification
+        let serial = generate_sdr_serial(index);
 
         Ok(SdrDevice {
             device,
@@ -301,7 +311,7 @@ impl SdrManager {
 
     /// Reopen a previously closed device at the given vec position.
     pub fn reopen_device_at(&mut self, index: usize, pos: usize, config: &SdrDeviceConfig) -> anyhow::Result<()> {
-        let serial = format!("SDR-{:04}", index);
+        let serial = generate_sdr_serial(index as u32);
         info!(index, serial = %serial, "Reopening SDR device");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -378,4 +388,47 @@ pub fn calculate_signal_power(iq_bytes: &[u8], dbm_offset: f32) -> (f64, f64) {
     let db_fs = 10.0 * mean_power.log10();
     let dbm = db_fs + dbm_offset as f64;
     (db_fs, dbm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_sdr_serial_deterministic() {
+        // Serial should be deterministic for the same index on the same machine
+        let serial1 = generate_sdr_serial(0);
+        let serial2 = generate_sdr_serial(0);
+        assert_eq!(serial1, serial2);
+    }
+
+    #[test]
+    fn test_generate_sdr_serial_unique_per_index() {
+        // Different indices should produce different serials
+        let serial0 = generate_sdr_serial(0);
+        let serial1 = generate_sdr_serial(1);
+        let serial42 = generate_sdr_serial(42);
+
+        assert_ne!(serial0, serial1);
+        assert_ne!(serial1, serial42);
+        assert_ne!(serial0, serial42);
+    }
+
+    #[test]
+    fn test_generate_sdr_serial_format() {
+        // Verify format: SDR-{fingerprint_prefix}-{index:04}
+        let serial = generate_sdr_serial(123);
+
+        // Should start with SDR-
+        assert!(serial.starts_with("SDR-"));
+
+        // Should end with -0123 for index 123
+        assert!(serial.ends_with("-0123"));
+
+        // Should be under 32 characters (alnum + dashes)
+        assert!(serial.len() < 32);
+
+        // Should only contain alphanumeric and dashes
+        assert!(serial.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
 }
