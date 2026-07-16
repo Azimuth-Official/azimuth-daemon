@@ -6,32 +6,44 @@ image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest"
 # ARM64 Linux target
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:latest"
 pre-build = [
+  "dpkg --add-architecture arm64",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev"
+  "apt-get install -y libusb-1.0-0-dev:arm64 libudev-dev:arm64 libssl-dev:arm64"
 ]
+build-command = "cross"
+env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" }
 
 [target.armv7-unknown-linux-gnueabihf]
 # ARMv7 (32-bit ARM) Linux target with hardware floats
 image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:latest"
 pre-build = [
+  "dpkg --add-architecture armhf",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev"
+  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf"
 ]
+build-command = "cross"
+env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig" }
 
 [target.arm-unknown-linux-gnueabihf]
 # ARMv6 (Raspberry Pi 1, Zero) with hardware floats
 # Best-effort: may require custom image if standard cross-rs image unavailable
 image = "ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:latest"
 pre-build = [
+  "dpkg --add-architecture armhf",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev"
+  "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf"
 ]
+build-command = "cross"
+env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig" }
 
 [target.riscv64gc-unknown-linux-gnu]
 # RISC-V 64-bit Linux target
 # Best-effort: no standard cross-rs image; may need custom container
 image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:latest"
 pre-build = [
+  "dpkg --add-architecture riscv64",
   "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev"
+  "apt-get install -y libusb-1.0-0-dev:riscv64 libudev-dev:riscv64 libssl-dev:riscv64"
 ]
+build-command = "cross"
+env = { PKG_CONFIG_ALLOW_CROSS = "1", PKG_CONFIG_SYSROOT_DIR = "/", PKG_CONFIG_PATH = "/usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig" }
