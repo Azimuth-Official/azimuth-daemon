@@ -11,6 +11,40 @@ pub mod recovery;
 use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{info, warn};
 
+/// Linux: detach the kernel driver (`dvb_usb_rtl28xxu`) that claims the RTL2832U —
+/// especially over usbip — before rtl-sdr-rs opens it, or `open()` fails with "open
+/// device N". Uses a PLAIN `detach_kernel_driver` via rusb, NOT `set_auto_detach`
+/// (auto mode re-attaches the kernel driver when the handle/interface is released,
+/// handing the device straight back before rtl-sdr-rs opens it). The handle is dropped
+/// without claiming and without reattach, so the detach persists past close. No-op on
+/// non-Linux (Windows uses a WinUSB/libusb driver, no kernel-detach needed).
+#[cfg(target_os = "linux")]
+fn detach_rtl_kernel_drivers() {
+    let devs = match rusb::devices() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for device in devs.iter() {
+        let desc = match device.device_descriptor() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if desc.vendor_id() == 0x0bda && matches!(desc.product_id(), 0x2832 | 0x2838) {
+            if let Ok(handle) = device.open() {
+                match handle.detach_kernel_driver(0) {
+                    Ok(()) => info!("kernel driver detached for RTL2832U (usbip-safe open)"),
+                    Err(rusb::Error::NotFound) => {} // no kernel driver attached — fine
+                    Err(e) => warn!(error = %e, "detach_kernel_driver failed (continuing)"),
+                }
+                // handle dropped here: no claim_interface, no reattach — detach persists
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detach_rtl_kernel_drivers() {}
+
 /// Gain configuration for SDR tuner.
 /// Auto: AGC mode (tuner controls gain).
 /// Manual(i32): Fixed gain in dB.
@@ -216,6 +250,9 @@ impl SdrManager {
         gain: &GainSetting,
         freq_correction_ppm: i32,
     ) -> anyhow::Result<SdrDevice> {
+        // Linux/usbip: detach the kernel dvb_usb_rtl28xxu driver before opening, or
+        // rtl-sdr-rs's open() fails ("open device N"). No-op on Windows.
+        detach_rtl_kernel_drivers();
         let mut device = RtlSdr::open_with_index(index as usize)
             .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
 
