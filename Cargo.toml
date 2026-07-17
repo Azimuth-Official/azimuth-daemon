@@ -1,6 +1,6 @@
 [package]
 name = "azimuth-daemon"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"
@@ -46,3 +46,8 @@ serialport = { version = "4", default-features = false }
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
 wdi-rs = "0.1"
+
+[profile.release]
+# Reproducible, machine-independent release binaries: strip symbols. Build paths
+# are additionally remapped via build-time RUSTFLAGS (see Cross.toml passthrough).
+strip = "symbols"

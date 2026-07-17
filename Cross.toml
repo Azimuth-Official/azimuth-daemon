@@ -1,3 +1,9 @@
+# Forward the host build-path remap flags into every target container so release
+# binaries carry no machine-specific paths (reproducible builds). Values are set in
+# the build environment, never committed.
+[build.env]
+passthrough = ["RUSTFLAGS", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS"]
+
 [target.x86_64-unknown-linux-gnu]
 # Debian stable-based image
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
