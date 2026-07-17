@@ -29,23 +29,28 @@ pre-build = [
 passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
 
 [target.arm-unknown-linux-gnueabihf]
-# ARMv6 (Pi 1 / Zero) — best-effort
-image = "ghcr.io/cross-rs/arm-unknown-linux-gnueabihf:0.2.5"
+# ARMv6 (Pi 1 / Zero). Custom image (C:\tmp\cross-armv6\Dockerfile) bakes the armhf
+# libc dev headers (libc6-dev:armhf/linux-libc-dev:armhf) the stock image omits — the
+# vendored libusb build needs bits/libc-header-start.h for the armhf target.
+image = "azimuth-cross-armv6:local"
 pre-build = [
   "dpkg --add-architecture armhf",
   "apt-get update",
   "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf",
 ]
 [target.arm-unknown-linux-gnueabihf.env]
-passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
+# The custom image (C:\tmp\cross-armv6\Dockerfile) symlink-merges armhf headers into
+# /usr/include so the vendored libusb build (-I //usr/include) resolves <bits/*> for
+# armhf. No global CFLAGS — openssl-sys builds cleanly against the toolchain sysroot.
+# The toolchain glibc (2.17) predates getrandom@2.25 which the Ubuntu-armhf libudev.so
+# references; --allow-shlib-undefined defers that shared-lib symbol to runtime (resolves
+# on any modern-glibc Pi). Target-scoped RUSTFLAGS — does NOT touch other targets.
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS"]
 
 [target.riscv64gc-unknown-linux-gnu]
-# RISC-V 64-bit — best-effort
+# RISC-V 64-bit. riscv64 dev libs are unreachable from the stock Ubuntu-18.04 cross
+# image (bionic never shipped riscv64; Debian-ports would clash with the toolchain
+# glibc). Built with `--no-default-features` (udev off) so NO system libs are needed:
+# rusb is `vendored` and reqwest is `native-tls-vendored`, both compiling from source
+# against the toolchain's own riscv64 sysroot. No pre-build apt step.
 image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:0.2.5"
-pre-build = [
-  "dpkg --add-architecture riscv64",
-  "apt-get update",
-  "apt-get install -y libusb-1.0-0-dev:riscv64 libudev-dev:riscv64 libssl-dev:riscv64",
-]
-[target.riscv64gc-unknown-linux-gnu.env]
-passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
