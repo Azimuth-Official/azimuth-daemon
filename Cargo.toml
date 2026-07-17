@@ -5,6 +5,16 @@ edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"
 
+[features]
+# udev (default) enables serialport's libudev-backed serial enumeration. It is ON by
+# default, so every normal build (x86/windows/aarch64/armv7/armv6) is unchanged. Targets
+# with no system libudev available (riscv64gc, whose Debian-ports libs are unreachable
+# from the stock cross image) build with `--no-default-features`, dropping only udev —
+# serialport falls back to sysfs enumeration. Scoped to the build invocation; not a
+# shared-dependency default change.
+default = ["udev"]
+udev = ["serialport/libudev"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
@@ -31,7 +41,7 @@ rustfft = "6"
 # Serial port access for RTK GPS receiver forwarding
 tokio-serial = "5.5"
 nmea = "0.7"
-serialport = "4"
+serialport = { version = "4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
