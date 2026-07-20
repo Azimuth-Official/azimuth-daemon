@@ -152,6 +152,7 @@ version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "nmea",

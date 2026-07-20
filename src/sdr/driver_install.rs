@@ -10,7 +10,22 @@ use tracing::{error, info, warn};
 use wdi_rs::{create_list, CreateListOptions, DriverInstaller, DriverType};
 
 const RTL2832U_VID: u16 = 0x0BDA;
-const RTL2832U_PID: u16 = 0x2832;
+const RTL2832U_PID_V4: u16 = 0x2832; // RTL2832U V4
+const RTL2832U_PID_V3: u16 = 0x2838; // RTL2832U V3
+
+/// Helper to check if a PID is a valid RTL2832U variant.
+fn is_valid_rtl2832u_pid(pid: u16) -> bool {
+    matches!(pid, RTL2832U_PID_V4 | RTL2832U_PID_V3)
+}
+
+/// Helper to get a product name for a valid RTL2832U PID.
+fn get_rtl2832u_product_name(pid: u16) -> &'static str {
+    match pid {
+        RTL2832U_PID_V4 => "RTL2832U V4",
+        RTL2832U_PID_V3 => "RTL2832U V3",
+        _ => "Unknown RTL2832U variant",
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,22 +61,23 @@ pub fn check_driver_status() -> DriverStatus {
         }
     };
 
-    let matches = devices.from_vid_pid(RTL2832U_VID, RTL2832U_PID);
-    match matches.first() {
-        None => {
-            info!("No RTL2832U device found (VID_{RTL2832U_VID:04X} PID_{RTL2832U_PID:04X})");
-            DriverStatus::DeviceNotFound
-        }
-        Some(dev) => {
+    // Try both PID V4 and V3 in order (prefer V4)
+    for pid in &[RTL2832U_PID_V4, RTL2832U_PID_V3] {
+        let matches = devices.from_vid_pid(RTL2832U_VID, *pid);
+        if let Some(dev) = matches.first() {
+            let product_name = if *pid == RTL2832U_PID_V3 { "V3" } else { "V4" };
             if let Some(ref driver) = dev.driver {
-                info!(driver, "RTL2832U has driver installed");
-                DriverStatus::Installed
+                info!(driver, pid = ?pid, product = product_name, "RTL2832U has driver installed");
+                return DriverStatus::Installed;
             } else {
-                info!(desc = ?dev.desc, "RTL2832U found without driver");
-                DriverStatus::NeedsInstall
+                info!(desc = ?dev.desc, pid = ?pid, product = product_name, "RTL2832U found without driver");
+                return DriverStatus::NeedsInstall;
             }
         }
     }
+
+    info!("No RTL2832U device found (VID_{RTL2832U_VID:04X} PID_{{0x{:04X} or 0x{:04X}}})", RTL2832U_PID_V4, RTL2832U_PID_V3);
+    DriverStatus::DeviceNotFound
 }
 
 /// Check driver status and install WinUSB if needed.
@@ -74,17 +90,62 @@ pub fn ensure_driver() -> DriverStatus {
 
     info!("Attempting WinUSB driver installation for RTL2832U via libwdi");
 
-    match DriverInstaller::for_device(RTL2832U_VID, RTL2832U_PID)
-        .with_driver_type(DriverType::WinUsb)
-        .install()
-    {
-        Ok(dev) => {
-            info!(desc = ?dev.desc, "WinUSB driver installed successfully");
-            DriverStatus::Installed
+    // Try both PID V4 and V3 in order (prefer V4)
+    for (pid, product_name) in &[(RTL2832U_PID_V4, "V4"), (RTL2832U_PID_V3, "V3")] {
+        match DriverInstaller::for_device(RTL2832U_VID, *pid)
+            .with_driver_type(DriverType::WinUsb)
+            .install()
+        {
+            Ok(dev) => {
+                info!(desc = ?dev.desc, pid = ?pid, product = product_name, "WinUSB driver installed successfully");
+                return DriverStatus::Installed;
+            }
+            Err(e) => {
+                warn!(pid = ?pid, product = product_name, error = ?e, "WinUSB driver installation failed for this PID, trying next");
+            }
         }
-        Err(e) => {
-            error!(error = ?e, "WinUSB driver installation failed");
-            DriverStatus::CheckFailed(format!("install failed: {e:?}"))
-        }
+    }
+
+    error!("WinUSB driver installation failed for all RTL2832U variants");
+    DriverStatus::CheckFailed("install failed for all PID variants".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_rtl2832u_pid_v4() {
+        assert!(is_valid_rtl2832u_pid(RTL2832U_PID_V4));
+    }
+
+    #[test]
+    fn test_is_valid_rtl2832u_pid_v3() {
+        assert!(is_valid_rtl2832u_pid(RTL2832U_PID_V3));
+    }
+
+    #[test]
+    fn test_is_valid_rtl2832u_pid_invalid() {
+        assert!(!is_valid_rtl2832u_pid(0x1234));
+        assert!(!is_valid_rtl2832u_pid(0x0000));
+        assert!(!is_valid_rtl2832u_pid(0xFFFF));
+    }
+
+    #[test]
+    fn test_get_rtl2832u_product_name_v4() {
+        assert_eq!(get_rtl2832u_product_name(RTL2832U_PID_V4), "RTL2832U V4");
+    }
+
+    #[test]
+    fn test_get_rtl2832u_product_name_v3() {
+        assert_eq!(get_rtl2832u_product_name(RTL2832U_PID_V3), "RTL2832U V3");
+    }
+
+    #[test]
+    fn test_get_rtl2832u_product_name_invalid() {
+        assert_eq!(
+            get_rtl2832u_product_name(0x1234),
+            "Unknown RTL2832U variant"
+        );
     }
 }

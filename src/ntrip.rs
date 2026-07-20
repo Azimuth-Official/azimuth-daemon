@@ -3,9 +3,37 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tokio_serial::SerialPortBuilderExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use base64::Engine;
 use tracing::{debug, error, info, warn};
 
 use crate::status_server::StatusState;
+
+/// Parse NTRIP/HTTP status line and return (status_code, status_line).
+/// Accepts both "ICY 200 OK" and "HTTP/1.x 200 ..." formats.
+fn parse_status_line(line: &str) -> Option<(u16, String)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // Try to parse as HTTP-like: "HTTP/1.1 200 OK" or "HTTP/1.0 401 Unauthorized"
+    if parts[0].starts_with("HTTP") {
+        if let Ok(code) = parts[1].parse::<u16>() {
+            return Some((code, line.to_string()));
+        }
+    }
+
+    // Try to parse as ICY: "ICY 200 OK"
+    if parts[0] == "ICY" {
+        if let Ok(code) = parts[1].parse::<u16>() {
+            return Some((code, line.to_string()));
+        }
+    }
+
+    None
+}
 
 /// Run the NTRIP v1 client loop. Connects to the configured caster, streams
 /// RTCM3 correction data, counts frames, optionally forwards to a serial port or RTCM channel,
@@ -35,31 +63,29 @@ pub async fn run_ntrip_client(
         "NTRIP client connecting"
     );
 
-    let url = format!(
-        "http://{}:{}/{}",
-        config.caster_url, config.port, config.mountpoint
-    );
+    // Use raw TCP socket for NTRIP compatibility (casters respond with "ICY 200 OK", not HTTP)
+    let mut socket = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::net::TcpStream::connect(format!("{}:{}", config.caster_url, config.port))
+    )
+        .await
+        .map_err(|_| anyhow::anyhow!("NTRIP connection timeout"))?
+        .map_err(|e| anyhow::anyhow!("NTRIP connection failed: {}", e))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(0)) // no timeout — persistent stream
-        .connect_timeout(Duration::from_secs(15))
-        .build()?;
-
-    let mut request = client
-        .get(&url)
-        .header("User-Agent", "NTRIP AzimuthDaemon/1.0")
-        .header("Ntrip-Version", "Ntrip/1.0")
-        .header("Accept", "*/*")
-        .header("Connection", "close");
-
-    if let (Some(ref user), Some(ref pass)) = (&config.username, &config.password) {
+    // Build HTTP request for NTRIP mountpoint
+    let auth_header = if let (Some(ref user), Some(ref pass)) = (&config.username, &config.password) {
         if !user.is_empty() {
-            request = request.basic_auth(user, Some(pass));
+            let creds = format!("{}:{}", user, pass);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
+            format!("\r\nAuthorization: Basic {}", encoded)
+        } else {
+            String::new()
         }
-    }
+    } else {
+        String::new()
+    };
 
-    // Send GGA sentence as body for casters that require initial position
-    // Use GPS coordinates if available, otherwise use static node coordinates
+    // Generate GGA sentence with current position
     let (lat, lon, alt) = {
         let s = state.read().await;
         if s.gps_fix_quality > 0 {
@@ -72,16 +98,65 @@ pub async fn run_ntrip_client(
             (node_lat, node_lon, node_alt)
         }
     };
-
     let gga = generate_gga(lat, lon, alt);
-    request = request.header("Ntrip-GGA", &gga);
 
-    let resp = request.send().await?;
+    let request = format!(
+        "GET /{} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: NTRIP AzimuthDaemon/1.0\r\nNtrip-Version: Ntrip/2.0\r\nNtrip-GGA: {}{}\r\nConnection: close\r\n\r\n",
+        config.mountpoint,
+        config.caster_url,
+        config.port,
+        gga,
+        auth_header
+    );
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("NTRIP caster returned {}: {}", status, body);
+    socket.write_all(request.as_bytes()).await?;
+
+    // Read and parse status line from caster (ICY or HTTP)
+    let (status_code, status_msg) = {
+        let mut buf = vec![0u8; 1];
+        let mut status_line = String::new();
+        loop {
+            socket.read_exact(&mut buf).await?;
+            status_line.push(buf[0] as char);
+            if status_line.ends_with("\r\n") {
+                break;
+            }
+            if status_line.len() > 256 {
+                anyhow::bail!("NTRIP status line too long");
+            }
+        }
+
+        let status_line_trimmed = status_line.trim();
+        parse_status_line(status_line_trimmed)
+            .ok_or_else(|| anyhow::anyhow!("Invalid NTRIP status line: {}", status_line_trimmed))?
+    };
+
+    info!(status_line = %status_msg, "NTRIP status received");
+
+    if status_code != 200 {
+        anyhow::bail!("NTRIP caster returned {}: {}", status_code, status_msg);
+    }
+
+    // Read headers until blank line (read one byte at a time to detect \r\n\r\n)
+    let mut buf = vec![0u8; 1];
+    let mut header_buf = String::new();
+    loop {
+        socket.read_exact(&mut buf).await?;
+        header_buf.push(buf[0] as char);
+
+        // Check for end of headers: \r\n\r\n
+        if header_buf.ends_with("\r\n\r\n") || header_buf.ends_with("\n\n") {
+            break;
+        }
+        if header_buf.len() > 8192 {
+            anyhow::bail!("NTRIP headers too long");
+        }
+    }
+
+    for line in header_buf.lines() {
+        if !line.is_empty() {
+            debug!("NTRIP header: {}", line);
+        }
     }
 
     info!("NTRIP connected, streaming RTCM3 corrections");
@@ -114,8 +189,8 @@ pub async fn run_ntrip_client(
     let gga_interval = Duration::from_secs(config.gga_interval_secs as u64);
     let mut last_gga = tokio::time::Instant::now();
 
-    // Stream response body via chunk() loop
-    let mut response = resp;
+    // Stream RTCM3 data from socket
+    let mut read_buf = vec![0u8; 4096];
     loop {
         // Check if RTK is still enabled
         {
@@ -128,16 +203,22 @@ pub async fn run_ntrip_client(
 
         // Guard against a stalled caster that holds the socket open but sends no data:
         // bound each read so we break out and let the parent task reconnect.
-        let chunk = match tokio::time::timeout(Duration::from_secs(120), response.chunk()).await {
+        let n = match tokio::time::timeout(Duration::from_secs(120), socket.read(&mut read_buf)).await {
             Ok(r) => r,
             Err(_) => {
                 warn!("NTRIP stream stalled (no data for 120s) — reconnecting");
                 break;
             }
         };
-        match chunk {
-            Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
+
+        match n {
+            Ok(0) => {
+                // Stream ended (EOF)
+                info!("NTRIP stream ended (caster closed connection)");
+                break;
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&read_buf[..n]);
 
                 // Count RTCM3 frames: preamble 0xD3 + 10-bit length in next 2 bytes
                 while buf.len() >= 3 {
@@ -180,12 +261,7 @@ pub async fn run_ntrip_client(
                     s.rtk_last_correction = Some(chrono::Utc::now());
                 }
 
-                debug!(frames = frame_count, chunk_bytes = chunk.len(), "RTCM3 data received");
-            }
-            Ok(None) => {
-                // Stream ended — caster closed connection
-                info!("NTRIP stream ended (caster closed connection)");
-                break;
+                debug!(frames = frame_count, bytes_read = n, "RTCM3 data received");
             }
             Err(e) => {
                 error!(error = %e, "NTRIP stream error");
@@ -245,4 +321,45 @@ fn generate_gga(lat: f64, lon: f64, alt: f64) -> String {
     let checksum: u8 = body.bytes().fold(0u8, |acc, b| acc ^ b);
 
     format!("${}*{:02X}", body, checksum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_status_line_icy_200() {
+        let result = parse_status_line("ICY 200 OK");
+        assert_eq!(result, Some((200, "ICY 200 OK".to_string())));
+    }
+
+    #[test]
+    fn test_parse_status_line_http11_200() {
+        let result = parse_status_line("HTTP/1.1 200 OK");
+        assert_eq!(result, Some((200, "HTTP/1.1 200 OK".to_string())));
+    }
+
+    #[test]
+    fn test_parse_status_line_http10_401() {
+        let result = parse_status_line("HTTP/1.0 401 Unauthorized");
+        assert_eq!(result, Some((401, "HTTP/1.0 401 Unauthorized".to_string())));
+    }
+
+    #[test]
+    fn test_parse_status_line_garbage() {
+        let result = parse_status_line("garbage line");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_status_line_empty() {
+        let result = parse_status_line("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_status_line_icy_401() {
+        let result = parse_status_line("ICY 401 Unauthorized");
+        assert_eq!(result, Some((401, "ICY 401 Unauthorized".to_string())));
+    }
 }

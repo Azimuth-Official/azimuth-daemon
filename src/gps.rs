@@ -261,16 +261,29 @@ pub async fn run_gps_task(
             }
 
             line.clear();
-            match buf_reader.read_line(&mut line).await {
-                Ok(0) => {
+            // Bound read with timeout to detect silent/disconnected ports
+            let read_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                buf_reader.read_line(&mut line)
+            ).await;
+
+            match read_result {
+                Ok(Ok(0)) => {
                     // EOF
                     info!("GPS connection closed (EOF)");
                     break;
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
+                    }
+
+                    // Try to parse any NMEA sentence to reset staleness
+                    // Accept any sentence starting with $ to detect liveness
+                    if trimmed.starts_with("$") {
+                        // Reset liveness indicator on any valid NMEA
+                        last_sample = tokio::time::Instant::now();
                     }
 
                     // Try to parse GGA sentence
@@ -315,8 +328,21 @@ pub async fn run_gps_task(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(error = %e, "GPS read error");
+                    break;
+                }
+                Err(_timeout) => {
+                    // Timeout: no data received for 10s — port may be stalled/disconnected
+                    warn!("GPS read timeout (no data for 10s) — reconnecting");
+
+                    // Set reconnecting state instead of terminal "no device connected"
+                    {
+                        let mut s = state.write().await;
+                        s.gps_detected = false;
+                        // Keep port/device_name to show reconnecting state, not "no device"
+                    }
+
                     break;
                 }
             }

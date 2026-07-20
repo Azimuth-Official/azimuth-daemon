@@ -21,7 +21,8 @@ use crate::gps::AccuracyPoint;
 use std::collections::VecDeque;
 
 const RTL_SDR_VID: u16 = 0x0BDA;
-const RTL_SDR_PID: u16 = 0x2832;
+const RTL_SDR_PID_V4: u16 = 0x2832; // RTL2832U V4
+const RTL_SDR_PID_V3: u16 = 0x2838; // RTL2832U V3
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalBreakdown {
@@ -200,6 +201,7 @@ struct SdrListEntry {
     index: usize,
     vendor_id: String,
     product_id: String,
+    product_name: String,
     serial: Option<String>,
     bus: u8,
     address: u8,
@@ -476,7 +478,12 @@ fn enumerate_sdr_devices() -> anyhow::Result<Vec<SdrListEntry>> {
     let mut index = 0usize;
     for device in rusb::devices()?.iter() {
         let desc = device.device_descriptor()?;
-        if desc.vendor_id() == RTL_SDR_VID && desc.product_id() == RTL_SDR_PID {
+        if desc.vendor_id() == RTL_SDR_VID {
+            let product_name = match desc.product_id() {
+                RTL_SDR_PID_V4 => "RTL2832U V4".to_string(),
+                RTL_SDR_PID_V3 => "RTL2832U V3".to_string(),
+                _ => continue, // Skip non-matching PIDs
+            };
             let serial = device
                 .open()
                 .ok()
@@ -485,6 +492,7 @@ fn enumerate_sdr_devices() -> anyhow::Result<Vec<SdrListEntry>> {
                 index,
                 vendor_id: format!("{:04X}", desc.vendor_id()),
                 product_id: format!("{:04X}", desc.product_id()),
+                product_name,
                 serial,
                 bus: device.bus_number(),
                 address: device.address(),

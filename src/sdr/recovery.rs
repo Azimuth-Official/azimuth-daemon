@@ -9,6 +9,9 @@
 use std::process::Command;
 use tracing::{info, warn};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 /// Maximum consecutive pipe errors before triggering a recovery action.
 const PIPE_ERROR_THRESHOLD: u32 = 3;
 /// Maximum failures at a given level before escalating to the next level.
@@ -202,16 +205,18 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
         info!(instance_id, "Disabling Windows PnP device for hard reset");
 
         // Disable device
-        let disable = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Disable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
-                    instance_id
-                ),
-            ])
-            .output()?;
+        let mut disable_cmd = Command::new("powershell");
+        disable_cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Disable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
+                instance_id
+            ),
+        ]);
+        #[cfg(windows)]
+        disable_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let disable = disable_cmd.output()?;
         if !disable.status.success() {
             let stdout = String::from_utf8_lossy(&disable.stdout);
             let stderr = String::from_utf8_lossy(&disable.stderr);
@@ -225,16 +230,18 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
         std::thread::sleep(std::time::Duration::from_millis(2000));
 
         // Re-enable device
-        let enable = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Enable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
-                    instance_id
-                ),
-            ])
-            .output()?;
+        let mut enable_cmd = Command::new("powershell");
+        enable_cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Enable-PnpDevice -InstanceId '{}' -Confirm:$false -ErrorAction Stop",
+                instance_id
+            ),
+        ]);
+        #[cfg(windows)]
+        enable_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let enable = enable_cmd.output()?;
         if !enable.status.success() {
             let stdout = String::from_utf8_lossy(&enable.stdout);
             let stderr = String::from_utf8_lossy(&enable.stderr);
@@ -271,13 +278,15 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
 #[cfg(target_os = "windows")]
 fn discover_windows_pnp_instance_id() -> anyhow::Result<String> {
     info!("Discovering Windows PnP instance ID for RTL-SDR (VID_0BDA&PID_2832)");
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-PnpDevice | Where-Object { $_.InstanceId -like '*VID_0BDA&PID_2832*' } | Select-Object -ExpandProperty InstanceId",
-        ])
-        .output()?;
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        "Get-PnpDevice | Where-Object { $_.InstanceId -like '*VID_0BDA&PID_2832*' } | Select-Object -ExpandProperty InstanceId",
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
