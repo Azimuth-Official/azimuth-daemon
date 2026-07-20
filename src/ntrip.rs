@@ -298,6 +298,79 @@ pub async fn run_ntrip_client(
     Ok(())
 }
 
+/// Test NTRIP connection: connect + status-line only, no streaming.
+/// Returns (status_line, socket_closed) on success, error on failure.
+pub async fn test_ntrip_connection(
+    caster_url: &str,
+    port: u16,
+    mountpoint: &str,
+    username: Option<String>,
+    password: Option<String>,
+) -> anyhow::Result<(String, bool)> {
+    // Use raw TCP socket for NTRIP compatibility
+    let mut socket = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::net::TcpStream::connect(format!("{}:{}", caster_url, port))
+    )
+        .await
+        .map_err(|_| anyhow::anyhow!("Connection timeout"))?
+        .map_err(|e| anyhow::anyhow!("Connection failed: {}", e))?;
+
+    // Build HTTP request for NTRIP mountpoint
+    let auth_header = if let (Some(ref user), Some(ref pass)) = (&username, &password) {
+        if !user.is_empty() {
+            let creds = format!("{}:{}", user, pass);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(creds);
+            format!("\r\nAuthorization: Basic {}", encoded)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let request = format!(
+        "GET /{} HTTP/1.1\r\nHost: {}:{}\r\nUser-Agent: NTRIP AzimuthDaemon/1.0\r\nNtrip-Version: Ntrip/2.0{}\r\nConnection: close\r\n\r\n",
+        mountpoint,
+        caster_url,
+        port,
+        auth_header
+    );
+
+    socket.write_all(request.as_bytes()).await?;
+
+    // Read and parse status line from caster (ICY or HTTP)
+    let (status_code, status_line) = {
+        let mut buf = vec![0u8; 1];
+        let mut status_line = String::new();
+        loop {
+            match socket.read_exact(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    status_line.push(buf[0] as char);
+                    if status_line.ends_with("\r\n") {
+                        break;
+                    }
+                    if status_line.len() > 256 {
+                        anyhow::bail!("Status line too long");
+                    }
+                }
+                Err(e) => return Err(anyhow::anyhow!("Read error: {}", e)),
+            }
+        }
+
+        let status_line_trimmed = status_line.trim();
+        parse_status_line(status_line_trimmed)
+            .ok_or_else(|| anyhow::anyhow!("Invalid status line: {}", status_line_trimmed))?
+    };
+
+    if status_code != 200 {
+        anyhow::bail!("NTRIP caster returned status {}: {}", status_code, status_line);
+    }
+
+    Ok((status_line, false))
+}
+
 /// Generate an NMEA GGA sentence from static coordinates.
 /// Format: $GPGGA,HHMMSS.SS,DDMM.MMMMM,N/S,DDDMM.MMMMM,E/W,1,12,1.0,ALT,M,0.0,M,,*HH
 fn generate_gga(lat: f64, lon: f64, alt: f64) -> String {

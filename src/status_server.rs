@@ -411,6 +411,29 @@ struct RtkStatusResponse {
     last_correction: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RtkTestRequest {
+    #[serde(default)]
+    caster_url: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    mountpoint: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RtkTestResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 async fn rtk_status_handler(State(state): State<Arc<AppState>>) -> Json<RtkStatusResponse> {
     let s = state.status.read().await;
     Json(RtkStatusResponse {
@@ -420,6 +443,86 @@ async fn rtk_status_handler(State(state): State<Arc<AppState>>) -> Json<RtkStatu
         messages_received: s.rtk_messages_received,
         last_correction: s.rtk_last_correction.map(|t| t.to_rfc3339()),
     })
+}
+
+async fn rtk_test_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<RtkTestRequest>,
+) -> impl IntoResponse {
+    let caster_url = match req.caster_url {
+        Some(url) if !url.is_empty() => url,
+        _ => return Ok::<_, StatusCode>((
+            StatusCode::BAD_REQUEST,
+            Json(RtkTestResponse {
+                ok: false,
+                status_line: None,
+                error: Some("Missing caster_url".to_string()),
+            }),
+        )),
+    };
+
+    let mountpoint = match req.mountpoint {
+        Some(mp) if !mp.is_empty() => mp,
+        _ => return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(RtkTestResponse {
+                ok: false,
+                status_line: None,
+                error: Some("Missing mountpoint".to_string()),
+            }),
+        )),
+    };
+
+    let port = req.port.unwrap_or(2101);
+
+    // Run test connection with 20s timeout
+    let test_result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::ntrip::test_ntrip_connection(
+            &caster_url,
+            port,
+            &mountpoint,
+            req.username.clone(),
+            req.password.clone(),
+        ),
+    )
+    .await;
+
+    match test_result {
+        Ok(Ok((status_line, _))) => {
+            info!(caster = %caster_url, port, mountpoint = %mountpoint, "RTK test connection succeeded");
+            Ok((
+                StatusCode::OK,
+                Json(RtkTestResponse {
+                    ok: true,
+                    status_line: Some(status_line),
+                    error: None,
+                }),
+            ))
+        }
+        Ok(Err(e)) => {
+            warn!(caster = %caster_url, port, mountpoint = %mountpoint, error = %e, "RTK test connection failed");
+            Ok((
+                StatusCode::OK,
+                Json(RtkTestResponse {
+                    ok: false,
+                    status_line: None,
+                    error: Some(format!("{}", e)),
+                }),
+            ))
+        }
+        Err(_timeout) => {
+            warn!(caster = %caster_url, port, mountpoint = %mountpoint, "RTK test connection timeout");
+            Ok((
+                StatusCode::OK,
+                Json(RtkTestResponse {
+                    ok: false,
+                    status_line: None,
+                    error: Some("Connection timeout (>20s)".to_string()),
+                }),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -524,6 +627,7 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/network-support", post(network_support_handler))
         .route("/rtk-config", post(rtk_config_handler))
         .route("/rtk/status", get(rtk_status_handler))
+        .route("/rtk/test", post(rtk_test_handler))
         .route("/gps/status", get(gps_status_handler))
         .route("/serial/ports", get(serial_ports_handler))
         .with_state(Arc::clone(&state));
