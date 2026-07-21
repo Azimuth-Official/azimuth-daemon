@@ -167,6 +167,7 @@ dependencies = [
  "tokio",
  "tokio-serial",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

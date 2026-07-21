@@ -630,6 +630,9 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/rtk/test", post(rtk_test_handler))
         .route("/gps/status", get(gps_status_handler))
         .route("/serial/ports", get(serial_ports_handler))
+        // The desktop app's webview calls this loopback-only server cross-origin
+        // (tauri.localhost -> 127.0.0.1); without CORS every fetch is blocked.
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
     // Bind with retry: transient TIME_WAIT or a just-exiting old instance
