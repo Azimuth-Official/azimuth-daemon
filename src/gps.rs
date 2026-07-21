@@ -365,3 +365,34 @@ pub async fn run_gps_task(
         tokio::time::sleep(tokio::time::Duration::from_secs(DETECTION_INTERVAL_SECS)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // VK-172-class u-blox receivers emit combined-constellation "$GN" talkers.
+    const GNGGA: &str = "$GNGGA,173000.00,4139.7541,N,09121.3906,W,1,08,1.2,215.3,M,-33.9,M,,*40";
+    const GPGGA: &str = "$GPGGA,173000.00,4139.7541,N,09121.3906,W,1,08,1.2,215.3,M,-33.9,M,,*4E";
+
+    #[test]
+    fn parse_gga_accepts_gn_talker() {
+        let (lat, lon, _alt, fix, sats) = parse_gga(GNGGA).expect("$GNGGA must parse");
+        assert!((lat - 41.662568).abs() < 0.001);
+        assert!((lon + 91.356510).abs() < 0.001);
+        assert_eq!(fix, 1);
+        assert_eq!(sats, 8);
+    }
+
+    #[test]
+    fn parse_gga_accepts_gp_talker() {
+        let parsed = parse_gga(GPGGA).expect("$GPGGA must parse");
+        assert_eq!(parsed.3, 1);
+    }
+
+    #[test]
+    fn parse_gga_rejects_garbage() {
+        assert!(parse_gga("$GNGGA,badfield").is_none());
+        assert!(parse_gga("not nmea at all").is_none());
+        assert!(parse_gga("").is_none());
+    }
+}
