@@ -277,12 +277,12 @@ pub fn restart_os_device(os_device_id: Option<&str>, _device_index: usize) -> an
 
 #[cfg(target_os = "windows")]
 fn discover_windows_pnp_instance_id() -> anyhow::Result<String> {
-    info!("Discovering Windows PnP instance ID for RTL-SDR (VID_0BDA&PID_2832)");
+    info!("Discovering Windows PnP instance ID for RTL-SDR (VID_0BDA&PID_2832 or VID_0BDA&PID_2838)");
     let mut cmd = Command::new("powershell");
     cmd.args([
         "-NoProfile",
         "-Command",
-        "Get-PnpDevice | Where-Object { $_.InstanceId -like '*VID_0BDA&PID_2832*' } | Select-Object -ExpandProperty InstanceId",
+        "Get-PnpDevice | Where-Object { ($_.InstanceId -like '*VID_0BDA&PID_2832*') -or ($_.InstanceId -like '*VID_0BDA&PID_2838*') } | Select-Object -ExpandProperty InstanceId",
     ]);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW

@@ -193,7 +193,7 @@ pub async fn run_gps_task(
     const ACCURACY_HISTORY_MAX: usize = 180;
 
     let bauds = &[9600u32, 115200u32, 4800u32];
-    let mut last_sample = tokio::time::Instant::now();
+    let mut last_sample_time = tokio::time::Instant::now(); // accuracy sampling interval (10s)
 
     loop {
         // Detection phase — scan for GPS
@@ -279,12 +279,7 @@ pub async fn run_gps_task(
                         continue;
                     }
 
-                    // Try to parse any NMEA sentence to reset staleness
-                    // Accept any sentence starting with $ to detect liveness
-                    if trimmed.starts_with("$") {
-                        // Reset liveness indicator on any valid NMEA
-                        last_sample = tokio::time::Instant::now();
-                    }
+                    // Any NMEA sentence proves liveness (timeout itself detects staleness)
 
                     // Try to parse GGA sentence
                     if trimmed.starts_with("$") && trimmed.contains("GGA") {
@@ -300,8 +295,8 @@ pub async fn run_gps_task(
                             s.gps_last_fix = Some(chrono::Utc::now().to_rfc3339());
 
                             // Sample accuracy history every 10s
-                            if last_sample.elapsed() >= tokio::time::Duration::from_secs(SAMPLE_INTERVAL_SECS) {
-                                last_sample = tokio::time::Instant::now();
+                            if last_sample_time.elapsed() >= tokio::time::Duration::from_secs(SAMPLE_INTERVAL_SECS) {
+                                last_sample_time = tokio::time::Instant::now();
 
                                 let point = AccuracyPoint {
                                     timestamp: chrono::Utc::now().timestamp(),
