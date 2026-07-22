@@ -5,7 +5,7 @@
 
 [api]
 # Azimuth API endpoint
-url = "https://azimuth.day/api"
+url = "https://azimuth.day"
 # Your API key (get from azimuth.day dashboard after registration)
 key = "your-api-key-here"
 
