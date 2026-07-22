@@ -1,0 +1,47 @@
+# Azimuth Node — user-facing Docker Compose.
+# Run a Tier 1 SDR node in a container.
+#
+#   docker compose up -d          # start (loads image azimuth-node:latest)
+#   docker compose logs -f        # follow logs
+#   docker compose down           # stop
+#
+# Configure with the AZIMUTH_* variables below. They are applied on FIRST boot and then
+# persisted to the named volume (later boots reuse the saved config). See DOCKER.md.
+
+services:
+  azimuth-node:
+    image: azimuth-node:latest
+    # To build locally instead of loading a released image tarball, uncomment:
+    # build: .
+    container_name: azimuth-node
+    restart: unless-stopped
+
+    # RTL-SDR USB passthrough (real hardware). The container runs as the non-root
+    # `azimuth` user, so for device access add the HOST's numeric device gid via
+    # group_add — the name "plugdev" will not match across the container boundary.
+    # See DOCKER.md for finding the gid. Remove this block if running with no hardware.
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    # group_add:
+    #   - "46"   # <- replace with the host's `getent group plugdev` gid (or device gid)
+
+    environment:
+      AZIMUTH_API_URL: "https://azimuth.day"
+      AZIMUTH_API_KEY: ""                 # REQUIRED to register/earn — set your key
+      AZIMUTH_NODE_LABEL: "my-azimuth-node"
+      AZIMUTH_HARDWARE_TYPE: "tier1_rtlsdr"
+      AZIMUTH_NODE_LAT: "0.0"             # set your real latitude
+      AZIMUTH_NODE_LON: "0.0"             # set your real longitude
+      AZIMUTH_NODE_ALT: "0.0"
+      AZIMUTH_STATUS_BIND: "0.0.0.0:8420" # keep 0.0.0.0 inside the container
+
+    # /status is UNAUTHENTICATED. Bound to loopback on the host by default. Change to
+    # "8420:8420" (and gate behind an authenticating reverse proxy) to expose remotely.
+    ports:
+      - "127.0.0.1:8420:8420"
+
+    volumes:
+      - azimuth-data:/var/lib/azimuth
+
+volumes:
+  azimuth-data:

@@ -1,0 +1,18 @@
+# Keep the 13 GB build tree and local junk out of the Docker build context.
+target/
+.git/
+.github/
+.serena/
+.azimuth-fix-backups/
+src.bak*/
+installer/*.exe
+docker-dist/
+**/*.bak.*
+config.toml
+config.toml.*
+config_*_test.toml
+config.smoke*.toml
+*.log
+smoke_*.log
+smoke2_*.log
+.env

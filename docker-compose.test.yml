@@ -1,0 +1,23 @@
+# Azimuth Node — SMOKE TEST compose. Local only. No hardware, no production writes.
+# NOT for production use.
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   curl http://127.0.0.1:18123/status
+#   docker compose -f docker-compose.test.yml down -v
+#
+# - No USB device mapping (Docker Desktop / Windows cannot pass USB).
+# - API points at a dead sink (connection-refused) so the container is provably
+#   incapable of reaching the production API; the daemon handles it gracefully.
+# - No named volume: the image's VOLUME /var/lib/azimuth becomes a fresh anonymous
+#   volume each run, so state starts empty. `down -v` removes it.
+
+services:
+  azimuth-node-test:
+    image: azimuth-node:latest
+    container_name: azimuth-node-test
+    environment:
+      AZIMUTH_STATUS_BIND: "0.0.0.0:8420"
+      AZIMUTH_API_URL: "http://127.0.0.1:1"   # dead sink — connection refused, fails fast
+      # No AZIMUTH_API_KEY -> daemon reports config_error and runs in stub mode.
+    ports:
+      - "127.0.0.1:18123:8420"
