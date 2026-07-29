@@ -49,6 +49,49 @@ status_bind = "$STATUS_BIND"
 [sdr]
 sample_rate = $SDR_SAMPLE_RATE
 gain = $SDR_GAIN
+
+[scanning]
+mode = "both"
+interval_seconds = 30
+weight_lte = 3
+weight_dtv = 2
+weight_fm = 1
+retune_delay_ms = 100
+capture_retries = 3
+max_observations_per_cycle = 20
+
+[scanning.fm]
+frequencies = []
+sweep_start = 87_500_000
+sweep_end = 108_000_000
+sweep_step = 200_000
+sweep_threshold = -20.0
+sweep_min_snr_db = 8.0
+
+[scanning.lte]
+frequencies = [631_000_000, 637_000_000, 737_000_000, 881_000_000]
+
+[[scanning.lte.sweep_bands]]
+start = 617_000_000
+end = 652_000_000
+step = 5_000_000
+
+[[scanning.lte.sweep_bands]]
+start = 729_000_000
+end = 746_000_000
+step = 5_000_000
+
+[[scanning.lte.sweep_bands]]
+start = 869_000_000
+end = 894_000_000
+step = 5_000_000
+
+[scanning.dtv]
+frequencies = []
+sweep_start = 470_000_000
+sweep_end = 608_000_000
+sweep_step = 6_000_000
+sweep_threshold = -45.0
 EOF
 else
   echo "[entrypoint] Using existing $CONFIG_PATH (AZIMUTH_* env ignored on this boot)"

@@ -21,6 +21,8 @@ WORKDIR /app
 # statically linked, so the build pulls and compiles them here.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Strip build-machine paths from panic messages / debug metadata in the binary.
+ENV RUSTFLAGS="--remap-path-prefix=/app=azimuth --remap-path-prefix=/usr/local/cargo=cargo"
 RUN cargo build --release --locked
 
 # ---- Stage 2: runtime ----
@@ -55,7 +57,7 @@ LABEL org.opencontainers.image.title="Azimuth Node" \
       org.opencontainers.image.vendor="Azimuth" \
       org.opencontainers.image.authors="Azimuth <contact@azimuth.day>" \
       org.opencontainers.image.source="https://github.com/Azimuth-Official/azimuth-daemon" \
-      org.opencontainers.image.version="0.2.3"
+      org.opencontainers.image.version="0.2.5"
 
 USER azimuth
 VOLUME ["/var/lib/azimuth"]
