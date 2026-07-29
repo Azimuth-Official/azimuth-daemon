@@ -435,8 +435,36 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        // Fresh installs may not have the config directory yet (e.g. AppData\Roaming\<app>
+        // on Windows) — create it or the write fails with os error 3.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("Failed to create config directory {}: {}", parent.display(), e)
+            })?;
+        }
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_creates_missing_parent_dir() {
+        let base = std::env::temp_dir().join(format!("azd-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join("nested").join("deeper").join("config.toml");
+        assert!(!path.parent().unwrap().exists());
+
+        let cfg = Config::default();
+        cfg.save(&path).expect("save must create missing parent dirs");
+
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[api]"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
