@@ -72,6 +72,10 @@ pub struct StatusInfo {
     /// validation failure, unconfigured API key). The desktop app surfaces
     /// this as a "setup needed" state instead of appearing dead.
     pub config_error: Option<String>,
+    /// Non-null when the API rejected the key with HTTP 401. Cleared when a
+    /// heartbeat succeeds or a new key arrives via POST /config/write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_error: Option<String>,
 }
 
 pub struct StatusState {
@@ -110,7 +114,12 @@ pub struct StatusState {
     pub gps_last_fix: Option<String>,
     pub gps_accuracy_history: VecDeque<AccuracyPoint>,
     pub config_error: Option<String>,
+    pub auth_error: Option<String>,
 }
+
+/// Message surfaced through /status when the API rejects the key.
+pub const AUTH_ERROR_MSG: &str =
+    "API key rejected by server (401). Generate a new key at azimuth.day/dashboard";
 
 impl StatusState {
     pub fn new(node_id: String, hardware_type: String) -> Self {
@@ -151,6 +160,7 @@ impl StatusState {
             gps_last_fix: None,
             gps_accuracy_history: VecDeque::new(),
             config_error: None,
+            auth_error: None,
         }
     }
 
@@ -184,6 +194,7 @@ impl StatusState {
             gps_fix_quality: self.gps_fix_quality,
             gps_hdop: self.gps_hdop,
             config_error: self.config_error.clone(),
+            auth_error: self.auth_error.clone(),
         }
     }
 }
@@ -194,6 +205,9 @@ pub struct AppState {
     pub scanning_enabled: Arc<AtomicBool>,
     pub scanner_active: Arc<AtomicBool>,
     pub config_path: PathBuf,
+    /// Live API key shared with ApiClient — POST /config/write swaps it so a
+    /// corrected key takes effect without a daemon restart.
+    pub api_key: Arc<std::sync::RwLock<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,10 +321,17 @@ async fn config_write_handler(
     }
 
     let config_path_for_save = config_path.clone();
+    let new_api_key = config.api.key.clone();
     let result = tokio::task::block_in_place(move || config.save(&config_path_for_save));
     match result {
         Ok(()) => {
             info!(path = %config_path.display(), "Config written from HTTP request");
+            // Hot-swap the live API key and clear any auth error so the next
+            // heartbeat retries immediately with the new key — no restart.
+            if let Ok(mut key) = state.api_key.write() {
+                *key = new_api_key;
+            }
+            state.status.write().await.auth_error = None;
             Ok((StatusCode::OK, Json(MessageResponse {
                 message: "Config written".to_string(),
             })))
@@ -695,5 +716,32 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
     let listener = listener.expect("bind loop guarantees a listener or an exit");
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!(error = %e, "Status server error");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_json_includes_auth_error_when_set() {
+        let mut state = StatusState::new("node-1".to_string(), "tier1_rtlsdr".to_string());
+        state.auth_error = Some(AUTH_ERROR_MSG.to_string());
+        let json = serde_json::to_value(state.to_info(true, false)).unwrap();
+        assert_eq!(
+            json["auth_error"].as_str(),
+            Some(AUTH_ERROR_MSG),
+            "auth_error must be serialized when set"
+        );
+    }
+
+    #[test]
+    fn status_json_omits_auth_error_when_none() {
+        let state = StatusState::new("node-1".to_string(), "tier1_rtlsdr".to_string());
+        let json = serde_json::to_value(state.to_info(true, false)).unwrap();
+        assert!(
+            json.get("auth_error").is_none(),
+            "auth_error must be omitted when None"
+        );
     }
 }

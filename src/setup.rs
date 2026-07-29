@@ -62,7 +62,10 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
         anyhow::bail!("API key cannot be empty");
     }
 
-    let client = ApiClient::new(&base_url, &api_key);
+    let client = ApiClient::new(
+        &base_url,
+        std::sync::Arc::new(std::sync::RwLock::new(api_key.clone())),
+    );
     println!("  Verifying API key...");
 
     // Step 2: Node Registration

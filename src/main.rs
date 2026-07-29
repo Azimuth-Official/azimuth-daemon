@@ -128,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Live API key, shared between ApiClient and the status server so
+    // POST /config/write can hot-swap a corrected key without a restart.
+    let api_key = Arc::new(std::sync::RwLock::new(config.api.key.clone()));
+
     // Status server state — create early so we can report config errors via HTTP
     let app_state = Arc::new(AppState {
         status: Arc::new(RwLock::new(StatusState::new(
@@ -137,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         scanning_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         scanner_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config_path: cli.config.clone(),
+        api_key: Arc::clone(&api_key),
     });
 
     // Spawn status server early so sidecar can always query it
@@ -174,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
         state.config_error = Some(config_errors.join(" | "));
     }
 
-    let client = Arc::new(ApiClient::new(&config.api.url, &config.api.key));
+    let client = Arc::new(ApiClient::new(&config.api.url, Arc::clone(&api_key)));
 
     // Machine-scoped identity + fingerprinted registration keep reinstalls
     // from creating duplicate nodes. Registration goes first: the server
@@ -348,8 +353,29 @@ async fn main() -> anyhow::Result<()> {
                 Ok(()) => {
                     let mut state = app_state_hb.status.write().await;
                     state.last_heartbeat = Some(chrono::Utc::now());
+                    if state.auth_error.is_some() {
+                        info!("Heartbeat succeeded — clearing auth error");
+                        state.auth_error = None;
+                    }
                 }
-                Err(e) => error!(error = %e, "Heartbeat failed"),
+                Err(e) => {
+                    if api_client::is_unauthorized(&e) {
+                        // 401: surface via /status, then back off hard — the
+                        // heartbeat stays the recovery probe, but at 5-minute
+                        // cadence instead of hammering with a dead key.
+                        {
+                            let mut state = app_state_hb.status.write().await;
+                            if state.auth_error.is_none() {
+                                error!("Heartbeat 401 — API key rejected; slowing to 5-minute probes until the key changes");
+                                state.auth_error =
+                                    Some(status_server::AUTH_ERROR_MSG.to_string());
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(300)).await;
+                    } else {
+                        error!(error = %e, "Heartbeat failed");
+                    }
+                }
             }
         }
     });
@@ -441,6 +467,13 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
+            // Auth error active: don't burn requests on a rejected key. The
+            // heartbeat loop probes for recovery and clears the flag.
+            if app_state.status.read().await.auth_error.is_some() {
+                tracing::debug!("Skipping observation submit — API key rejected (401)");
+                continue;
+            }
+
             let count = observations.len();
             let request = SubmitObservationsRequest {
                 node_id: node_id.clone(),
@@ -452,9 +485,20 @@ async fn main() -> anyhow::Result<()> {
                     let mut state = app_state.status.write().await;
                     state.observations_submitted += accepted as u64;
                     info!(submitted = count, accepted, total = state.observations_submitted, "Batch submitted");
+                    if state.auth_error.is_some() {
+                        state.auth_error = None;
+                    }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Observation submit failed — will retry next interval");
+                    if api_client::is_unauthorized(&e) {
+                        let mut state = app_state.status.write().await;
+                        if state.auth_error.is_none() {
+                            error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
+                            state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                        }
+                    } else {
+                        warn!(error = %e, "Observation submit failed — will retry next interval");
+                    }
                 }
             }
         }
@@ -518,6 +562,13 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
+            // Auth error active: don't burn requests on a rejected key. The
+            // heartbeat loop probes for recovery and clears the flag.
+            if app_state.status.read().await.auth_error.is_some() {
+                tracing::debug!("Skipping observation submit — API key rejected (401)");
+                continue;
+            }
+
             let request = SubmitObservationsRequest {
                 node_id: node_id.clone(),
                 observations,
@@ -528,9 +579,20 @@ async fn main() -> anyhow::Result<()> {
                     let mut state = app_state.status.write().await;
                     state.observations_submitted += accepted as u64;
                     info!(accepted, total = state.observations_submitted, "Batch submitted");
+                    if state.auth_error.is_some() {
+                        state.auth_error = None;
+                    }
                 }
                 Err(e) => {
-                    warn!(error = %e, "Observation submit failed — will retry next interval");
+                    if api_client::is_unauthorized(&e) {
+                        let mut state = app_state.status.write().await;
+                        if state.auth_error.is_none() {
+                            error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
+                            state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                        }
+                    } else {
+                        warn!(error = %e, "Observation submit failed — will retry next interval");
+                    }
                 }
             }
         }
