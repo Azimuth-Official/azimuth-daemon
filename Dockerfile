@@ -21,6 +21,8 @@ WORKDIR /app
 # statically linked, so the build pulls and compiles them here.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# regions.rs embeds the region database at compile time (include_str!).
+COPY data ./data
 # Strip build-machine paths from panic messages / debug metadata in the binary.
 ENV RUSTFLAGS="--remap-path-prefix=/app=azimuth --remap-path-prefix=/usr/local/cargo=cargo"
 RUN cargo build --release --locked
@@ -57,7 +59,7 @@ LABEL org.opencontainers.image.title="Azimuth Node" \
       org.opencontainers.image.vendor="Azimuth" \
       org.opencontainers.image.authors="Azimuth <contact@azimuth.day>" \
       org.opencontainers.image.source="https://github.com/Azimuth-Official/azimuth-daemon" \
-      org.opencontainers.image.version="0.2.5"
+      org.opencontainers.image.version="0.3.0"
 
 USER azimuth
 VOLUME ["/var/lib/azimuth"]
