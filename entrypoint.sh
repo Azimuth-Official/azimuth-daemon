@@ -8,6 +8,33 @@ set -eu
 
 CONFIG_PATH="${AZIMUTH_CONFIG_PATH:-/var/lib/azimuth/config.toml}"
 
+# ── Docker auto-directory guard ────────────────────────────────────────
+# When docker-compose bind-mounts a host FILE path that does not exist,
+# Docker silently creates it as an empty DIRECTORY — then the config
+# write below fails with "Is a directory" and the container crash-loops.
+if [ -d "$CONFIG_PATH" ]; then
+  if [ -n "$(ls -A "$CONFIG_PATH" 2>/dev/null)" ]; then
+    echo "[entrypoint] FATAL: $CONFIG_PATH is a NON-EMPTY directory — refusing to touch it."
+    echo "[entrypoint] Move its contents aside on the host, then restart."
+    exit 1
+  fi
+  if rmdir "$CONFIG_PATH" 2>/dev/null; then
+    echo "[entrypoint] Removed empty config.toml directory (Docker auto-created it from a missing bind-mount file)"
+  else
+    # rmdir fails when the directory IS the bind mountpoint — only fixable on the host.
+    echo "[entrypoint] FATAL: $CONFIG_PATH is an empty DIRECTORY bind-mounted by docker-compose."
+    echo "[entrypoint] Docker created it because the host file did not exist before 'docker compose up'."
+    echo "[entrypoint] Fix on the HOST, then restart:"
+    echo "[entrypoint]   docker compose down"
+    echo "[entrypoint]   rm -rf ./config.toml"
+    echo "[entrypoint]   # either create the file first:   touch ./config.toml"
+    echo "[entrypoint]   # or remove the ./config.toml:... volume line and use AZIMUTH_* env vars"
+    echo "[entrypoint]   docker compose up -d"
+    echo "[entrypoint] Docs: https://azimuth.day/docs/docker"
+    exit 1
+  fi
+fi
+
 API_URL="${AZIMUTH_API_URL:-https://azimuth.day}"
 API_KEY="${AZIMUTH_API_KEY:-}"
 NODE_ID="${AZIMUTH_NODE_ID:-}"
@@ -25,7 +52,9 @@ REGION="${AZIMUTH_REGION:-AUTO}"
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 
-if [ ! -f "$CONFIG_PATH" ]; then
+# Generate when the config is missing OR an empty file (an empty file is what
+# a user creates with `touch` before file-bind-mounting — write through it).
+if [ ! -s "$CONFIG_PATH" ]; then
   echo "[entrypoint] Generating $CONFIG_PATH from AZIMUTH_* environment"
   cat > "$CONFIG_PATH" <<EOF
 # Region code (ISO country, e.g. US, DE, JP) or AUTO for the worldwide default.

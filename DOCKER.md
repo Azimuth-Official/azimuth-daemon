@@ -53,7 +53,10 @@ On **first boot** the entrypoint generates `/var/lib/azimuth/config.toml` from t
 variables below and then persists it (later boots reuse the saved file — the daemon also
 writes its assigned `node.id` back to it). To regenerate, delete the file or the volume
 and restart. To use the full config (including the advanced `[scanning]`, `[ntrip]`, and
-`[gps]` sections), mount your own `config.toml` at `AZIMUTH_CONFIG_PATH` instead.
+`[gps]` sections), mount your own `config.toml` at `AZIMUTH_CONFIG_PATH` instead —
+but **create the host file before `docker compose up`** (e.g. `touch ./config.toml`):
+if it does not exist, Docker creates an empty directory in its place and the container
+refuses to start with a `FATAL: ... is an empty DIRECTORY` message.
 
 | Variable | Maps to | Default | Notes |
 |----------|---------|---------|-------|
