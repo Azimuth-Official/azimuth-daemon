@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::regions::RegionResolver;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub api: ApiConfig,
@@ -8,6 +10,8 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub sdr: SdrConfig,
     #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default = "default_scanning")]
     pub scanning: Option<ScanningConfig>,
     #[serde(default)]
     pub ntrip: Option<NtripConfig>,
@@ -53,6 +57,8 @@ pub struct SdrConfig {
     pub gain: i32,
     #[serde(default = "default_dbm_offset")]
     pub dbm_offset: f32,
+    #[serde(default = "default_max_tuner_mhz")]
+    pub max_tuner_mhz: u64,
 }
 
 impl Default for Config {
@@ -86,8 +92,10 @@ impl Default for Config {
                 center_frequency: default_center_frequency(),
                 gain: -1,
                 dbm_offset: default_dbm_offset(),
+                max_tuner_mhz: default_max_tuner_mhz(),
             },
-            scanning: None,
+            region: None,
+            scanning: default_scanning(),
             ntrip: None,
             gps: None,
         }
@@ -102,8 +110,20 @@ fn default_dbm_offset() -> f32 {
     -30.0
 }
 
+fn default_max_tuner_mhz() -> u64 {
+    1766
+}
+
+fn default_scanning() -> Option<ScanningConfig> {
+    Some(ScanningConfig::default())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScanningConfig {
+    /// Master switch for the multi-signal scanner. `false` drops the daemon
+    /// back to the legacy single-frequency loop (Stage A behavior).
+    #[serde(default = "default_scanning_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_scan_mode")]
     pub mode: String,
     #[serde(default = "default_scan_interval")]
@@ -128,6 +148,9 @@ pub struct ScanningConfig {
     pub dtv: DtvScanConfig,
 }
 
+fn default_scanning_enabled() -> bool {
+    true
+}
 fn default_scan_mode() -> String {
     "both".to_string()
 }
@@ -156,6 +179,7 @@ fn default_max_obs_per_cycle() -> u32 {
 impl Default for ScanningConfig {
     fn default() -> Self {
         Self {
+            enabled: default_scanning_enabled(),
             mode: default_scan_mode(),
             interval_seconds: default_scan_interval(),
             weight_lte: default_weight_lte(),
@@ -386,26 +410,31 @@ impl Config {
                         .into(),
                 );
             }
+            // FM floor is 65 MHz, not 87.5: Russia/Ukraine still broadcast on
+            // the OIRT band (65.9-74 MHz), and Japan uses 76-95 MHz.
             for freq in &s.fm.frequencies {
-                if *freq < 87_500_000 || *freq > 108_000_000 {
+                if *freq < 65_000_000 || *freq > 108_000_000 {
                     errors.push(format!(
-                        "scanning.fm.frequencies: {} Hz is outside FM band (87.5-108 MHz)",
+                        "scanning.fm.frequencies: {} Hz is outside FM band (65-108 MHz)",
                         freq
                     ));
                 }
             }
+            let lte_max_hz = self.sdr.max_tuner_mhz * 1_000_000;
             for freq in &s.lte.frequencies {
-                if *freq > 1_766_000_000 {
+                if *freq > lte_max_hz {
                     errors.push(format!(
-                        "scanning.lte.frequencies: {} Hz exceeds RTL-SDR max (~1.766 GHz)",
-                        freq
+                        "scanning.lte.frequencies: {} Hz exceeds tuner max ({} MHz)",
+                        freq, self.sdr.max_tuner_mhz
                     ));
                 }
             }
+            // 862 MHz is the DVB-T/T2 upper edge; ATSC tops out lower but a
+            // region-agnostic bound has to admit the widest standard.
             for freq in &s.dtv.frequencies {
-                if *freq < 470_000_000 || *freq > 700_000_000 {
+                if *freq < 470_000_000 || *freq > 862_000_000 {
                     errors.push(format!(
-                        "scanning.dtv.frequencies: {} Hz is outside UHF TV range (470-700 MHz)",
+                        "scanning.dtv.frequencies: {} Hz is outside UHF TV range (470-862 MHz)",
                         freq
                     ));
                 }
@@ -417,6 +446,65 @@ impl Config {
         } else {
             Err(errors)
         }
+    }
+
+    /// Resolve `region` (ISO country code or AUTO) into concrete sweep plans and
+    /// populate the [scanning] sub-configs. An explicit region overrides the FM,
+    /// LTE, and DTV sweep ranges; without one, only an empty LTE sweep-band list
+    /// is filled from the worldwide default so upgraded nodes start scanning.
+    /// Resolution failures keep the configured sweep plans — never fatal.
+    pub fn apply_region(&mut self) {
+        let explicit_region =
+            matches!(self.region.as_deref(), Some(r) if !r.is_empty() && r != "AUTO");
+        let region_code = self.region.clone().unwrap_or_else(|| "AUTO".to_string());
+        let max_tuner_mhz = self.sdr.max_tuner_mhz;
+
+        let Some(scanning) = self.scanning.as_mut() else {
+            return;
+        };
+
+        let resolver = match RegionResolver::new(max_tuner_mhz) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "embedded region database failed to load — keeping configured sweep plans");
+                return;
+            }
+        };
+        let resolved = match resolver.resolve(&region_code) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, region = %region_code,
+                    "region resolution failed — keeping configured sweep plans");
+                return;
+            }
+        };
+
+        if explicit_region || scanning.lte.sweep_bands.is_empty() {
+            scanning.lte.sweep_bands = resolved
+                .lte_sweep_bands
+                .iter()
+                .map(|b| BandRange {
+                    start: b.start,
+                    end: b.end,
+                    step: b.step,
+                })
+                .collect();
+        }
+        if explicit_region {
+            scanning.fm.sweep_start = resolved.fm_sweep_start;
+            scanning.fm.sweep_end = resolved.fm_sweep_end;
+            scanning.fm.sweep_step = resolved.fm_sweep_step;
+            scanning.dtv.sweep_start = resolved.dtv_sweep_start;
+            scanning.dtv.sweep_end = resolved.dtv_sweep_end;
+            scanning.dtv.sweep_step = resolved.dtv_sweep_step;
+        }
+        tracing::info!(
+            region = %resolved.region_code,
+            lte_bands = scanning.lte.sweep_bands.len(),
+            skipped_bands = resolved.skipped_bands.len(),
+            "regional frequency plan applied"
+        );
     }
 
     #[allow(dead_code)]
@@ -466,5 +554,150 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[api]"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn missing_scanning_section_enables_scanning_by_default() {
+        // Regression test for legacy-fallback bug: config.toml WITHOUT [scanning]
+        // should enable scanning (Some(ScanningConfig::default())), NOT None.
+        // This ensures fielded nodes on upgrade get regional frequency scanning automatically.
+        let toml_str = r#"
+[api]
+url = "https://azimuth.day"
+key = "test-key"
+
+[node]
+id = "test-node"
+hardware_type = "tier1_rtlsdr"
+label = "Test Node"
+
+[node.location]
+latitude = 40.7128
+longitude = -74.0060
+altitude_m = 0.0
+
+[daemon]
+heartbeat_interval_secs = 15
+submit_interval_secs = 30
+status_bind = "127.0.0.1:8420"
+
+[sdr]
+sample_rate = 2048000
+center_frequency = 100000000
+gain = -1
+"#;
+
+        let config: Config = toml::from_str(toml_str)
+            .expect("config should parse even without [scanning] section");
+
+        // This is the RED test: currently fails because scanning is None
+        // After fix, scanning should be Some(...) with default values
+        assert!(
+            config.scanning.is_some(),
+            "scanning should be enabled (Some) by default when [scanning] section is missing, \
+             got None (legacy single-frequency mode)"
+        );
+
+        // Verify the defaults are sensible
+        let scanning = config.scanning.as_ref().unwrap();
+        assert_eq!(scanning.mode, "both");
+        assert_eq!(scanning.interval_seconds, 30);
+        assert_eq!(scanning.weight_lte, 3);
+        assert_eq!(scanning.weight_dtv, 2);
+        assert_eq!(scanning.weight_fm, 1);
+        assert!(scanning.enabled, "scanner must default to enabled");
+    }
+
+    fn valid_base_config() -> Config {
+        let mut config = Config::default();
+        config.api.key = "test-key".to_string();
+        config.node.id = "test-node".to_string();
+        config.node.location.latitude = 40.7128;
+        config.node.location.longitude = -74.0060;
+        config
+    }
+
+    #[test]
+    fn validate_accepts_oirt_and_japan_fm_frequencies() {
+        let mut config = valid_base_config();
+        let scanning = config.scanning.as_mut().unwrap();
+        // OIRT (Russia/Ukraine) 65.9 MHz and Japan 76.0 MHz are real FM carriers.
+        scanning.fm.frequencies = vec![65_900_000, 76_000_000, 107_900_000];
+        assert!(config.validate().is_ok(), "OIRT/Japan FM frequencies must pass");
+    }
+
+    #[test]
+    fn validate_rejects_fm_below_65_mhz() {
+        let mut config = valid_base_config();
+        config.scanning.as_mut().unwrap().fm.frequencies = vec![64_000_000];
+        let errors = config.validate().expect_err("64 MHz is below any FM band");
+        assert!(errors.iter().any(|e| e.contains("outside FM band")));
+    }
+
+    #[test]
+    fn validate_accepts_dvbt_uhf_up_to_862_mhz() {
+        let mut config = valid_base_config();
+        config.scanning.as_mut().unwrap().dtv.frequencies = vec![858_000_000];
+        assert!(config.validate().is_ok(), "858 MHz DVB-T channel must pass");
+    }
+
+    #[test]
+    fn validate_lte_bound_follows_max_tuner_mhz() {
+        let mut config = valid_base_config();
+        config.sdr.max_tuner_mhz = 1000;
+        config.scanning.as_mut().unwrap().lte.frequencies = vec![1_100_000_000];
+        let errors = config.validate().expect_err("1.1 GHz exceeds a 1000 MHz tuner");
+        assert!(errors.iter().any(|e| e.contains("exceeds tuner max (1000 MHz)")));
+    }
+
+    #[test]
+    fn apply_region_fills_empty_sweep_bands_without_region() {
+        let mut config = valid_base_config();
+        assert!(config.region.is_none());
+        assert!(config.scanning.as_ref().unwrap().lte.sweep_bands.is_empty());
+
+        config.apply_region();
+
+        let scanning = config.scanning.as_ref().unwrap();
+        assert!(
+            !scanning.lte.sweep_bands.is_empty(),
+            "worldwide default bands must be populated when none are configured"
+        );
+        // Without an explicit region the FM sweep range stays untouched.
+        assert_eq!(scanning.fm.sweep_start, 87_500_000);
+    }
+
+    #[test]
+    fn apply_region_explicit_region_overrides_sweep_ranges() {
+        let mut config = valid_base_config();
+        config.region = Some("JP".to_string());
+
+        config.apply_region();
+
+        let scanning = config.scanning.as_ref().unwrap();
+        assert_eq!(scanning.fm.sweep_start, 76_000_000, "Japan FM band starts at 76 MHz");
+        assert_eq!(scanning.fm.sweep_end, 95_000_000, "Japan FM band ends at 95 MHz");
+        assert!(!scanning.lte.sweep_bands.is_empty());
+        // Capability filter: nothing above the default 1766 MHz tuner ceiling.
+        for band in &scanning.lte.sweep_bands {
+            assert!(band.end <= 1_766_000_000);
+        }
+    }
+
+    #[test]
+    fn apply_region_preserves_user_sweep_bands_without_region() {
+        let mut config = valid_base_config();
+        let user_band = BandRange {
+            start: 700_000_000,
+            end: 750_000_000,
+            step: 5_000_000,
+        };
+        config.scanning.as_mut().unwrap().lte.sweep_bands = vec![user_band];
+
+        config.apply_region();
+
+        let bands = &config.scanning.as_ref().unwrap().lte.sweep_bands;
+        assert_eq!(bands.len(), 1, "hand-configured sweep bands must survive");
+        assert_eq!(bands[0].start, 700_000_000);
     }
 }

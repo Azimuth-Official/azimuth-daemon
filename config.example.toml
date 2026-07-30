@@ -3,6 +3,11 @@
 # Copy this file to config.toml and edit before running.
 # =============================================================================
 
+# Region code: ISO country code (US, DE, JP, ...) or "AUTO" for the worldwide
+# default. The daemon resolves this into FM/LTE/DTV sweep plans at startup and
+# overrides the [scanning.*] sweep ranges below. Also settable via --region.
+region = "AUTO"
+
 [api]
 # Azimuth API endpoint
 url = "https://azimuth.day"
@@ -46,10 +51,14 @@ gain = -1
 dbm_offset = -30.0
 
 # =============================================================================
-# Scanning Configuration (optional — omit entire section for legacy single-freq mode)
+# Scanning Configuration (optional — scanning runs by default even without this
+# section, using the region's sweep plans; set enabled = false for the legacy
+# single-frequency mode)
 # =============================================================================
 
 [scanning]
+# Master switch: false drops back to the legacy single-frequency loop
+enabled = true
 # Scan mode:
 #   "config" = use only the frequency lists below (fast, predictable)
 #   "sweep"  = auto-discover stations on first run (slower startup, finds everything)

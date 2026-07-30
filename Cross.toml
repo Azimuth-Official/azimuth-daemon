@@ -7,6 +7,10 @@ passthrough = ["RUSTFLAGS", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS"
 [target.x86_64-unknown-linux-gnu]
 # Debian stable-based image
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5"
+pre-build = [
+    "apt-get update",
+    "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev",
+]
 
 # Cross-compile note: the C-linked deps (libudev-sys via serialport) resolve through
 # pkg-config. cross-rs does NOT set container env from an inline `env = {...}` table;

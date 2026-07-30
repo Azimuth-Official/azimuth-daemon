@@ -178,7 +178,9 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
             center_frequency: 100_000_000,
             gain,
             dbm_offset: -30.0,
+            max_tuner_mhz: 1766,
         },
+        region: None,
         scanning: Some(ScanningConfig {
             mode: scan_mode,
             ..Default::default()

@@ -3,6 +3,7 @@ mod config;
 mod gps;
 mod identity;
 mod observation;
+mod regions;
 mod sdr;
 mod setup;
 mod ntrip;
@@ -91,6 +92,10 @@ struct Cli {
     /// Longitude (for automated setup)
     #[arg(long)]
     lon: Option<f64>,
+
+    /// Region code (ISO country, e.g. US, DE, JP) or AUTO — overrides config `region`
+    #[arg(long)]
+    region: Option<String>,
 }
 
 #[tokio::main]
@@ -127,6 +132,13 @@ async fn main() -> anyhow::Result<()> {
             (Config::default(), Some(format!("Config load failed: {e}")))
         }
     };
+
+    // CLI --region overrides config.region; resolution then turns the region
+    // code into concrete FM/LTE/DTV sweep plans (capability-filtered).
+    if let Some(ref region) = cli.region {
+        config.region = Some(region.clone());
+    }
+    config.apply_region();
 
     // Live API key, shared between ApiClient and the status server so
     // POST /config/write can hot-swap a corrected key without a restart.
@@ -422,8 +434,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Determine observation mode: scanner vs legacy
-    if let Some(ref scanning_config) = config.scanning {
+    // Determine observation mode: scanner vs legacy. The scanner runs whenever
+    // a [scanning] config exists AND its `enabled` flag is true (the default —
+    // including when [scanning] is absent entirely); `enabled = false` is the
+    // only way to opt back into the legacy single-frequency loop.
+    if let Some(scanning_config) = config.scanning.as_ref().filter(|s| s.enabled) {
         // Scanner mode — multi-frequency, multi-signal-type
         let mut scanner = Scanner::new(scanning_config, config.sdr.dbm_offset);
         let scan_interval = Duration::from_secs(scanner.interval_seconds() as u64);
