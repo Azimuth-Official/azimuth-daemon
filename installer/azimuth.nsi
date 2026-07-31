@@ -55,7 +55,7 @@ Section "Azimuth Daemon" SecDaemon
     ; Machine-scoped identity dir: %ProgramData%\Azimuth holds node-identity.json
     ; so the node keeps its identity across uninstall/reinstall. Grant Users
     ; Modify so the user-context desktop sidecar writes the SAME file as the
-    ; SYSTEM-context service (one identity per machine — no split-brain).
+    ; SYSTEM-context service (one identity per machine -- no split-brain).
     ReadEnvStr $0 "ProgramData"
     CreateDirectory "$0\Azimuth"
     nsExec::ExecToLog 'icacls "$0\Azimuth" /grant "*S-1-5-32-545:(OI)(CI)M"'
