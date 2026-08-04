@@ -60,6 +60,14 @@ struct HeartbeatRequest {
     rtk_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     rtk_provider: Option<String>,
+    // Merged into nodes.metadata server-side so the dashboard can show which
+    // daemon build a node is running.
+    metadata: HeartbeatMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct HeartbeatMetadata {
+    daemon_version: &'static str,
 }
 
 impl ApiClient {
@@ -140,6 +148,9 @@ impl ApiClient {
             network_support_enabled,
             rtk_enabled,
             rtk_provider,
+            metadata: HeartbeatMetadata {
+                daemon_version: env!("CARGO_PKG_VERSION"),
+            },
         };
         let resp = self
             .client
@@ -215,6 +226,26 @@ mod tests {
     fn client_for(base: &str) -> ApiClient {
         let key = std::sync::Arc::new(std::sync::RwLock::new("test-key".to_string()));
         ApiClient::new(base, key)
+    }
+
+    #[test]
+    fn heartbeat_body_reports_daemon_version() {
+        let body = HeartbeatRequest {
+            device_count: 1,
+            device_serials: vec!["SDR-0000".to_string()],
+            network_support_enabled: false,
+            rtk_enabled: false,
+            rtk_provider: None,
+            metadata: HeartbeatMetadata {
+                daemon_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let json = serde_json::to_value(&body).expect("heartbeat body must serialize");
+        assert_eq!(
+            json["metadata"]["daemon_version"],
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+            "heartbeat must report the crate version so the dashboard can display it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
