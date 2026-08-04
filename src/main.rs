@@ -461,11 +461,51 @@ async fn main() -> anyhow::Result<()> {
         info!("Scanner observation loop started (interval {}s)", scanner.interval_seconds());
         let scanning_enabled = Arc::clone(&app_state.scanning_enabled);
         let scanner_active = Arc::clone(&app_state.scanner_active);
+        // Counts consecutive cycles with no open SDR device. Recovery
+        // exhaustion (L2/L3 close the handle, reopen fails) leaves the
+        // manager empty; without re-detection every later cycle returns no
+        // observations while heartbeats keep the node looking healthy.
+        let mut cycles_without_sdr: u64 = 0;
         loop {
             tokio::time::sleep(scan_interval).await;
 
             if !scanning_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
+            }
+
+            if sdr_manager.device_count() == 0 {
+                cycles_without_sdr += 1;
+                if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 {
+                    warn!(
+                        cycles = cycles_without_sdr,
+                        "No SDR devices open — attempting re-detection"
+                    );
+                    sdr_manager = SdrManager::new(
+                        config.sdr.device_index,
+                        config.sdr.sample_rate,
+                        config.sdr.gain,
+                    );
+                    let mut state = app_state.status.write().await;
+                    state.sdr_connected = sdr_manager.is_connected();
+                    state.device_count = sdr_manager.device_count();
+                    if sdr_manager.device_count() > 0 {
+                        state.sdr_name = sdr_manager
+                            .device_serials()
+                            .into_iter()
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "RTL-SDR".to_string());
+                        drop(state);
+                        info!("SDR re-detected — resuming scanning");
+                        cycles_without_sdr = 0;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                cycles_without_sdr = 0;
             }
 
             scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);
