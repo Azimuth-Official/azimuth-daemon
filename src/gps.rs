@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_serial::SerialPortBuilderExt;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 
 use crate::status_server::StatusState;
 
@@ -167,10 +167,46 @@ async fn try_open_serial(
                 debug!(port = %port, baud, "NMEA validation failed on this baud rate");
                 // Drop this stream and try next baud
             }
-            Err(_) => continue,
+            Err(e) => {
+                if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
+                    warn_permission_denied(port);
+                    // Permission does not depend on baud rate — no point
+                    // retrying the remaining rates on this port.
+                    return None;
+                }
+                debug!(port = %port, baud, error = %e, "Serial port open failed");
+                continue;
+            }
         }
     }
     None
+}
+
+/// Log the dialout-group fix instructions once per port at error level;
+/// the 5-second detection loop would otherwise repeat it endlessly.
+fn warn_permission_denied(port: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = warned
+        .lock()
+        .map(|mut set| set.insert(port.to_string()))
+        .unwrap_or(true);
+    if first {
+        error!(
+            port = %port,
+            "Permission denied opening GPS serial port '{port}'.\n  \
+             On Linux, your user must be in the 'dialout' group:\n    \
+             sudo usermod -aG dialout $USER\n  \
+             Then log out and back in (or reboot).\n  \
+             If running in Docker, ensure the device is passed through:\n    \
+             devices: [\"/dev/ttyUSB0:/dev/ttyUSB0\"]\n  \
+             and the container has sufficient privileges."
+        );
+    } else {
+        debug!(port = %port, "GPS serial port still permission-denied");
+    }
 }
 
 /// Extract latitude/longitude/altitude from a GGA sentence

@@ -44,6 +44,7 @@ pub struct RecentSignal {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusInfo {
+    pub version: String,
     pub node_id: String,
     pub hardware_type: String,
     pub uptime_secs: u64,
@@ -169,6 +170,7 @@ impl StatusState {
         scanner_active: bool,
     ) -> StatusInfo {
         StatusInfo {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             node_id: self.node_id.clone(),
             hardware_type: self.hardware_type.clone(),
             uptime_secs: self.start_time.elapsed().as_secs(),
@@ -639,6 +641,7 @@ fn test_sdr_device(index: u32) -> anyhow::Result<bool> {
 
 pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
     let app = Router::new()
+        .route("/", get(crate::dashboard::dashboard_handler))
         .route("/status", get(status_handler))
         .route("/sdr/list", get(sdr_list_handler))
         .route("/sdr/test", post(sdr_test_handler))

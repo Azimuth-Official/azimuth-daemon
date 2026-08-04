@@ -1,5 +1,6 @@
 mod api_client;
 mod config;
+mod dashboard;
 mod gps;
 mod identity;
 mod observation;

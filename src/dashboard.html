@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azimuth Node Dashboard</title>
+<style>
+  :root {
+    --bg: #0A0F1E;
+    --card: #0D1428;
+    --border: #1E293B;
+    --text: #E2E8F0;
+    --muted: #64748B;
+    --amber: #F59E0B;
+    --cyan: #06B6D4;
+    --green: #34D399;
+    --red: #F87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+  }
+  header h1 { font-size: 1.4rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--amber); }
+  #conn { font-size: 0.65rem; color: var(--muted); }
+  #conn.err { color: var(--red); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--cyan);
+    margin-bottom: 10px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 3px 0;
+    font-size: 0.85rem;
+  }
+  .row .k { color: var(--muted); flex-shrink: 0; }
+  .row .v { text-align: right; overflow-wrap: anywhere; }
+  .ok { color: var(--green); }
+  .bad { color: var(--red); }
+  .warn { color: var(--amber); }
+  .signals { margin-top: 8px; font-size: 0.65rem; color: var(--muted); max-height: 140px; overflow-y: auto; }
+  .signals div { padding: 2px 0; border-top: 1px solid var(--border); }
+  footer { margin-top: 18px; font-size: 0.65rem; color: var(--muted); }
+  @media (max-width: 480px) { body { padding: 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Azimuth Node Dashboard</h1>
+  <span id="conn">connecting…</span>
+</header>
+<div class="grid">
+  <div class="card"><h2>Node</h2>
+    <div class="row"><span class="k">Version</span><span class="v" id="version">–</span></div>
+    <div class="row"><span class="k">Node ID</span><span class="v" id="node_id">–</span></div>
+    <div class="row"><span class="k">Hardware</span><span class="v" id="hardware">–</span></div>
+    <div class="row"><span class="k">Uptime</span><span class="v" id="uptime">–</span></div>
+  </div>
+  <div class="card"><h2>GPS</h2>
+    <div class="row"><span class="k">Fix</span><span class="v" id="gps_fix">–</span></div>
+    <div class="row"><span class="k">Satellites</span><span class="v" id="gps_sats">–</span></div>
+    <div class="row"><span class="k">Position</span><span class="v" id="gps_pos">–</span></div>
+    <div class="row"><span class="k">HDOP</span><span class="v" id="gps_hdop">–</span></div>
+    <div class="row"><span class="k">Port</span><span class="v" id="gps_port">–</span></div>
+  </div>
+  <div class="card"><h2>SDR</h2>
+    <div class="row"><span class="k">Device</span><span class="v" id="sdr_name">–</span></div>
+    <div class="row"><span class="k">Connected</span><span class="v" id="sdr_conn">–</span></div>
+    <div class="row"><span class="k">Devices</span><span class="v" id="sdr_count">–</span></div>
+    <div class="row"><span class="k">Driver</span><span class="v" id="sdr_driver">–</span></div>
+  </div>
+  <div class="card"><h2>Observations</h2>
+    <div class="row"><span class="k">Submitted</span><span class="v" id="obs_total">–</span></div>
+    <div class="row"><span class="k">Rate</span><span class="v" id="obs_rate">–</span></div>
+    <div class="row"><span class="k">Signals found</span><span class="v" id="signals_found">–</span></div>
+    <div class="row"><span class="k">LTE / FM / DTV</span><span class="v" id="signal_breakdown">–</span></div>
+  </div>
+  <div class="card"><h2>API</h2>
+    <div class="row"><span class="k">Status</span><span class="v" id="api_status">–</span></div>
+    <div class="row"><span class="k">Last heartbeat</span><span class="v" id="api_hb">–</span></div>
+  </div>
+  <div class="card"><h2>RTK</h2>
+    <div class="row"><span class="k">Provider</span><span class="v" id="rtk_provider">–</span></div>
+    <div class="row"><span class="k">Connected</span><span class="v" id="rtk_conn">–</span></div>
+    <div class="row"><span class="k">RTCM frames</span><span class="v" id="rtk_frames">–</span></div>
+    <div class="row"><span class="k">Last correction</span><span class="v" id="rtk_last">–</span></div>
+  </div>
+  <div class="card"><h2>Scanning</h2>
+    <div class="row"><span class="k">Enabled</span><span class="v" id="scan_enabled">–</span></div>
+    <div class="row"><span class="k">Active</span><span class="v" id="scan_active">–</span></div>
+    <div class="signals" id="recent_signals"></div>
+  </div>
+</div>
+<footer>Refreshes every 5 seconds from 127.0.0.1 · no external resources</footer>
+<script>
+(function () {
+  "use strict";
+  var prevObs = null;
+  var prevTime = null;
+
+  function $(id) { return document.getElementById(id); }
+  function txt(id, value, cls) {
+    var el = $(id);
+    el.textContent = value;
+    el.className = "v" + (cls ? " " + cls : "");
+  }
+  function fmtUptime(secs) {
+    if (secs == null) return "–";
+    var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
+        m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    return (d ? d + "d " : "") + (h ? h + "h " : "") + m + "m " + s + "s";
+  }
+  function fmtTime(iso) {
+    if (!iso) return "never";
+    var dt = new Date(iso);
+    return isNaN(dt) ? String(iso) : dt.toLocaleTimeString();
+  }
+  var FIX = { 0: "No fix", 1: "GPS", 2: "DGPS", 4: "RTK fixed", 5: "RTK float" };
+
+  function applyStatus(s) {
+    txt("version", s.version || "–");
+    txt("node_id", s.node_id || "–");
+    txt("hardware", s.hardware_type || "–");
+    txt("uptime", fmtUptime(s.uptime_secs));
+
+    txt("sdr_name", s.sdr_name || "–");
+    txt("sdr_conn", s.sdr_connected ? "yes" : "no", s.sdr_connected ? "ok" : "bad");
+    txt("sdr_count", String(s.device_count != null ? s.device_count : "–"));
+    txt("sdr_driver", s.driver_status || "–");
+
+    txt("obs_total", String(s.observations_submitted != null ? s.observations_submitted : "–"));
+    var now = Date.now();
+    if (prevObs != null && s.observations_submitted != null && now > prevTime) {
+      var perMin = (s.observations_submitted - prevObs) * 60000 / (now - prevTime);
+      txt("obs_rate", perMin >= 0 ? perMin.toFixed(1) + "/min" : "–");
+    }
+    if (s.observations_submitted != null) { prevObs = s.observations_submitted; prevTime = now; }
+    txt("signals_found", String(s.signals_found != null ? s.signals_found : "–"));
+    var b = s.signal_breakdown || {};
+    txt("signal_breakdown", (b.lte || 0) + " / " + (b.fm || 0) + " / " + (b.dtv || 0));
+
+    if (s.auth_error) txt("api_status", "auth error", "bad");
+    else if (s.config_error) txt("api_status", "config error", "bad");
+    else if (s.last_heartbeat) txt("api_status", "connected", "ok");
+    else txt("api_status", "waiting", "warn");
+    txt("api_hb", fmtTime(s.last_heartbeat));
+
+    if (!s.rtk_enabled) {
+      txt("rtk_provider", "Not configured");
+      txt("rtk_conn", "–"); txt("rtk_frames", "–"); txt("rtk_last", "–");
+    } else {
+      txt("rtk_provider", s.rtk_provider || "–");
+      txt("rtk_conn", s.rtk_connected ? "yes" : "no", s.rtk_connected ? "ok" : "bad");
+      txt("rtk_frames", String(s.rtk_messages_received != null ? s.rtk_messages_received : "–"));
+      txt("rtk_last", fmtTime(s.rtk_last_correction));
+    }
+
+    txt("scan_enabled", s.scanning_enabled ? "yes" : "no", s.scanning_enabled ? "ok" : "warn");
+    txt("scan_active", s.scanner_active ? "yes" : "no", s.scanner_active ? "ok" : "warn");
+    var list = $("recent_signals");
+    list.textContent = "";
+    (s.recent_signals || []).slice(0, 10).forEach(function (sig) {
+      var div = document.createElement("div");
+      var mhz = sig.frequency_hz ? (sig.frequency_hz / 1e6).toFixed(1) + " MHz" : "";
+      div.textContent = (sig.type || "?") + " " + mhz +
+        (sig.snr_db != null ? " · " + sig.snr_db.toFixed(1) + " dB" : "") +
+        (sig.status ? " · " + sig.status : "");
+      list.appendChild(div);
+    });
+  }
+
+  function applyGps(g) {
+    if (!g) return;
+    var q = g.gps_fix_quality != null ? g.gps_fix_quality : 0;
+    var detected = g.gps_detected;
+    if (!detected) txt("gps_fix", "not detected", "bad");
+    else txt("gps_fix", FIX[q] || ("quality " + q), q > 0 ? "ok" : "warn");
+    txt("gps_sats", String(g.gps_satellites != null ? g.gps_satellites : "–"));
+    if (g.gps_latitude != null && g.gps_longitude != null) {
+      txt("gps_pos", g.gps_latitude.toFixed(5) + ", " + g.gps_longitude.toFixed(5));
+    } else {
+      txt("gps_pos", "–");
+    }
+    txt("gps_hdop", g.gps_hdop != null ? String(g.gps_hdop) : "–");
+    txt("gps_port", g.gps_port || "–");
+  }
+
+  function refresh() {
+    Promise.all([
+      fetch("/status").then(function (r) { return r.json(); }),
+      fetch("/gps/status").then(function (r) { return r.json(); }).catch(function () { return null; })
+    ]).then(function (results) {
+      applyStatus(results[0]);
+      applyGps(results[1]);
+      $("conn").textContent = "live · updated " + new Date().toLocaleTimeString();
+      $("conn").className = "";
+    }).catch(function () {
+      $("conn").textContent = "daemon unreachable, retrying";
+      $("conn").className = "err";
+    });
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</body>
+</html>
