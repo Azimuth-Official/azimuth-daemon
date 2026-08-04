@@ -13,3 +13,4 @@ src/sdr.bak*/
 config.smoke*.toml
 smoke_*.log
 smoke2_*.log
+.cargo/config.toml
