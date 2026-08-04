@@ -22,8 +22,15 @@ services:
     # See DOCKER.md for finding the gid. Remove this block if running with no hardware.
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
-    # group_add:
-    #   - "46"   # <- replace with the host's `getent group plugdev` gid (or device gid)
+      # GPS receiver (u-blox / Prolific / FTDI / CP210x / CH340). Uncomment and
+      # point at your serial device if you run a GPS dongle:
+      # - "/dev/ttyUSB0:/dev/ttyUSB0"
+    # Serial GPS ports are owned by the `dialout` group on the host. Adding it by
+    # name works when the host and container dialout gids match (both 20 on Debian
+    # /Ubuntu). If they differ, replace with the host's numeric gid from
+    # `getent group dialout`. See DOCKER.md.
+    group_add:
+      - "dialout"
 
     environment:
       AZIMUTH_API_URL: "https://azimuth.day"

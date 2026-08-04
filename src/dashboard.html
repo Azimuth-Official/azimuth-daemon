@@ -197,18 +197,18 @@
 
   function applyGps(g) {
     if (!g) return;
-    var q = g.gps_fix_quality != null ? g.gps_fix_quality : 0;
-    var detected = g.gps_detected;
+    var q = g.fix_quality != null ? g.fix_quality : 0;
+    var detected = g.detected;
     if (!detected) txt("gps_fix", "not detected", "bad");
     else txt("gps_fix", FIX[q] || ("quality " + q), q > 0 ? "ok" : "warn");
-    txt("gps_sats", String(g.gps_satellites != null ? g.gps_satellites : "–"));
-    if (g.gps_latitude != null && g.gps_longitude != null) {
-      txt("gps_pos", g.gps_latitude.toFixed(5) + ", " + g.gps_longitude.toFixed(5));
+    txt("gps_sats", String(g.satellites != null ? g.satellites : "–"));
+    if (g.latitude != null && g.longitude != null) {
+      txt("gps_pos", g.latitude.toFixed(5) + ", " + g.longitude.toFixed(5));
     } else {
       txt("gps_pos", "–");
     }
-    txt("gps_hdop", g.gps_hdop != null ? String(g.gps_hdop) : "–");
-    txt("gps_port", g.gps_port || "–");
+    txt("gps_hdop", g.hdop != null ? String(g.hdop) : "–");
+    txt("gps_port", g.port || "–");
   }
 
   function refresh() {

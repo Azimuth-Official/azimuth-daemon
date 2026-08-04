@@ -99,4 +99,21 @@ else
   echo "[entrypoint] Using existing $CONFIG_PATH (AZIMUTH_* env ignored on this boot)"
 fi
 
+# GPS serial accessibility check — warn early if a device is present but the
+# container process (non-root azimuth user) can't read/write it. Guarded so a
+# missing/inaccessible device never trips `set -e`.
+for dev in /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyACM0; do
+  if [ -e "$dev" ]; then
+    if [ -r "$dev" ] && [ -w "$dev" ]; then
+      echo "[entrypoint] GPS device $dev: accessible"
+    else
+      echo "[entrypoint] WARNING: GPS device $dev present but not accessible to this container."
+      echo "[entrypoint]   Add to your compose service:"
+      echo "[entrypoint]     group_add: [\"dialout\"]"
+      echo "[entrypoint]     devices:   [\"$dev:$dev\"]"
+      echo "[entrypoint]   (if the host dialout gid differs, use its numeric gid in group_add)"
+    fi
+  fi
+done
+
 exec /usr/local/bin/azimuth-daemon --config "$CONFIG_PATH"

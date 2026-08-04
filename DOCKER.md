@@ -103,6 +103,23 @@ Without hardware the daemon runs in **stub mode**: `/status` reports
 `sdr_connected: false`, `device_count: 0`, and the daemon does not crash — useful for
 verifying the container itself.
 
+### GPS receiver (serial)
+
+A USB GPS dongle appears as a serial device (`/dev/ttyUSB0` or `/dev/ttyACM0`) owned by
+the host's `dialout` group. Map the device and grant the group:
+
+```yaml
+devices:
+  - "/dev/ttyUSB0:/dev/ttyUSB0"
+group_add:
+  - "dialout"
+```
+
+The compose file adds `dialout` by name, which works when the host and container gids
+match (both `20` on Debian/Ubuntu). If `getent group dialout` on the host shows a
+different gid, use that number instead. The entrypoint logs a clear warning at startup if
+a GPS device is present but not accessible.
+
 ## 5. State & identity persistence
 
 `/var/lib/azimuth` holds `node-identity.json` and the generated `config.toml`. Keep it on

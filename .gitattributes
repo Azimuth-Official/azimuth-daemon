@@ -1,0 +1,8 @@
+# Ship Linux-bound text with LF regardless of the checkout OS. Shell scripts,
+# udev rules, and the Docker entrypoint break on Linux if smudged to CRLF.
+*.sh        text eol=lf
+*.rules     text eol=lf
+entrypoint.sh text eol=lf
+install.sh  text eol=lf
+*.toml      text eol=lf
+Dockerfile  text eol=lf

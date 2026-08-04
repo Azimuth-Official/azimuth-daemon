@@ -1,0 +1,11 @@
+# Azimuth GPS serial access rules
+# Grants the dialout group read/write on common USB GPS receivers so the daemon
+# can open the serial port without per-user manual configuration. install.sh adds
+# the invoking user to dialout; these rules scope device access to that group.
+#
+# Vendors: u-blox (VK-162/VK-172), Prolific PL2303, FTDI, Silicon Labs CP210x, CH340/CH341.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", GROUP="dialout", MODE="0660", TAG+="azimuth-gps"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", GROUP="dialout", MODE="0660", TAG+="azimuth-gps"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", GROUP="dialout", MODE="0660", TAG+="azimuth-gps"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", GROUP="dialout", MODE="0660", TAG+="azimuth-gps"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", GROUP="dialout", MODE="0660", TAG+="azimuth-gps"
