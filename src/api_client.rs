@@ -43,6 +43,11 @@ struct RegisterNodeRequest {
     altitude_m: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_fingerprint: Option<String>,
+    /// Previously issued node id from this machine's identity file. The server
+    /// reclaims it when it belongs to the authenticated account, which keeps a
+    /// recreated container from registering a duplicate node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +104,7 @@ impl ApiClient {
         lon: f64,
         alt: f64,
         machine_fingerprint: Option<&str>,
+        known_node_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let url = format!("{}/api/nodes/register", self.base_url);
         let body = RegisterNodeRequest {
@@ -108,6 +114,7 @@ impl ApiClient {
             longitude: lon,
             altitude_m: alt,
             machine_fingerprint: machine_fingerprint.map(|s| s.to_string()),
+            node_id: known_node_id.map(|s| s.to_string()),
         };
 
         let resp = self

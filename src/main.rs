@@ -205,6 +205,14 @@ async fn main() -> anyhow::Result<()> {
         identity::save(&cli.config, &config.node.id);
     } else if has_valid_api_key {
         info!("No node_id — attempting registration via API");
+        // A persisted identity is offered to the server as a reclaim hint. The
+        // server honours it only when that node belongs to the authenticated
+        // account, so this stays account-scoped while stopping a recreated
+        // container from registering a duplicate.
+        let saved_identity = identity::load(&cli.config);
+        if let Some(saved) = &saved_identity {
+            info!(node_id = %saved.node_id, "Offering persisted node identity for reclaim");
+        }
         match client
             .register_node(
                 &config.node.hardware_type,
@@ -213,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
                 config.node.location.longitude,
                 config.node.location.altitude_m,
                 Some(&fingerprint),
+                saved_identity.as_ref().map(|i| i.node_id.as_str()),
             )
             .await
         {
@@ -225,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                 info!(node_id = %config.node.id, "Node registered");
             }
             Err(e) => {
-                if let Some(saved) = identity::load(&cli.config) {
+                if let Some(saved) = saved_identity {
                     warn!(error = %e, node_id = %saved.node_id,
                         "Registration unreachable — adopting persisted node identity; \
                          if this machine changed accounts, re-run 'azimuth-daemon --setup'");
@@ -276,6 +285,11 @@ async fn main() -> anyhow::Result<()> {
                         retry_node.location.longitude,
                         retry_node.location.altitude_m,
                         Some(&retry_fingerprint),
+                        // Re-read each attempt: an identity file may have been
+                        // restored while the retry loop was running.
+                        identity::load(&retry_config_path)
+                            .map(|i| i.node_id)
+                            .as_deref(),
                     )
                     .await
                 {

@@ -107,6 +107,9 @@ pub async fn run_setup(args: SetupArgs) -> anyhow::Result<PathBuf> {
             lon,
             0.0,
             Some(&crate::identity::machine_fingerprint()),
+            // Interactive setup is an explicit "this is a new node" action, so
+            // no reclaim hint is offered.
+            None,
         )
         .await
         .map_err(|e| {
