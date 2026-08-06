@@ -68,7 +68,7 @@ fn update_status_from_observations(state: &mut StatusState, observations: &[Obse
 }
 
 #[derive(Parser)]
-#[command(name = "azimuth-daemon", about = "Azimuth positioning network daemon")]
+#[command(name = "azimuth-daemon", version, about = "Azimuth positioning network daemon")]
 struct Cli {
     /// Path to config.toml
     #[arg(short, long, default_value = "config.toml")]
