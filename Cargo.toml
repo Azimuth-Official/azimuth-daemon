@@ -5,6 +5,13 @@ edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"
 
+[lib]
+# Android builds compile the crate as a cdylib (JNI .so for the Observer app).
+# lib.rs is `#![cfg(target_os = "android")]` — on every other target the library
+# is empty and the existing binary build is unchanged.
+name = "azimuth_daemon"
+crate-type = ["cdylib", "rlib"]
+
 [features]
 # udev (default) enables serialport's libudev-backed serial enumeration. It is ON by
 # default, so every normal build (x86/windows/aarch64/armv7/armv6) is unchanged. Targets
@@ -17,7 +24,6 @@ udev = ["serialport/libudev"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -48,6 +54,19 @@ serialport = { version = "4", default-features = false }
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
 wdi-rs = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# JNI bridge for the Observer app's OTG SDR mode
+jni = "0.21"
+android_logger = "0.15"
+log = "0.4"
+# rustls on Android: openssl-sys (native-tls-vendored) cannot cross-build from
+# a Windows host, and Android ships no system OpenSSL anyway.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Desktop/server targets keep the original vendored native-tls build.
+reqwest = { version = "0.12", features = ["json", "native-tls-vendored"] }
 
 [profile.release]
 # Reproducible, machine-independent release binaries: strip symbols. Build paths

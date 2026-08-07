@@ -302,6 +302,65 @@ impl SdrManager {
         })
     }
 
+    /// Android OTG path: open the SDR from a USB file descriptor provided by
+    /// the app's USB Host integration (libusb `wrap_sys_device` under
+    /// `RtlSdr::open_with_fd`). Enumeration never happens — Android's SELinux
+    /// policy blocks /dev/bus/usb scans — so index-based recovery reopen is
+    /// unavailable in this mode; an unplug invalidates the fd and the app
+    /// restarts the pipeline on the next permission grant.
+    /// `serial_seed` is the device fingerprint from Kotlin (ANDROID_ID hash),
+    /// keeping the reported SDR serial stable per phone.
+    #[cfg(target_os = "android")]
+    pub fn new_from_fd(
+        fd: i32,
+        sample_rate: u32,
+        gain: i32,
+        serial_seed: &str,
+    ) -> anyhow::Result<Self> {
+        let gain_setting = GainSetting::from_config(gain);
+
+        let mut device = RtlSdr::open_with_fd(fd)
+            .map_err(|e| anyhow::Error::new(e).context(format!("open device from fd {}", fd)))?;
+
+        device
+            .set_sample_rate(sample_rate)
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_sample_rate({} Hz)", sample_rate)))?;
+
+        device
+            .set_freq_correction(0)
+            .map_err(|e| anyhow::Error::new(e).context("set_freq_correction(0 ppm)"))?;
+
+        let tuner_gain = match &gain_setting {
+            GainSetting::Auto => TunerGain::Auto,
+            GainSetting::Manual(g) => TunerGain::Manual(*g),
+        };
+        device
+            .set_tuner_gain(tuner_gain)
+            .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))?;
+
+        device
+            .reset_buffer()
+            .map_err(|e| anyhow::Error::new(e).context("reset_buffer"))?;
+
+        let prefix: String = serial_seed.chars().take(8).collect();
+        let serial = format!("SDR-{}-otg0", prefix);
+        info!(fd, serial = %serial, "SDR device opened from USB fd");
+
+        Ok(Self {
+            devices: vec![SdrDevice {
+                device,
+                index: 0,
+                serial,
+                config: SdrDeviceConfig {
+                    sample_rate,
+                    gain: gain_setting,
+                    freq_correction_ppm: 0,
+                },
+                last_tuned_freq_hz: None,
+            }],
+        })
+    }
+
     pub fn device_count(&self) -> usize {
         self.devices.len()
     }
