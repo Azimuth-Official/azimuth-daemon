@@ -87,7 +87,6 @@ pub struct StatusState {
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
     pub sdr_connected: bool,
     pub sdr_name: String,
-    pub sdr_multiplier: f64,
     pub device_count: usize,
     pub driver_status: String,
     pub network_support_enabled: bool,
@@ -118,6 +117,55 @@ pub struct StatusState {
     pub auth_error: Option<String>,
 }
 
+/// Minimum spacing between two signals of the same type for both to count as
+/// distinct frequencies, mirroring the server's `sdr_min_spacing_*_hz` config.
+fn min_spacing_hz(signal_type: &str) -> u64 {
+    match signal_type {
+        "fm" => 2_000_000,
+        "lte" => 5_000_000,
+        "dtv" => 6_000_000,
+        _ => 0,
+    }
+}
+
+/// Local estimate of the SDR multiplier for the dashboard.
+///
+/// The server owns the canonical value: it counts distinct frequencies observed
+/// recently — collapsing any that sit closer together than the per-type minimum
+/// spacing — and caps that by the node's device count. This reproduces the same
+/// shape from the signals this daemon has in hand, so the status page shows
+/// something truthful instead of a hardcoded 1.0. Expect small divergence from
+/// the server, which scores a different observation window.
+fn estimate_sdr_multiplier(recent_signals: &[RecentSignal], device_count: usize) -> f64 {
+    if recent_signals.is_empty() || device_count == 0 {
+        return 1.0;
+    }
+
+    let mut by_type: std::collections::HashMap<&str, Vec<u64>> = std::collections::HashMap::new();
+    for signal in recent_signals {
+        by_type
+            .entry(signal.signal_type.as_str())
+            .or_default()
+            .push(signal.frequency_hz);
+    }
+
+    let mut valid_frequencies = 0usize;
+    for (signal_type, mut frequencies) in by_type {
+        frequencies.sort_unstable();
+        let spacing = min_spacing_hz(signal_type);
+        let mut last_counted: Option<u64> = None;
+        for frequency in frequencies {
+            let far_enough = last_counted.is_none_or(|last| frequency.saturating_sub(last) >= spacing);
+            if far_enough {
+                valid_frequencies += 1;
+                last_counted = Some(frequency);
+            }
+        }
+    }
+
+    valid_frequencies.min(device_count).max(1) as f64
+}
+
 /// Message surfaced through /status when the API rejects the key.
 pub const AUTH_ERROR_MSG: &str =
     "API key rejected by server (401). Generate a new key at azimuth.day/dashboard";
@@ -132,8 +180,6 @@ impl StatusState {
             last_heartbeat: None,
             sdr_connected: false,
             sdr_name: "No device".to_string(),
-            // TODO: fetch actual multiplier from web API
-            sdr_multiplier: 1.0,
             device_count: 0,
             driver_status: "not_applicable".to_string(),
             network_support_enabled: false,
@@ -178,7 +224,7 @@ impl StatusState {
             last_heartbeat: self.last_heartbeat.map(|t| t.to_rfc3339()),
             sdr_connected: self.sdr_connected,
             sdr_name: self.sdr_name.clone(),
-            sdr_multiplier: self.sdr_multiplier,
+            sdr_multiplier: estimate_sdr_multiplier(&self.recent_signals, self.device_count),
             device_count: self.device_count,
             driver_status: self.driver_status.clone(),
             scanning_enabled,
@@ -746,5 +792,66 @@ mod tests {
             json.get("auth_error").is_none(),
             "auth_error must be omitted when None"
         );
+    }
+
+    fn signal(signal_type: &str, frequency_hz: u64) -> RecentSignal {
+        RecentSignal {
+            id: format!("{signal_type}-{frequency_hz}"),
+            signal_type: signal_type.to_string(),
+            frequency_hz,
+            source_id: None,
+            snr_db: None,
+            status: "accepted".to_string(),
+        }
+    }
+
+    #[test]
+    fn multiplier_is_one_without_signals_or_devices() {
+        assert_eq!(estimate_sdr_multiplier(&[], 4), 1.0);
+        assert_eq!(estimate_sdr_multiplier(&[signal("fm", 98_500_000)], 0), 1.0);
+    }
+
+    #[test]
+    fn frequencies_closer_than_min_spacing_count_once() {
+        // 100 kHz apart, well inside the 2 MHz FM spacing rule.
+        let signals = [signal("fm", 98_500_000), signal("fm", 98_600_000)];
+        assert_eq!(
+            estimate_sdr_multiplier(&signals, 4),
+            1.0,
+            "adjacent FM signals must not both count"
+        );
+    }
+
+    #[test]
+    fn well_separated_frequencies_each_count() {
+        let signals = [
+            signal("fm", 92_000_000),
+            signal("fm", 98_500_000),
+            signal("lte", 751_000_000),
+        ];
+        assert_eq!(estimate_sdr_multiplier(&signals, 4), 3.0);
+    }
+
+    #[test]
+    fn device_count_caps_the_multiplier() {
+        let signals = [
+            signal("fm", 92_000_000),
+            signal("fm", 98_500_000),
+            signal("dtv", 605_000_000),
+        ];
+        assert_eq!(
+            estimate_sdr_multiplier(&signals, 1),
+            1.0,
+            "a single dongle cannot earn more than 1x"
+        );
+    }
+
+    #[test]
+    fn spacing_is_per_signal_type() {
+        // Same numeric gap (3 MHz): legal for FM (2 MHz), too close for LTE (5 MHz).
+        let fm = [signal("fm", 90_000_000), signal("fm", 93_000_000)];
+        let lte = [signal("lte", 750_000_000), signal("lte", 753_000_000)];
+        assert_eq!(estimate_sdr_multiplier(&fm, 4), 2.0);
+        assert_eq!(estimate_sdr_multiplier(&lte, 4), 1.0);
     }
 }
