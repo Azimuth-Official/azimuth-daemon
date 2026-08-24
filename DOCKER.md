@@ -1,19 +1,35 @@
 # Running an Azimuth Node in Docker
 
-This repository ships a container image for the Azimuth Tier 1 SDR node daemon. You can
-either **load a prebuilt image tarball** or **build from source**. Maintained by the
-Azimuth team.
+This repository ships a container image for the Azimuth Tier 1 SDR node daemon. Pull it
+from the registry, or — if the machine has no registry access — load a released tarball or
+build from source. Maintained by the Azimuth team.
 
 ## 1. Get the image
 
-### Option A — load a released tarball (fastest)
+### Option A — pull from the registry (recommended)
+
+```sh
+docker pull ghcr.io/azimuth-official/azimuth-node:latest
+```
+
+The tag is multi-architecture: Docker selects amd64 or arm64 (Raspberry Pi 4/5) for you.
+Pin a release instead of tracking `latest` if you want reproducible deployments:
+
+```sh
+docker pull ghcr.io/azimuth-official/azimuth-node:0.3.4
+```
+
+`docker compose up -d` (section 2) pulls this image on its own, so you can skip straight
+there.
+
+### Option B — load a released tarball (offline / air-gapped)
 
 ```sh
 # amd64 (x86_64)
 curl -LO https://azimuth.day/downloads/azimuth-node-docker-amd64.tar.gz
 docker load < azimuth-node-docker-amd64.tar.gz
 
-# arm64 (aarch64), if published
+# arm64 (aarch64)
 curl -LO https://azimuth.day/downloads/azimuth-node-docker-arm64.tar.gz
 docker load < azimuth-node-docker-arm64.tar.gz
 ```
@@ -24,7 +40,14 @@ Verify the download against the published `azimuth-node-docker-sha256.txt`:
 sha256sum -c azimuth-node-docker-sha256.txt
 ```
 
-### Option B — build from source
+A loaded tarball is tagged `azimuth-node:latest`, so point `image:` in
+`docker-compose.yml` at that tag, or retag it:
+
+```sh
+docker tag azimuth-node:latest ghcr.io/azimuth-official/azimuth-node:latest
+```
+
+### Option C — build from source
 
 ```sh
 git clone https://github.com/Azimuth-Official/azimuth-daemon.git

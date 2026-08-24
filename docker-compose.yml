@@ -1,7 +1,7 @@
 # Azimuth Node — user-facing Docker Compose.
 # Run a Tier 1 SDR node in a container.
 #
-#   docker compose up -d          # start (loads image azimuth-node:latest)
+#   docker compose up -d          # start (pulls ghcr.io/azimuth-official/azimuth-node)
 #   docker compose logs -f        # follow logs
 #   docker compose down           # stop
 #
@@ -10,8 +10,10 @@
 
 services:
   azimuth-node:
-    image: azimuth-node:latest
-    # To build locally instead of loading a released image tarball, uncomment:
+    image: ghcr.io/azimuth-official/azimuth-node:latest
+    # Pulled automatically on `docker compose up -d`. If you loaded a release tarball
+    # instead, it arrives tagged `azimuth-node:latest` — either set that here or retag it.
+    # To build locally from this checkout, uncomment:
     # build: .
     container_name: azimuth-node
     restart: unless-stopped

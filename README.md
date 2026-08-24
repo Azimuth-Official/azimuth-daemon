@@ -73,7 +73,14 @@ cd azimuth-daemon-<version>-linux-<arch>
 
 ### Docker
 
-Prebuilt image tarballs (amd64 + arm64) are published alongside the other downloads, with SHA-256 checksums. See [DOCKER.md](DOCKER.md) for the full guide:
+Pull the multi-architecture image (amd64 and arm64 are both published under the same tag):
+
+```sh
+docker pull ghcr.io/azimuth-official/azimuth-node:latest
+```
+
+Image tarballs are also published alongside the other downloads, with SHA-256 checksums,
+for machines without registry access. See [DOCKER.md](DOCKER.md) for the full guide:
 
 ```sh
 curl -LO https://azimuth.day/downloads/azimuth-node-docker-amd64.tar.gz
