@@ -129,7 +129,12 @@ does not re-register.
 ## 6. Health endpoint
 
 `GET /status` returns JSON with SDR connection state, device count, uptime, signal counts,
-and any `config_error`. The image's `HEALTHCHECK` polls it.
+and any `config_error`. The image's `HEALTHCHECK` polls it, and fails (container shows
+`unhealthy` in `docker ps` — this does NOT stop, kill, or restart it) whenever
+`config_error` is non-null: most commonly a missing `AZIMUTH_API_KEY` or an unset
+`(0,0)` location. The daemon runs fine in that state and keeps scanning; it just cannot
+register, so the node will not appear on the dashboard. Check `docker logs` or
+`curl http://127.0.0.1:8420/status` for the exact reason.
 
 > **Security:** `/status` is unauthenticated. `docker-compose.yml` binds it to
 > `127.0.0.1` on the host by default. Only expose it publicly behind an authenticating

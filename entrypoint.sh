@@ -95,6 +95,23 @@ interval_seconds = 30
 # default (-25.0) — keep that behavior explicit.
 sweep_threshold = -45.0
 EOF
+  if [ -z "$API_KEY" ]; then
+    echo "[entrypoint] ################################################################"
+    echo "[entrypoint] # WARNING: AZIMUTH_API_KEY is not set."
+    echo "[entrypoint] #"
+    echo "[entrypoint] # This node will start and scan, but it CANNOT register and will"
+    echo "[entrypoint] # NOT appear on the azimuth.day dashboard — the daemon assigns a"
+    echo "[entrypoint] # placeholder id and silently suppresses heartbeats. The container"
+    echo "[entrypoint] # (and its HEALTHCHECK) will still look healthy."
+    echo "[entrypoint] #"
+    echo "[entrypoint] # Get an API key from https://azimuth.day (dashboard -> node setup)"
+    echo "[entrypoint] # and set AZIMUTH_API_KEY, then restart this container."
+    echo "[entrypoint] #"
+    echo "[entrypoint] # The running daemon will keep repeating this warning in its own"
+    echo "[entrypoint] # logs (every ~5 minutes) and via GET /status (config_error) until"
+    echo "[entrypoint] # a valid key is configured."
+    echo "[entrypoint] ################################################################"
+  fi
 else
   echo "[entrypoint] Using existing $CONFIG_PATH (AZIMUTH_* env ignored on this boot)"
 fi

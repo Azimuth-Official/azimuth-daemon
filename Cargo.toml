@@ -1,6 +1,6 @@
 [package]
 name = "azimuth-daemon"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"

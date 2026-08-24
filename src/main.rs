@@ -25,6 +25,13 @@ use sdr::SdrManager;
 use sdr::scanner::Scanner;
 use status_server::{AppState, RecentSignal, StatusState, run_status_server};
 
+/// Reused verbatim so the heartbeat loop can tell "I set this" from "startup
+/// validation set this" when deciding whether to clear `config_error` once a
+/// placeholder node id resolves to a real registration.
+const NODE_NOT_REGISTERED_MSG: &str = "Node not registered — heartbeats suppressed, this node will \
+     not appear on the dashboard. Set a valid api.key (from the azimuth.day dashboard) and restart, \
+     or wait for the background registration retry.";
+
 fn category_for_signal_type(signal_type: &str) -> &str {
     if signal_type.starts_with("lte_") {
         "lte"
@@ -234,6 +241,21 @@ async fn main() -> anyhow::Result<()> {
                 info!(node_id = %config.node.id, "Node registered");
             }
             Err(e) => {
+                // Distinct, actionable signal for "the key itself was rejected"
+                // vs. "registration failed for some other reason" (network
+                // blip, backend down, etc.) — a typo'd/invalid key needs the
+                // user to fix the key, not wait for a retry that can never
+                // succeed. Reuses the same auth_error field/message the
+                // heartbeat loop already sets on a 401, so the desktop
+                // Dashboard's existing "API key invalid — Open Settings" UI
+                // covers this case too, immediately at startup.
+                if api_client::is_unauthorized(&e) {
+                    error!(error = %e, "Node registration rejected (401) — API key is invalid");
+                    let mut state = app_state.status.write().await;
+                    if state.auth_error.is_none() {
+                        state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                    }
+                }
                 if let Some(saved) = saved_identity {
                     warn!(error = %e, node_id = %saved.node_id,
                         "Registration unreachable — adopting persisted node identity; \
@@ -307,7 +329,20 @@ async fn main() -> anyhow::Result<()> {
                         return;
                     }
                     Err(e) => {
-                        warn!(error = %e, attempt, "Deferred registration failed; will retry");
+                        if api_client::is_unauthorized(&e) {
+                            // A 401 here means the key is bad, not that the
+                            // network is flaky — retrying every 5 minutes for
+                            // 24h can never fix this. Surface it distinctly
+                            // (same field/message the heartbeat loop uses) so
+                            // it doesn't masquerade as "still trying".
+                            error!(error = %e, attempt, "Deferred registration rejected (401) — API key is invalid, retries will not help");
+                            let mut state = app_state_retry.status.write().await;
+                            if state.auth_error.is_none() {
+                                state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                            }
+                        } else {
+                            warn!(error = %e, attempt, "Deferred registration failed; will retry");
+                        }
                     }
                 }
             }
@@ -356,6 +391,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_interval));
         info!(interval_secs = heartbeat_interval, "Heartbeat loop started");
+        // Ticks between placeholder-id reminders (~5 minutes), bounded so this
+        // never turns into an unbounded busy-loop of warnings.
+        let placeholder_warn_every_ticks = (300 / heartbeat_interval.max(1)).max(1);
+        let mut placeholder_tick_count: u64 = 0;
         loop {
             interval.tick().await;
             let (current_node_id, net_support, rtk_enabled, rtk_provider) = {
@@ -363,9 +402,33 @@ async fn main() -> anyhow::Result<()> {
                 (s.node_id.clone(), s.network_support_enabled, s.rtk_enabled, s.rtk_provider.clone())
             };
             if current_node_id.is_empty() || current_node_id.starts_with("placeholder-") {
+                // A placeholder id means heartbeats — and therefore this
+                // node's presence on the dashboard — are silently suppressed,
+                // while /status and the Docker HEALTHCHECK still report "up".
+                // Without a loud, periodic explanation the node just looks
+                // invisible with no clue why. Warn immediately, then every
+                // ~5 minutes so it surfaces in `docker logs` without
+                // spamming every 15s heartbeat tick.
+                placeholder_tick_count += 1;
+                if placeholder_tick_count == 1
+                    || placeholder_tick_count % placeholder_warn_every_ticks == 0
+                {
+                    warn!(node_id = %current_node_id, "{}", NODE_NOT_REGISTERED_MSG);
+                    let mut state = app_state_hb.status.write().await;
+                    // Don't set the generic "not registered" config_error when
+                    // a more specific auth_error (401 — key rejected) is
+                    // already present: the frontend (useDaemonStatus.js)
+                    // checks config_error BEFORE auth_error, so setting both
+                    // would silently mask the more actionable "API key
+                    // invalid" message behind a vaguer "setup needed" one.
+                    if state.config_error.is_none() && state.auth_error.is_none() {
+                        state.config_error = Some(NODE_NOT_REGISTERED_MSG.to_string());
+                    }
+                }
                 tracing::debug!("Skipping heartbeat — node not yet registered");
                 continue;
             }
+            placeholder_tick_count = 0;
             match heartbeat_client
                 .heartbeat(
                     &current_node_id,
@@ -383,6 +446,14 @@ async fn main() -> anyhow::Result<()> {
                     if state.auth_error.is_some() {
                         info!("Heartbeat succeeded — clearing auth error");
                         state.auth_error = None;
+                    }
+                    // Only clear config_error if it's the placeholder-reminder
+                    // message we set ourselves — a config_error from startup
+                    // validation (missing key, unset location, etc.) means the
+                    // config still needs attention even if a heartbeat somehow
+                    // got through.
+                    if state.config_error.as_deref() == Some(NODE_NOT_REGISTERED_MSG) {
+                        state.config_error = None;
                     }
                 }
                 Err(e) => {

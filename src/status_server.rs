@@ -794,6 +794,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_json_serializes_config_error_as_literal_null_when_unset() {
+        // Contract the Dockerfile HEALTHCHECK relies on: unlike auth_error,
+        // config_error has NO skip_serializing_if, so /status always includes
+        // the key — `"config_error":null` when healthy, a message string
+        // otherwise. `grep -q '"config_error":null'` in the HEALTHCHECK CMD
+        // depends on this key never being omitted.
+        let state = StatusState::new("node-1".to_string(), "tier1_rtlsdr".to_string());
+        let compact = serde_json::to_string(&state.to_info(true, false)).unwrap();
+        assert!(
+            compact.contains("\"config_error\":null"),
+            "config_error must serialize as a literal null (not be omitted) when unset: {compact}"
+        );
+    }
+
+    #[test]
+    fn status_json_serializes_config_error_message_when_set() {
+        let mut state = StatusState::new("node-1".to_string(), "tier1_rtlsdr".to_string());
+        state.config_error = Some("Node not registered".to_string());
+        let compact = serde_json::to_string(&state.to_info(true, false)).unwrap();
+        assert!(
+            compact.contains("\"config_error\":\"Node not registered\""),
+            "config_error must serialize its message when set: {compact}"
+        );
+        assert!(!compact.contains("\"config_error\":null"));
+    }
+
     fn signal(signal_type: &str, frequency_hz: u64) -> RecentSignal {
         RecentSignal {
             id: format!("{signal_type}-{frequency_hz}"),

@@ -74,6 +74,20 @@ enum ScanType {
 /// Default IQ capture size for signal processing (128K samples = 256KB).
 const CAPTURE_BYTES: usize = 262_144;
 
+/// Relaxed gates for the one-shot FM sweep retry when the primary pass (using
+/// `fm_config.sweep_threshold` / `sweep_min_snr_db`) finds zero stations.
+/// See `fm_sweep_pass` / `should_run_fm_fallback`.
+const FM_FALLBACK_THRESHOLD_DBFS: f32 = -35.0;
+const FM_FALLBACK_MIN_SNR_DB: f32 = 5.0;
+
+/// Whether the FM discovery sweep should re-run with relaxed gates: only
+/// when the primary pass found nothing at all. A partial result (even one
+/// station) means the gates are working for this RF environment, so we
+/// don't second-guess it.
+fn should_run_fm_fallback(primary_result: &[u64]) -> bool {
+    primary_result.is_empty()
+}
+
 impl Scanner {
     pub fn new(config: &ScanningConfig, dbm_offset: f32) -> Self {
         let mode = ScanMode::from_str(&config.mode);
@@ -131,31 +145,35 @@ impl Scanner {
             return result;
         }
 
-        // FM sweep: 87.5-108 MHz
+        // FM sweep: 87.5-108 MHz (or the configured/regional range)
         info!("Sweeping FM band {}-{} MHz",
             self.fm_config.sweep_start / 1_000_000,
             self.fm_config.sweep_end / 1_000_000);
-        let mut freq = self.fm_config.sweep_start;
-        while freq <= self.fm_config.sweep_end {
-            if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
-                if let Some(device) = sdr_manager.device_mut(0) {
-                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
-                    let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
-                    if dbfs > self.fm_config.sweep_threshold as f64 {
-                        // SNR gate — verify real station, not noise spike
-                        if let Some(demod) = super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
-                            if demod.snr_db >= self.fm_config.sweep_min_snr_db {
-                                info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
-                                result.fm_stations.push(freq);
-                            } else {
-                                debug!(freq_mhz = freq as f64 / 1e6, snr = format!("{:.1}", demod.snr_db), "Power OK but SNR too low");
-                            }
-                        }
-                    }
-                    }
-                }
-            }
-            freq += self.fm_config.sweep_step;
+        result.fm_stations = self.fm_sweep_pass(
+            sdr_manager,
+            self.fm_config.sweep_threshold,
+            self.fm_config.sweep_min_snr_db,
+        );
+        if should_run_fm_fallback(&result.fm_stations) {
+            // Zero stations at the configured gates. `discovered` is latched
+            // true below regardless of outcome, and run_cycle's periodic FM
+            // scan only iterates `fm_frequencies` — so a sweep that finds
+            // nothing here means PERMANENTLY zero FM observations until the
+            // next full discovery. Re-sweep once with materially looser
+            // gates before giving up, to catch cases where the configured
+            // threshold/SNR are simply too strict for this node's RF
+            // environment (weak antenna feed, distant stations, etc.)
+            // without silently leaving the node blind.
+            warn!(
+                threshold_dbfs = FM_FALLBACK_THRESHOLD_DBFS,
+                min_snr_db = FM_FALLBACK_MIN_SNR_DB,
+                "FM sweep found zero stations at configured gates — retrying with relaxed gates"
+            );
+            result.fm_stations = self.fm_sweep_pass(
+                sdr_manager,
+                FM_FALLBACK_THRESHOLD_DBFS,
+                FM_FALLBACK_MIN_SNR_DB,
+            );
         }
 
         // LTE sweep: configured band ranges
@@ -229,6 +247,49 @@ impl Scanner {
             "Discovery complete"
         );
         result
+    }
+
+    /// One full FM sweep pass across the configured band using the given
+    /// power/SNR gates. Returns the frequencies that passed both gates.
+    /// Emits debug-level diagnostics for every candidate — dBFS, SNR (when
+    /// demod succeeded), and which gate (power/demod/snr) rejected it, if
+    /// any — so a user can self-diagnose from logs why a given frequency
+    /// wasn't detected as a station.
+    fn fm_sweep_pass(
+        &mut self,
+        sdr_manager: &mut SdrManager,
+        threshold_dbfs: f32,
+        min_snr_db: f32,
+    ) -> Vec<u64> {
+        let mut found = Vec::new();
+        let mut freq = self.fm_config.sweep_start;
+        while freq <= self.fm_config.sweep_end {
+            if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
+                if let Some(device) = sdr_manager.device_mut(0) {
+                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
+                        let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
+                        if dbfs > threshold_dbfs as f64 {
+                            match super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
+                                Some(demod) if demod.snr_db >= min_snr_db => {
+                                    info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
+                                    found.push(freq);
+                                }
+                                Some(demod) => {
+                                    debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), gate = "snr", "FM candidate rejected: SNR below threshold");
+                                }
+                                None => {
+                                    debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "demod", "FM candidate rejected: demodulation failed (near-DC input or capture too short)");
+                                }
+                            }
+                        } else {
+                            debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "power", "FM candidate rejected: below power threshold");
+                        }
+                    }
+                }
+            }
+            freq += self.fm_config.sweep_step;
+        }
+        found
     }
 
     /// Run one full scan cycle. Returns observations to submit.
@@ -773,5 +834,43 @@ fn scan_result_to_observation(result: &ScanResult, freq: u64) -> Observation {
         snr_db: result.snr_db.map(|s| s as f64),
         source_id: result.source_id.clone(),
         raw_data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `discover_stations`/`fm_sweep_pass` require a real RTL-SDR device
+    // (SdrManager opens hardware directly), so the fallback DECISION logic
+    // is factored into `should_run_fm_fallback` specifically so it can be
+    // tested without hardware. This is the regression coverage for the
+    // "FM sweep finds zero stations => permanently zero FM observations"
+    // bug: `run_cycle` only iterates `fm_frequencies`, and `discovered` is
+    // latched true after one discovery pass regardless of outcome, so a
+    // sweep that finds nothing must retry with relaxed gates before that
+    // latch closes.
+    #[test]
+    fn fm_fallback_engages_when_primary_sweep_found_nothing() {
+        assert!(should_run_fm_fallback(&[]));
+    }
+
+    #[test]
+    fn fm_fallback_does_not_engage_when_primary_sweep_found_a_station() {
+        assert!(!should_run_fm_fallback(&[100_300_000]));
+    }
+
+    #[test]
+    fn fm_fallback_does_not_engage_with_multiple_stations_found() {
+        assert!(!should_run_fm_fallback(&[88_500_000, 101_100_000, 107_900_000]));
+    }
+
+    #[test]
+    fn fm_fallback_gates_are_looser_than_defaults() {
+        // FmScanConfig defaults (config.rs): sweep_threshold = -20.0 dBFS,
+        // sweep_min_snr_db = 8.0. The fallback must be strictly looser on
+        // both axes, or it wouldn't find anything the primary pass missed.
+        assert!(FM_FALLBACK_THRESHOLD_DBFS < -20.0);
+        assert!(FM_FALLBACK_MIN_SNR_DB < 8.0);
     }
 }

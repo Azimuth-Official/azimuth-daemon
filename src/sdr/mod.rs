@@ -66,6 +66,23 @@ impl GainSetting {
     }
 }
 
+/// Convert our `GainSetting` (plain dB — matches `sdr.gain` in config.toml,
+/// which `Config::validate()` bounds at "max ~50 dB") into rtl-sdr-rs's
+/// `TunerGain`. `TunerGain::Manual` expects gain in TENTHS of a dB: confirmed
+/// against rtl-sdr-rs 0.3.3's R820T gain table (`tuners/r82xx.rs`), whose
+/// `GAINS` entries top out at 496 (== 49.6 dB) and whose `set_gain` walks
+/// `R82XX_LNA_GAIN_STEPS` / `R82XX_MIXER_GAIN_STEPS` — both tenths-of-dB
+/// tables — accumulating until `total_gain >= gain`. Passing a plain-dB value
+/// straight through (the previous behavior) silently divided real gain by
+/// 10x: a configured 25 dB became 2.5 dB at the tuner, starving sensitivity
+/// enough that FM/LTE/DTV sweeps found nothing even with a healthy antenna.
+fn tuner_gain_from_setting(gain: &GainSetting) -> TunerGain {
+    match gain {
+        GainSetting::Auto => TunerGain::Auto,
+        GainSetting::Manual(db) => TunerGain::Manual(db.saturating_mul(10)),
+    }
+}
+
 /// Generate machine-scoped SDR serial number from fingerprint and index.
 /// Format: SDR-{fingerprint_prefix}-{index:04}
 /// Example: SDR-a1b2c3d4-0001
@@ -134,12 +151,8 @@ impl SdrDevice {
 
     #[allow(dead_code)]
     pub fn set_gain(&mut self, gain: &GainSetting) -> anyhow::Result<()> {
-        let tuner_gain = match gain {
-            GainSetting::Auto => TunerGain::Auto,
-            GainSetting::Manual(g) => TunerGain::Manual(*g),
-        };
         self.device
-            .set_tuner_gain(tuner_gain)
+            .set_tuner_gain(tuner_gain_from_setting(gain))
             .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))
     }
 
@@ -274,12 +287,8 @@ impl SdrManager {
             .set_freq_correction(freq_correction_ppm)
             .map_err(|e| anyhow::Error::new(e).context(format!("set_freq_correction({} ppm)", freq_correction_ppm)))?;
 
-        let tuner_gain = match gain {
-            GainSetting::Auto => TunerGain::Auto,
-            GainSetting::Manual(g) => TunerGain::Manual(*g),
-        };
         device
-            .set_tuner_gain(tuner_gain)
+            .set_tuner_gain(tuner_gain_from_setting(gain))
             .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))?;
 
         device
@@ -330,12 +339,8 @@ impl SdrManager {
             .set_freq_correction(0)
             .map_err(|e| anyhow::Error::new(e).context("set_freq_correction(0 ppm)"))?;
 
-        let tuner_gain = match &gain_setting {
-            GainSetting::Auto => TunerGain::Auto,
-            GainSetting::Manual(g) => TunerGain::Manual(*g),
-        };
         device
-            .set_tuner_gain(tuner_gain)
+            .set_tuner_gain(tuner_gain_from_setting(&gain_setting))
             .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))?;
 
         device
@@ -526,5 +531,37 @@ mod tests {
 
         // Should only contain alphanumeric and dashes
         assert!(serial.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn tuner_gain_from_setting_converts_configured_db_to_tenths_of_db() {
+        // Regression test for the FM/LTE/DTV "zero signals" bug: rtl-sdr-rs's
+        // TunerGain::Manual expects tenths of a dB (its R820T gain table tops
+        // out at 496 == 49.6 dB), but our config's sdr.gain is documented and
+        // validated as plain dB (0-50). A configured 25 dB gain must reach the
+        // tuner as 250 (tenths), not 25 (which the tuner would read as 2.5 dB).
+        match tuner_gain_from_setting(&GainSetting::Manual(25)) {
+            TunerGain::Manual(tenths) => assert_eq!(tenths, 250),
+            other => panic!("expected TunerGain::Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tuner_gain_from_setting_max_gain_stays_within_gain_table_bounds() {
+        // The UI's manual-gain slider tops out at 49.6 dB (Step4SdrDevice.jsx),
+        // matching rtl-sdr-rs's real max gain step. Config validation rejects
+        // sdr.gain > 50, so 50 is the worst-case integer input.
+        match tuner_gain_from_setting(&GainSetting::Manual(50)) {
+            TunerGain::Manual(tenths) => assert_eq!(tenths, 500),
+            other => panic!("expected TunerGain::Manual, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tuner_gain_from_setting_auto_passes_through() {
+        match tuner_gain_from_setting(&GainSetting::Auto) {
+            TunerGain::Auto => {}
+            other => panic!("expected TunerGain::Auto, got {:?}", other),
+        }
     }
 }
