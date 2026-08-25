@@ -236,10 +236,13 @@ pub async fn run_ntrip_client(
                     frame_count += 1;
                     let frame_data = buf[..frame_len].to_vec();
 
-                    // Forward via RTCM3 channel if available
+                    // Forward via RTCM3 channel if available. try_send, not send:
+                    // the receiver may be absent or behind, and RTCM corrections are
+                    // real-time — dropping a frame is correct; parking this loop
+                    // stalls the caster read forever.
                     if let Some(ref tx) = rtcm_tx {
-                        if let Err(e) = tx.send(frame_data.clone()).await {
-                            warn!(error = %e, "RTCM3 channel send failed");
+                        if let Err(e) = tx.try_send(frame_data.clone()) {
+                            debug!(error = %e, "RTCM3 channel unavailable — frame dropped");
                         }
                     }
 
@@ -434,5 +437,81 @@ mod tests {
     fn test_parse_status_line_icy_401() {
         let result = parse_status_line("ICY 401 Unauthorized");
         assert_eq!(result, Some((401, "ICY 401 Unauthorized".to_string())));
+    }
+
+    /// BUG-2 regression: a bounded RTCM channel whose receiver is never polled
+    /// must not stall the caster read loop. Pre-fix, frame 65's send().await
+    /// parks forever (capacity 64, receiver alive, never polled) and this test
+    /// times out; post-fix (try_send) the client drains the stream, drops the
+    /// overflow frames, and exits on EOF.
+    #[tokio::test]
+    async fn rtcm_channel_backpressure_does_not_stall_ntrip_client() {
+        use crate::config::NtripConfig;
+        use tokio::io::AsyncWriteExt;
+
+        const FRAMES: usize = 100; // > channel capacity of 64
+
+        // Loopback fake caster: handshake, then 100 minimal RTCM3 frames
+        // (0-byte payload -> 6 bytes: D3 00 00 + 3 CRC bytes; the framing
+        // loop checks preamble+length only, not CRC), then EOF via drop.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Drain the client's GET request before responding. Closing a socket
+            // that still has unread inbound bytes buffered sends an RST instead of
+            // a graceful FIN (observed on Windows), which would abort the client's
+            // read mid-stream before it ever reaches the backpressure scenario.
+            let mut req_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                sock.read_exact(&mut byte).await.unwrap();
+                req_buf.push(byte[0]);
+                if req_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            sock.write_all(b"ICY 200 OK\r\n\r\n\r\n").await.unwrap();
+            let frame: [u8; 6] = [0xD3, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
+            for _ in 0..FRAMES {
+                sock.write_all(&frame).await.unwrap();
+            }
+        });
+
+        let mut status = StatusState::new("test-node".into(), "test".into());
+        status.rtk_enabled = true;
+        status.rtk_config = Some(NtripConfig {
+            caster_url: addr.ip().to_string(),
+            port: addr.port(),
+            mountpoint: "TEST".into(),
+            username: None,
+            password: None,
+            gga_interval_secs: 3600, // keep the periodic-GGA branch out of this test
+            serial_port: None,
+            baud_rate: 115200,
+        });
+        let state = Arc::new(RwLock::new(status));
+
+        // Mirror production exactly: receiver alive but never polled.
+        // Must be `_rx`, NOT `_` — dropping it closes the channel and masks
+        // the bug (send() would fail fast instead of parking).
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ntrip_client(Arc::clone(&state), 0.0, 0.0, 0.0, Some(tx)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "NTRIP client stalled on RTCM channel backpressure"
+        );
+        result.unwrap().unwrap();
+        assert_eq!(state.read().await.rtk_messages_received, FRAMES as u64);
+        server.await.unwrap();
     }
 }
