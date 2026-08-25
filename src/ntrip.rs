@@ -287,8 +287,14 @@ pub async fn run_ntrip_client(
                     (node_lat, node_lon, node_alt)
                 }
             };
-            let _gga = generate_gga(lat, lon, alt);
-            debug!("GGA re-generated with current position");
+            let gga = generate_gga(lat, lon, alt);
+            // VRS casters require periodic client GGA to keep serving corrections;
+            // a failed write means the socket is dead — break to the reconnect loop.
+            if let Err(e) = socket.write_all(format!("{}\r\n", gga).as_bytes()).await {
+                warn!(error = %e, "GGA send failed — reconnecting");
+                break;
+            }
+            debug!("GGA sent to caster");
         }
     }
 
@@ -512,6 +518,93 @@ mod tests {
         );
         result.unwrap().unwrap();
         assert_eq!(state.read().await.rtk_messages_received, FRAMES as u64);
+        server.await.unwrap();
+    }
+
+    /// Periodic GGA regression: without periodic client GGA, VRS casters stop
+    /// serving corrections after 30-60s. The periodic-GGA branch currently
+    /// generates a sentence and discards it (`let _gga = ...`) instead of
+    /// writing it to the caster socket. This test drives one RTCM frame
+    /// through the client (to reach the periodic-GGA check with a near-zero
+    /// interval) and asserts a `$GPGGA` line actually arrives at the caster.
+    #[tokio::test]
+    async fn periodic_gga_is_sent_to_caster() {
+        use crate::config::NtripConfig;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Drain the client's GET request (see rtcm_channel_backpressure test
+            // for why: an RST on close would otherwise abort the client's read).
+            let mut req_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                sock.read_exact(&mut byte).await.unwrap();
+                req_buf.push(byte[0]);
+                if req_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            sock.write_all(b"ICY 200 OK\r\n\r\n\r\n").await.unwrap();
+            // One minimal RTCM3 frame to drive the client through a read
+            // iteration and into the periodic-GGA check.
+            let frame: [u8; 6] = [0xD3, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
+            sock.write_all(&frame).await.unwrap();
+
+            // Read the GGA line the client should send back, bounded so a
+            // regression (nothing sent) fails the test instead of hanging.
+            let mut gga_line = Vec::new();
+            let read_gga = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    sock.read_exact(&mut byte).await.unwrap();
+                    gga_line.push(byte[0]);
+                    if gga_line.ends_with(b"\r\n") {
+                        break;
+                    }
+                }
+            })
+            .await;
+
+            assert!(read_gga.is_ok(), "no GGA sentence received from client");
+            let gga_str = String::from_utf8(gga_line).unwrap();
+            assert!(
+                gga_str.contains("$GPGGA"),
+                "expected a $GPGGA sentence, got: {}",
+                gga_str
+            );
+            // Close the connection so the client's next read sees EOF and exits cleanly.
+        });
+
+        let mut status = StatusState::new("test-node".into(), "test".into());
+        status.rtk_enabled = true;
+        status.rtk_config = Some(NtripConfig {
+            caster_url: addr.ip().to_string(),
+            port: addr.port(),
+            mountpoint: "TEST".into(),
+            username: None,
+            password: None,
+            gga_interval_secs: 0, // fire the periodic-GGA branch on the first iteration
+            serial_port: None,
+            baud_rate: 115200,
+        });
+        let state = Arc::new(RwLock::new(status));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_ntrip_client(Arc::clone(&state), 0.0, 0.0, 0.0, None),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "NTRIP client did not exit after caster closed"
+        );
+        result.unwrap().unwrap();
         server.await.unwrap();
     }
 }
