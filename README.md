@@ -134,4 +134,4 @@ cargo build --release
 
 ## Current version
 
-**v0.3.3** — August 2026
+**v0.3.5** — August 2026 — NTRIP client reliability fixes: the RTCM correction channel no longer stalls the caster read loop under backpressure, and periodic GGA position updates are now actually sent to the caster (previously generated and discarded). Refreshed Windows daemon binary.

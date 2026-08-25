@@ -16,7 +16,7 @@ The tag is multi-architecture: Docker selects amd64 or arm64 (Raspberry Pi 4/5) 
 Pin a release instead of tracking `latest` if you want reproducible deployments:
 
 ```sh
-docker pull ghcr.io/azimuth-official/azimuth-node:0.3.4
+docker pull ghcr.io/azimuth-official/azimuth-node:0.3.5
 ```
 
 `docker compose up -d` (section 2) pulls this image on its own, so you can skip straight
