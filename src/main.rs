@@ -8,6 +8,7 @@ mod regions;
 mod sdr;
 mod setup;
 mod ntrip;
+mod rtk;
 mod status_server;
 
 use std::path::PathBuf;
@@ -478,10 +479,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Initialize RTK config from config.toml if present
-    if let Some(ref ntrip_cfg) = config.ntrip {
+    // Initialize RTK config: prefer a persisted config (survives container
+    // recreation / reinstall — see rtk.rs) over config.toml, since only the
+    // persisted file carries the enabled/provider state a POST /rtk-config
+    // previously lost on every restart. Falls back to config.toml [ntrip]
+    // (caster settings only — config.toml has no enabled flag, so `enabled`
+    // stays false) when nothing has ever been persisted. Must run before the
+    // NTRIP supervisor task below, which reads rtk_enabled/rtk_config.
+    {
         let mut s = app_state.status.write().await;
-        s.rtk_config = Some(ntrip_cfg.clone());
+        if rtk::restore_into(&mut s, &cli.config) {
+            info!("RTK config restored from persistent storage");
+        } else if let Some(ref ntrip_cfg) = config.ntrip {
+            s.rtk_config = Some(ntrip_cfg.clone());
+        }
     }
 
     // GPS reader task — provides RTCM3 channel and auto-detection

@@ -145,9 +145,10 @@ a GPS device is present but not accessible.
 
 ## 5. State & identity persistence
 
-`/var/lib/azimuth` holds `node-identity.json` and the generated `config.toml`. Keep it on
-a named volume (the compose file does) so the node keeps its identity across restarts and
-does not re-register.
+`/var/lib/azimuth` holds `node-identity.json`, `rtk-config.json`, and the generated
+`config.toml`. Keep it on a named volume (the compose file does) so the node keeps its
+identity — and any RTK/NTRIP caster config enabled via the desktop app — across restarts
+and does not re-register or lose its RTK setup.
 
 ## 6. Health endpoint
 

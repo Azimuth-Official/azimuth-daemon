@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::{Config, NtripConfig};
+use crate::rtk::{self, PersistedRtkConfig};
 use crate::sdr::SdrManager;
 use crate::gps::AccuracyPoint;
 use std::collections::VecDeque;
@@ -442,33 +443,84 @@ async fn rtk_config_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RtkConfigRequest>,
 ) -> impl IntoResponse {
-    let mut s = state.status.write().await;
-    s.rtk_enabled = req.enabled;
-    if let Some(provider) = req.provider.clone() {
-        s.rtk_provider = Some(provider);
-    }
-    // Build NtripConfig from request fields if provided
-    if let (Some(caster_url), Some(mountpoint)) = (req.caster_url.clone(), req.mountpoint.clone()) {
-        if !caster_url.is_empty() && !mountpoint.is_empty() {
+    let config_path = state.config_path.clone();
+
+    // Snapshot values after mutating state, then drop the write guard before
+    // the blocking disk write below (same pattern as config_write_handler).
+    let (snapshot_enabled, snapshot_provider, snapshot_ntrip) = {
+        let mut s = state.status.write().await;
+        s.rtk_enabled = req.enabled;
+        if let Some(provider) = req.provider.clone() {
+            s.rtk_provider = Some(provider);
+        }
+
+        // Merge request fields over the existing NtripConfig (sourced from
+        // config.toml, a restored persisted file, or a prior POST) instead of
+        // rebuilding from scratch — a bare {enabled:false} or a partial update
+        // must not wipe serial_port/baud_rate/gga_interval_secs. Request
+        // fields win when present; defaults only apply when nothing existed
+        // before.
+        let existing = s.rtk_config.clone();
+        let caster_url = req
+            .caster_url
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| existing.as_ref().map(|c| c.caster_url.clone()));
+        let mountpoint = req
+            .mountpoint
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| existing.as_ref().map(|c| c.mountpoint.clone()));
+
+        if let (Some(caster_url), Some(mountpoint)) = (caster_url, mountpoint) {
             s.rtk_config = Some(NtripConfig {
                 caster_url,
-                port: req.port.unwrap_or(2101),
+                port: req.port.or_else(|| existing.as_ref().map(|c| c.port)).unwrap_or(2101),
                 mountpoint,
-                username: req.username.clone(),
-                password: req.password.clone(),
-                gga_interval_secs: 10,
-                serial_port: None,
-                baud_rate: 115200,
+                username: req
+                    .username
+                    .clone()
+                    .or_else(|| existing.as_ref().and_then(|c| c.username.clone())),
+                password: req
+                    .password
+                    .clone()
+                    .or_else(|| existing.as_ref().and_then(|c| c.password.clone())),
+                gga_interval_secs: existing.as_ref().map(|c| c.gga_interval_secs).unwrap_or(10),
+                serial_port: existing.as_ref().and_then(|c| c.serial_port.clone()),
+                baud_rate: existing.as_ref().map(|c| c.baud_rate).unwrap_or(115200),
             });
         }
+
+        if !req.enabled {
+            s.rtk_connected = false;
+        }
+
+        (s.rtk_enabled, s.rtk_provider.clone(), s.rtk_config.clone())
+    };
+
+    info!(enabled = snapshot_enabled, provider = ?snapshot_provider, "RTK config updated via HTTP");
+
+    let mut message = format!("RTK {}", if snapshot_enabled { "enabled" } else { "disabled" });
+
+    // Persist even on disable — a disable must be durable across a restart,
+    // not just cleared in memory. Nothing to persist yet if no caster config
+    // has ever been set (e.g. toggling before first configuring a caster).
+    if let Some(ntrip) = snapshot_ntrip {
+        let persisted = PersistedRtkConfig {
+            version: 1,
+            enabled: snapshot_enabled,
+            provider: snapshot_provider,
+            ntrip,
+        };
+        let persist_result =
+            tokio::task::block_in_place(|| rtk::save(&config_path, &persisted));
+        if let Err(e) = persist_result {
+            warn!(error = %e, "Failed to persist RTK config");
+            message.push_str(" (warning: failed to persist to disk — will reset on restart)");
+        }
     }
-    if !req.enabled {
-        s.rtk_connected = false;
-    }
-    info!(enabled = req.enabled, provider = ?req.provider, "RTK config updated via HTTP");
-    Json(MessageResponse {
-        message: format!("RTK {}", if req.enabled { "enabled" } else { "disabled" }),
-    })
+
+    Json(MessageResponse { message })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -771,6 +823,57 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtk_config_persists_and_restores_across_simulated_restart() {
+        // Regression test for Bug 4: RTK config POSTed via /rtk-config was
+        // runtime-only — after a container recreation / daemon restart it
+        // reset to enabled:false / provider:null. This simulates the full
+        // round trip: persist what the fixed handler would have written, then
+        // restore into a *fresh* StatusState the way main() does at startup.
+        let base = std::env::temp_dir()
+            .join(format!("azd-rtk-restart-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join(crate::rtk::RTK_CONFIG_FILE);
+        let paths = vec![path.clone()];
+
+        let ntrip = NtripConfig {
+            caster_url: "rtk2go.com".to_string(),
+            port: 2101,
+            mountpoint: "TESTMOUNT".to_string(),
+            username: Some("user".to_string()),
+            password: Some("secret".to_string()),
+            gga_interval_secs: 10,
+            serial_port: None,
+            baud_rate: 115200,
+        };
+        let persisted = crate::rtk::PersistedRtkConfig {
+            version: 1,
+            enabled: true,
+            provider: Some("rtk2go".to_string()),
+            ntrip: ntrip.clone(),
+        };
+        crate::rtk::save_to_paths(&paths, &persisted)
+            .expect("save must succeed to an isolated tempdir");
+
+        // "After restart" — a brand new StatusState, as main() creates at startup.
+        let mut fresh = StatusState::new("node-1".to_string(), "tier1_rtlsdr".to_string());
+        assert!(!fresh.rtk_enabled, "sanity: fresh state starts disabled");
+        assert!(fresh.rtk_provider.is_none());
+
+        let restored = crate::rtk::restore_from_paths(&mut fresh, &paths);
+
+        assert!(restored, "restore must report it found a persisted config");
+        assert!(fresh.rtk_enabled, "POSTed enabled:true must survive the simulated restart");
+        assert_eq!(fresh.rtk_provider.as_deref(), Some("rtk2go"));
+        assert_eq!(
+            fresh.rtk_config.as_ref().map(|c| c.caster_url.as_str()),
+            Some("rtk2go.com"),
+            "POSTed caster config must survive the simulated restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn status_json_includes_auth_error_when_set() {
