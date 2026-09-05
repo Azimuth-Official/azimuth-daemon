@@ -1,8 +1,30 @@
-# Forward the host build-path remap flags into every target container so release
-# binaries carry no machine-specific paths (reproducible builds). Values are set in
-# the build environment, never committed.
+# Forward the host build-path sanitising flags into every target container so release
+# binaries carry no machine-specific paths (reproducible builds). Values are computed
+# from the environment by scripts/build-release.sh and are never committed.
+#
+# Two independent mechanisms are required, and missing either one reintroduces the leak:
+#   * Rust code -> --remap-path-prefix, supplied via RUSTFLAGS (or the per-target
+#     CARGO_TARGET_<TRIPLE>_RUSTFLAGS override).
+#   * C code    -> -ffile-prefix-map, supplied via CFLAGS/CXXFLAGS. Rust's
+#     --remap-path-prefix does NOT apply to anything the cc crate compiles (vendored
+#     libusb via rusb, libudev-sys via serialport, vendored OpenSSL via reqwest), so
+#     C sources embed the builder's home through __FILE__ and assert() unless mapped.
+#
+# NOTE on precedence: a per-target CARGO_TARGET_<TRIPLE>_RUSTFLAGS REPLACES RUSTFLAGS
+# and [build] rustflags wholesale — it does not merge. Any target that sets one must
+# repeat the full remap set inside it. (v0.3.6 armv6 shipped a home-directory leak for
+# exactly this reason: its per-target override carried only the link-arg.)
 [build.env]
-passthrough = ["RUSTFLAGS", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS"]
+passthrough = [
+    "RUSTFLAGS",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+    "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+    "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS",
+    "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS",
+    "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+]
 
 [target.x86_64-unknown-linux-gnu]
 # Debian stable-based image
@@ -11,6 +33,8 @@ pre-build = [
     "apt-get update",
     "apt-get install -y libusb-1.0-0-dev libudev-dev libssl-dev",
 ]
+[target.x86_64-unknown-linux-gnu.env]
+passthrough = ["RUSTFLAGS", "CFLAGS", "CXXFLAGS"]
 
 # Cross-compile note: the C-linked deps (libudev-sys via serialport) resolve through
 # pkg-config. cross-rs does NOT set container env from an inline `env = {...}` table;
@@ -26,7 +50,7 @@ pre-build = [
   "apt-get install -y libusb-1.0-0-dev:arm64 libudev-dev:arm64 libssl-dev:arm64",
 ]
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "RUSTFLAGS", "CFLAGS", "CXXFLAGS"]
 
 [target.armv7-unknown-linux-gnueabihf]
 image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
@@ -36,12 +60,12 @@ pre-build = [
   "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf",
 ]
 [target.armv7-unknown-linux-gnueabihf.env]
-passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR"]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "RUSTFLAGS", "CFLAGS", "CXXFLAGS"]
 
 [target.arm-unknown-linux-gnueabihf]
-# ARMv6 (Pi 1 / Zero). Custom image (C:\tmp\cross-armv6\Dockerfile) bakes the armhf
-# libc dev headers (libc6-dev:armhf/linux-libc-dev:armhf) the stock image omits — the
-# vendored libusb build needs bits/libc-header-start.h for the armhf target.
+# ARMv6 (Pi 1 / Zero). Custom image bakes the armhf libc dev headers
+# (libc6-dev:armhf/linux-libc-dev:armhf) the stock image omits — the vendored libusb
+# build needs bits/libc-header-start.h for the armhf target.
 image = "azimuth-cross-armv6:local"
 pre-build = [
   "dpkg --add-architecture armhf",
@@ -49,13 +73,15 @@ pre-build = [
   "apt-get install -y libusb-1.0-0-dev:armhf libudev-dev:armhf libssl-dev:armhf",
 ]
 [target.arm-unknown-linux-gnueabihf.env]
-# The custom image (C:\tmp\cross-armv6\Dockerfile) symlink-merges armhf headers into
-# /usr/include so the vendored libusb build (-I //usr/include) resolves <bits/*> for
-# armhf. No global CFLAGS — openssl-sys builds cleanly against the toolchain sysroot.
+# The custom image symlink-merges armhf headers into /usr/include so the vendored
+# libusb build (-I //usr/include) resolves <bits/*> for armhf. No global CFLAGS beyond
+# the prefix map — openssl-sys builds cleanly against the toolchain sysroot.
 # The toolchain glibc (2.17) predates getrandom@2.25 which the Ubuntu-armhf libudev.so
 # references; --allow-shlib-undefined defers that shared-lib symbol to runtime (resolves
-# on any modern-glibc Pi). Target-scoped RUSTFLAGS — does NOT touch other targets.
-passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS"]
+# on any modern-glibc Pi). Target-scoped RUSTFLAGS — does NOT touch other targets, and
+# because it replaces RUSTFLAGS entirely it must repeat the full remap set (see the
+# precedence note at the top of this file).
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_DIR", "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS", "CFLAGS", "CXXFLAGS"]
 
 [target.riscv64gc-unknown-linux-gnu]
 # RISC-V 64-bit. riscv64 dev libs are unreachable from the stock Ubuntu-18.04 cross
@@ -64,3 +90,5 @@ passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_PATH", "PKG_CONFIG_SYSROOT_
 # rusb is `vendored` and reqwest is `native-tls-vendored`, both compiling from source
 # against the toolchain's own riscv64 sysroot. No pre-build apt step.
 image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:0.2.5"
+[target.riscv64gc-unknown-linux-gnu.env]
+passthrough = ["RUSTFLAGS", "CFLAGS", "CXXFLAGS"]
