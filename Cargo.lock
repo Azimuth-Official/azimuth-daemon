@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "azimuth-daemon"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "android_logger",
  "anyhow",
