@@ -48,7 +48,6 @@ rustfft = "6"
 
 # Serial port access for RTK GPS receiver forwarding
 tokio-serial = "5.5"
-nmea = "0.7"
 serialport = { version = "4", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
