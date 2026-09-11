@@ -1,6 +1,6 @@
 [package]
 name = "azimuth-daemon"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 authors = ["Azimuth <team@azimuth.day>"]
 description = "Azimuth positioning network daemon — SDR signal observation and submission"
@@ -29,7 +29,11 @@ serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+# env-filter is NOT in tracing-subscriber's default feature set; without it there
+# is no EnvFilter and therefore no way to raise this crate's level while pinning
+# third-party crates down (which is what keeps Authorization headers out of logs).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }

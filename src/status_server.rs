@@ -257,6 +257,9 @@ pub struct AppState {
     /// Live API key shared with ApiClient — POST /config/write swaps it so a
     /// corrected key takes effect without a daemon restart.
     pub api_key: Arc<std::sync::RwLock<String>>,
+    /// Runtime log-level control, so the desktop Debug mode toggle takes effect
+    /// without restarting the sidecar.
+    pub log: Arc<crate::logging::LogHandle>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -684,6 +687,87 @@ async fn gps_status_handler(State(state): State<Arc<AppState>>) -> Json<GpsStatu
     })
 }
 
+#[derive(Debug, Deserialize)]
+struct LogLevelRequest {
+    /// Friendly level: trace|debug|info|warn|error.
+    level: Option<String>,
+    /// Raw EnvFilter directive for support sessions. Validated — a directive
+    /// that would raise a non-azimuth_daemon target is rejected, because
+    /// dependency debug logging includes the Bearer API key.
+    filter: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LogLevelResponse {
+    filter: String,
+    log_dir: String,
+    files: Vec<LogFileEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct LogFileEntry {
+    name: String,
+    bytes: u64,
+}
+
+/// Flip the runtime log level without restarting the sidecar. Never logs the
+/// request body.
+async fn log_level_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LogLevelRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let directive =
+        match crate::logging::parse_level_directive(req.level.as_deref(), req.filter.as_deref()) {
+            Ok(d) => d,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": e })),
+                );
+            }
+        };
+
+    match state.log.set_filter(&directive) {
+        Ok(applied) => {
+            tracing::info!(filter = %applied, "log level changed at runtime");
+            let files = state
+                .log
+                .files()
+                .into_iter()
+                .map(|(name, bytes)| LogFileEntry { name, bytes })
+                .collect();
+            let body = LogLevelResponse {
+                filter: applied,
+                log_dir: state.log.dir().display().to_string(),
+                files,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(body).unwrap_or_default()),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "message": e })),
+        ),
+    }
+}
+
+/// Where the logs are and what is on disk, so "Export logs" does not guess
+/// filenames.
+async fn log_path_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let files: Vec<LogFileEntry> = state
+        .log
+        .files()
+        .into_iter()
+        .map(|(name, bytes)| LogFileEntry { name, bytes })
+        .collect();
+    Json(serde_json::json!({
+        "log_dir": state.log.dir().display().to_string(),
+        "files": serde_json::to_value(files).unwrap_or_default(),
+    }))
+}
+
 async fn serial_ports_handler(State(_state): State<Arc<AppState>>) -> Json<Vec<crate::gps::SerialPortInfo>> {
     let ports = crate::gps::list_serial_ports();
     Json(ports)
@@ -752,6 +836,8 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/rtk/test", post(rtk_test_handler))
         .route("/gps/status", get(gps_status_handler))
         .route("/serial/ports", get(serial_ports_handler))
+        .route("/log/level", post(log_level_handler))
+        .route("/log/path", get(log_path_handler))
         // The desktop app's webview calls this loopback-only server cross-origin
         // (tauri.localhost -> 127.0.0.1); without CORS every fetch is blocked.
         .layer(tower_http::cors::CorsLayer::permissive())

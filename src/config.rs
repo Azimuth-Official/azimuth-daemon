@@ -19,10 +19,25 @@ pub struct Config {
     pub gps: Option<GpsConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct ApiConfig {
     pub url: String,
     pub key: String,
+}
+
+/// Hand-written so the API key can never be printed.
+///
+/// With `#[derive(Debug)]`, a single `debug!(?config)` anywhere — now that debug
+/// logging is a user-facing toggle that writes to a file users are asked to
+/// send in — would dump the Bearer key verbatim. This is the control that
+/// survives a future contributor who doesn't know that.
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("url", &self.url)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -140,6 +155,15 @@ pub struct ScanningConfig {
     pub capture_retries: u32,
     #[serde(default = "default_max_obs_per_cycle")]
     pub max_observations_per_cycle: u32,
+    /// Seconds between repeat discovery sweeps. Discovery used to be a one-shot
+    /// latch, so whatever a single sweep found at process start was what the
+    /// node scanned until it restarted. 0 restores that one-shot behavior.
+    #[serde(default = "default_rediscovery_interval")]
+    pub rediscovery_interval_secs: u64,
+    /// Re-run discovery early while the FM list is below this count. 0 disables
+    /// the low-yield trigger. Matches the fallback gate's minimum by default.
+    #[serde(default = "default_rediscovery_min_fm_stations")]
+    pub rediscovery_min_fm_stations: usize,
     #[serde(default)]
     pub fm: FmScanConfig,
     #[serde(default)]
@@ -175,6 +199,16 @@ fn default_capture_retries() -> u32 {
 fn default_max_obs_per_cycle() -> u32 {
     20
 }
+/// 6 hours. A full sweep is ~103 FM steps plus LTE/DTV, each with a 256 KB
+/// capture — minutes during which nothing is submitted. Nightly is too slow for
+/// a user who attaches an antenna after first run; hourly wastes capture time in
+/// a healthy environment. 6 h bounds "wrong forever" to 6 h.
+fn default_rediscovery_interval() -> u64 {
+    21_600
+}
+fn default_rediscovery_min_fm_stations() -> usize {
+    3
+}
 
 impl Default for ScanningConfig {
     fn default() -> Self {
@@ -188,6 +222,8 @@ impl Default for ScanningConfig {
             retune_delay_ms: default_retune_delay(),
             capture_retries: default_capture_retries(),
             max_observations_per_cycle: default_max_obs_per_cycle(),
+            rediscovery_interval_secs: default_rediscovery_interval(),
+            rediscovery_min_fm_stations: default_rediscovery_min_fm_stations(),
             fm: FmScanConfig::default(),
             lte: LteScanConfig::default(),
             dtv: DtvScanConfig::default(),
@@ -308,7 +344,7 @@ fn default_dtv_sweep_threshold() -> f32 {
     -25.0
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct NtripConfig {
     pub caster_url: String,
     #[serde(default = "default_ntrip_port")]
@@ -326,6 +362,24 @@ pub struct NtripConfig {
     pub baud_rate: u32,
 }
 
+/// Hand-written for the same reason as `ApiConfig`: the NTRIP username and
+/// password are Basic-auth credentials for a third-party caster, and must not
+/// reach a log file a user is asked to email in.
+impl std::fmt::Debug for NtripConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NtripConfig")
+            .field("caster_url", &self.caster_url)
+            .field("port", &self.port)
+            .field("mountpoint", &self.mountpoint)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("gga_interval_secs", &self.gga_interval_secs)
+            .field("serial_port", &self.serial_port)
+            .field("baud_rate", &self.baud_rate)
+            .finish()
+    }
+}
+
 fn default_ntrip_port() -> u16 {
     2101
 }
@@ -336,16 +390,55 @@ fn default_baud_rate() -> u32 {
     115200
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GpsConfig {
     #[serde(default = "default_gps_enabled")]
     pub enabled: bool,
+    /// Pin a specific serial port. Highest priority — skips auto-detection
+    /// entirely and never silently falls back to another port.
     #[serde(default)]
     pub port: Option<String>,
     #[serde(default)]
     pub baud_rate: Option<u32>,
     #[serde(default = "default_sample_interval")]
     pub sample_interval_secs: u64,
+    /// Probe serial ports that expose no usable USB vendor id. Detection used
+    /// to be a strict vid whitelist, so a receiver the OS reports as a plain
+    /// COM port (no vid) was invisible no matter what it emitted. Valid NMEA is
+    /// the real proof; the vid is only a fast path. `false` restores the old
+    /// whitelist-only behavior.
+    #[serde(default = "default_probe_unknown_ports")]
+    pub probe_unknown_ports: bool,
+    /// If non-empty, only these port names are considered.
+    #[serde(default)]
+    pub allow_ports: Vec<String>,
+    /// Never probe these port names, even a recognised GPS vendor id.
+    #[serde(default)]
+    pub deny_ports: Vec<String>,
+    #[serde(default = "default_probe_retry_base")]
+    pub probe_retry_base_secs: u64,
+    #[serde(default = "default_probe_retry_max")]
+    pub probe_retry_max_secs: u64,
+}
+
+/// Hand-written, NOT derived. `#[derive(Default)]` ignores `#[serde(default =
+/// "...")]` and would yield `enabled: false` — and since no shipped config has
+/// a `[gps]` section, a single `config.gps.unwrap_or_default()` would then
+/// silently disable GPS on every node in the fleet.
+impl Default for GpsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gps_enabled(),
+            port: None,
+            baud_rate: None,
+            sample_interval_secs: default_sample_interval(),
+            probe_unknown_ports: default_probe_unknown_ports(),
+            allow_ports: Vec::new(),
+            deny_ports: Vec::new(),
+            probe_retry_base_secs: default_probe_retry_base(),
+            probe_retry_max_secs: default_probe_retry_max(),
+        }
+    }
 }
 
 fn default_gps_enabled() -> bool {
@@ -354,6 +447,18 @@ fn default_gps_enabled() -> bool {
 
 fn default_sample_interval() -> u64 {
     10
+}
+
+fn default_probe_unknown_ports() -> bool {
+    true
+}
+
+fn default_probe_retry_base() -> u64 {
+    60
+}
+
+fn default_probe_retry_max() -> u64 {
+    1800
 }
 
 impl Config {
@@ -699,5 +804,52 @@ gain = -1
         let bands = &config.scanning.as_ref().unwrap().lte.sweep_bands;
         assert_eq!(bands.len(), 1, "hand-configured sweep bands must survive");
         assert_eq!(bands[0].start, 700_000_000);
+    }
+
+    // --- secret safety ----------------------------------------------------
+    //
+    // Debug logging is now a user-facing toggle that writes to a file users are
+    // asked to send in for support. A single `debug!(?config)` must not turn
+    // that file into a credential leak, so the Debug impls are hand-written and
+    // these tests pin them.
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let cfg = ApiConfig {
+            url: "https://azimuth.day".to_string(),
+            key: "az_live_supersecretvalue".to_string(),
+        };
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("az_live_supersecretvalue"), "API key leaked: {s}");
+        assert!(s.contains("<redacted>"));
+        assert!(s.contains("https://azimuth.day"), "non-secret fields should survive");
+    }
+
+    #[test]
+    fn debug_never_prints_ntrip_credentials() {
+        let cfg = NtripConfig {
+            caster_url: "rtk.example.net".to_string(),
+            port: 2101,
+            mountpoint: "NEAR".to_string(),
+            username: Some("ntripuser".to_string()),
+            password: Some("ntrippassword".to_string()),
+            gga_interval_secs: 10,
+            serial_port: None,
+            baud_rate: 115200,
+        };
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("ntrippassword"), "NTRIP password leaked: {s}");
+        assert!(!s.contains("ntripuser"), "NTRIP username leaked: {s}");
+        assert!(s.contains("<redacted>"));
+    }
+
+    #[test]
+    fn whole_config_debug_inherits_the_redaction() {
+        // Config still derives Debug; it must inherit the field-level redaction
+        // rather than bypass it.
+        let mut cfg = Config::default();
+        cfg.api.key = "az_live_anothersecret".to_string();
+        let s = format!("{cfg:?}");
+        assert!(!s.contains("az_live_anothersecret"), "key leaked via Config: {s}");
     }
 }

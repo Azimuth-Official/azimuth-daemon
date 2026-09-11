@@ -6,7 +6,7 @@ use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
 use crate::sdr::recovery::{RecoveryAction, RecoveryManager, reset_usb_bus_device, restart_os_device};
 use chrono::Utc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Result from a single scan operation.
@@ -58,6 +58,10 @@ pub struct Scanner {
     dtv_config: DtvScanConfig,
     dbm_offset: f32,
     discovered: bool,
+    /// When the last discovery sweep finished. `None` until the first one runs.
+    last_discovery: Option<Instant>,
+    rediscovery_interval: Duration,
+    rediscovery_min_fm: usize,
     retune_delay_ms: u32,
     capture_retries: u32,
     max_observations_per_cycle: u32,
@@ -80,12 +84,67 @@ const CAPTURE_BYTES: usize = 262_144;
 const FM_FALLBACK_THRESHOLD_DBFS: f32 = -35.0;
 const FM_FALLBACK_MIN_SNR_DB: f32 = 5.0;
 
-/// Whether the FM discovery sweep should re-run with relaxed gates: only
-/// when the primary pass found nothing at all. A partial result (even one
-/// station) means the gates are working for this RF environment, so we
-/// don't second-guess it.
-fn should_run_fm_fallback(primary_result: &[u64]) -> bool {
-    primary_result.is_empty()
+/// Minimum station count a primary FM sweep must clear before its gates are
+/// trusted. Below this the sweep is read as "these gates are too tight for this
+/// RF environment", not as a complete picture of the band.
+///
+/// 3, because the default grid is 87.5-108 MHz at 200 kHz = ~103 candidate
+/// steps, and anywhere worth siting a node carries far more than three
+/// receivable carriers (a thin rural market still runs 8-15). A node that
+/// genuinely lives in an RF desert is exactly the case where one extra relaxed
+/// pass costs a single sweep and can only add stations. 1 would leave the bug
+/// half-fixed (2 found => still no retry, still nearly blind); 10 would
+/// re-sweep on almost every node for no gain in a healthy environment.
+const FM_FALLBACK_MIN_STATIONS: usize = 3;
+
+/// Whether the FM discovery sweep should re-run with relaxed gates.
+///
+/// Takes the threshold as a parameter rather than reading the constant, so the
+/// constant stays independently assertable and a future `fm.fallback_min_stations`
+/// config field can feed this without touching the predicate.
+fn should_run_fm_fallback(primary_result: &[u64], min_stations: usize) -> bool {
+    primary_result.len() < min_stations
+}
+
+/// Union two frequency lists, preserving sort order and dropping duplicates.
+///
+/// The relaxed pass re-walks the same deterministic grid, so it normally
+/// re-finds everything the strict pass found — but it is not *guaranteed* to:
+/// a fade, an AGC excursion or a capture error on one step can drop a frequency
+/// the strict pass caught. Assigning instead of merging would silently lose it.
+fn merge_frequencies(mut a: Vec<u64>, b: Vec<u64>) -> Vec<u64> {
+    a.extend(b);
+    a.sort_unstable();
+    a.dedup();
+    a
+}
+
+/// Short leash for a node that came out of discovery nearly blind: retry sooner
+/// than the full interval rather than waiting hours to find out the antenna was
+/// unplugged during the one sweep that ever ran.
+const LOW_YIELD_RETRY_INTERVAL: Duration = Duration::from_secs(900);
+
+/// Whether a *repeat* discovery sweep is due. Pure, so it is testable without
+/// hardware; the caller supplies elapsed time rather than reading a clock.
+///
+/// `discovered` being a one-shot latch is what pinned a node to whatever a
+/// single sweep happened to find at process start — see `needs_discovery`.
+fn should_rediscover(
+    since_last: Option<Duration>,
+    interval: Duration,
+    fm_station_count: usize,
+    min_fm_stations: usize,
+) -> bool {
+    let Some(elapsed) = since_last else {
+        return true;
+    };
+    if min_fm_stations > 0
+        && fm_station_count < min_fm_stations
+        && elapsed >= LOW_YIELD_RETRY_INTERVAL
+    {
+        return true;
+    }
+    !interval.is_zero() && elapsed >= interval
 }
 
 impl Scanner {
@@ -120,6 +179,9 @@ impl Scanner {
             dtv_config: config.dtv.clone(),
             dbm_offset,
             discovered: false,
+            last_discovery: None,
+            rediscovery_interval: Duration::from_secs(config.rediscovery_interval_secs),
+            rediscovery_min_fm: config.rediscovery_min_fm_stations,
             retune_delay_ms: config.retune_delay_ms,
             capture_retries: config.capture_retries,
             max_observations_per_cycle: config.max_observations_per_cycle,
@@ -154,25 +216,36 @@ impl Scanner {
             self.fm_config.sweep_threshold,
             self.fm_config.sweep_min_snr_db,
         );
-        if should_run_fm_fallback(&result.fm_stations) {
-            // Zero stations at the configured gates. `discovered` is latched
+        if should_run_fm_fallback(&result.fm_stations, FM_FALLBACK_MIN_STATIONS) {
+            // Too few stations at the configured gates. `discovered` is latched
             // true below regardless of outcome, and run_cycle's periodic FM
             // scan only iterates `fm_frequencies` — so a sweep that finds
-            // nothing here means PERMANENTLY zero FM observations until the
-            // next full discovery. Re-sweep once with materially looser
-            // gates before giving up, to catch cases where the configured
+            // almost nothing here pins this node to that handful of
+            // frequencies until the next full discovery. Re-sweep once with
+            // materially looser gates, to catch cases where the configured
             // threshold/SNR are simply too strict for this node's RF
             // environment (weak antenna feed, distant stations, etc.)
-            // without silently leaving the node blind.
+            // without silently leaving the node nearly blind.
             warn!(
+                found = result.fm_stations.len(),
+                min_stations = FM_FALLBACK_MIN_STATIONS,
                 threshold_dbfs = FM_FALLBACK_THRESHOLD_DBFS,
                 min_snr_db = FM_FALLBACK_MIN_SNR_DB,
-                "FM sweep found zero stations at configured gates — retrying with relaxed gates"
+                "FM sweep found too few stations at configured gates — retrying with relaxed gates"
             );
-            result.fm_stations = self.fm_sweep_pass(
+            let relaxed = self.fm_sweep_pass(
                 sdr_manager,
                 FM_FALLBACK_THRESHOLD_DBFS,
                 FM_FALLBACK_MIN_SNR_DB,
+            );
+            let before = result.fm_stations.len();
+            // MERGE, never assign: the relaxed pass is not guaranteed to
+            // re-find every strict hit (see merge_frequencies).
+            result.fm_stations = merge_frequencies(result.fm_stations, relaxed);
+            info!(
+                before,
+                after = result.fm_stations.len(),
+                "relaxed FM sweep merged into strict result"
             );
         }
 
@@ -240,6 +313,7 @@ impl Scanner {
         self.dtv_frequencies.sort_unstable();
 
         self.discovered = true;
+        self.last_discovery = Some(Instant::now());
         info!(
             fm = self.fm_frequencies.len(),
             lte = self.lte_frequencies.len(),
@@ -262,33 +336,77 @@ impl Scanner {
         min_snr_db: f32,
     ) -> Vec<u64> {
         let mut found = Vec::new();
+        let mut candidates = 0usize;
+        let mut tune_failed = 0usize;
+        let mut capture_failed = 0usize;
+        let mut rejected_power = 0usize;
+        let mut rejected_snr = 0usize;
+        let mut demod_failed = 0usize;
+
         let mut freq = self.fm_config.sweep_start;
         while freq <= self.fm_config.sweep_end {
+            candidates += 1;
             if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
                 if let Some(device) = sdr_manager.device_mut(0) {
-                    if let Ok(iq) = device.capture_raw(CAPTURE_BYTES) {
-                        let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
-                        if dbfs > threshold_dbfs as f64 {
-                            match super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
-                                Some(demod) if demod.snr_db >= min_snr_db => {
-                                    info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
-                                    found.push(freq);
+                    match device.capture_raw(CAPTURE_BYTES) {
+                        Ok(iq) => {
+                            let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
+                            if dbfs > threshold_dbfs as f64 {
+                                match super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
+                                    Some(demod) if demod.snr_db >= min_snr_db => {
+                                        info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
+                                        found.push(freq);
+                                    }
+                                    Some(demod) => {
+                                        rejected_snr += 1;
+                                        debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), gate = "snr", "FM candidate rejected: SNR below threshold");
+                                    }
+                                    None => {
+                                        demod_failed += 1;
+                                        debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "demod", "FM candidate rejected: demodulation failed (near-DC input or capture too short)");
+                                    }
                                 }
-                                Some(demod) => {
-                                    debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), gate = "snr", "FM candidate rejected: SNR below threshold");
-                                }
-                                None => {
-                                    debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "demod", "FM candidate rejected: demodulation failed (near-DC input or capture too short)");
-                                }
+                            } else {
+                                rejected_power += 1;
+                                debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "power", "FM candidate rejected: below power threshold");
                             }
-                        } else {
-                            debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "power", "FM candidate rejected: below power threshold");
+                        }
+                        Err(e) => {
+                            // Previously silent: a failed capture skipped the
+                            // frequency with no trace at any log level.
+                            capture_failed += 1;
+                            debug!(freq_mhz = freq as f64 / 1e6, gate = "capture", error = %e, "FM candidate skipped: capture failed");
                         }
                     }
                 }
+            } else {
+                // Previously silent: tune_with_recovery returning None skipped
+                // the frequency with no trace at any log level, so a sweep that
+                // failed to tune 102 of 103 steps looked identical in the logs
+                // to one where 102 steps were genuinely below threshold.
+                tune_failed += 1;
+                debug!(freq_mhz = freq as f64 / 1e6, gate = "tune", "FM candidate skipped: tune failed (recovery exhausted or device gone)");
             }
             freq += self.fm_config.sweep_step;
         }
+
+        // Single info-level line that makes this sweep diagnosable without
+        // debug logging: "103 candidates / 87 below power / 1 found" and
+        // "103 candidates / 102 tune failures / 1 found" are entirely
+        // different diagnoses and were previously indistinguishable.
+        info!(
+            threshold_dbfs,
+            min_snr_db,
+            candidates,
+            tune_failed,
+            capture_failed,
+            rejected_power,
+            rejected_snr,
+            demod_failed,
+            found = found.len(),
+            "FM sweep pass complete"
+        );
+
         found
     }
 
@@ -512,7 +630,18 @@ impl Scanner {
     }
 
     pub fn needs_discovery(&self) -> bool {
-        (self.mode == ScanMode::Sweep || self.mode == ScanMode::Both) && !self.discovered
+        if !(self.mode == ScanMode::Sweep || self.mode == ScanMode::Both) {
+            return false;
+        }
+        if !self.discovered {
+            return true;
+        }
+        should_rediscover(
+            self.last_discovery.map(|t| t.elapsed()),
+            self.rediscovery_interval,
+            self.fm_frequencies.len(),
+            self.rediscovery_min_fm,
+        )
     }
 
     pub fn interval_seconds(&self) -> u32 {
@@ -541,14 +670,14 @@ impl Scanner {
         device_idx: usize,
         freq: u64,
     ) -> Option<()> {
-        // Compute and apply delay based on *previous* tuned frequency, before we update it.
+        // Compute the delay from the *previous* tuned frequency BEFORE the tune
+        // updates it — the jump size is a property of the transition, not of the
+        // target. (Computing it after set_last_tuned_freq_hz would make
+        // freq.abs_diff(prev) == 0 and silently delete the large-jump path.)
         let delay = {
             let device = sdr_manager.device_mut(device_idx)?;
             self.retune_delay(device, freq)
         };
-        if delay > Duration::ZERO {
-            std::thread::sleep(delay);
-        }
 
         let result = {
             let device = sdr_manager.device_mut(device_idx)?;
@@ -559,6 +688,15 @@ impl Scanner {
             Ok(()) => {
                 if let Some(device) = sdr_manager.device_mut(device_idx) {
                     device.set_last_tuned_freq_hz(freq);
+                }
+                // Settle AFTER the tune. The PLL needs this time to lock the NEW
+                // frequency. Sleeping before set_center_freq waited on the
+                // previous, already-locked frequency and left ZERO settle before
+                // the caller's capture_raw() — so every post-retune capture read
+                // a slewing PLL. That is the "only the strongest station is ever
+                // found" symptom.
+                if delay > Duration::ZERO {
+                    std::thread::sleep(delay);
                 }
                 Some(())
             }
@@ -585,6 +723,12 @@ impl Scanner {
                                     device.set_last_tuned_freq_hz(freq);
                                     self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Tune succeeded after recovery");
+                                    // Same post-tune PLL settle as the happy path — a
+                                    // capture straight after a recovery retune is just
+                                    // as vulnerable to reading a slewing PLL.
+                                    if delay > Duration::ZERO {
+                                        std::thread::sleep(delay);
+                                    }
                                     return Some(());
                                 }
                                 Err(e2) => {
@@ -850,19 +994,62 @@ mod tests {
     // latched true after one discovery pass regardless of outcome, so a
     // sweep that finds nothing must retry with relaxed gates before that
     // latch closes.
+    // CHANGED (BUG-5). The previous revision asserted that a single discovered
+    // station suppresses the relaxed re-sweep:
+    //
+    //     #[test]
+    //     fn fm_fallback_does_not_engage_when_primary_sweep_found_a_station() {
+    //         assert!(!should_run_fm_fallback(&[100_300_000]));
+    //     }
+    //
+    // That test was correct about the code and wrong about the requirement. The
+    // rule it encoded — "a partial result means the gates are working for this
+    // RF environment" — does not hold: `discovered` is latched true after one
+    // pass and `run_cycle` only re-tunes the frozen `fm_frequencies`, so a sweep
+    // that clears the strict gates on exactly one strong local carrier pinned
+    // the node to a single FM frequency for the rest of the process lifetime.
+    // That is the reported symptom (one station near the top of the band while
+    // other users see 20+). One station out of the ~103 candidate steps in
+    // 87.5-108 MHz is evidence the gates are too tight, not evidence they are
+    // calibrated. The tests below pin the corrected contract.
     #[test]
     fn fm_fallback_engages_when_primary_sweep_found_nothing() {
-        assert!(should_run_fm_fallback(&[]));
+        assert!(should_run_fm_fallback(&[], FM_FALLBACK_MIN_STATIONS));
     }
 
     #[test]
-    fn fm_fallback_does_not_engage_when_primary_sweep_found_a_station() {
-        assert!(!should_run_fm_fallback(&[100_300_000]));
+    fn fm_fallback_engages_when_primary_sweep_found_a_single_station() {
+        assert!(should_run_fm_fallback(
+            &[100_300_000],
+            FM_FALLBACK_MIN_STATIONS
+        ));
+    }
+
+    #[test]
+    fn fm_fallback_engages_below_the_minimum_station_count() {
+        assert!(should_run_fm_fallback(
+            &[88_500_000, 101_100_000],
+            FM_FALLBACK_MIN_STATIONS
+        ));
     }
 
     #[test]
     fn fm_fallback_does_not_engage_with_multiple_stations_found() {
-        assert!(!should_run_fm_fallback(&[88_500_000, 101_100_000, 107_900_000]));
+        assert!(!should_run_fm_fallback(
+            &[88_500_000, 101_100_000, 107_900_000],
+            FM_FALLBACK_MIN_STATIONS
+        ));
+        assert!(!should_run_fm_fallback(
+            &[88_500_000, 95_500_000, 101_100_000, 107_900_000],
+            FM_FALLBACK_MIN_STATIONS
+        ));
+    }
+
+    #[test]
+    fn fm_fallback_min_stations_is_a_plausible_floor() {
+        // Guards a future edit that disables the fallback (0) or forces it on
+        // every node (a value near the ~103 steps in the default grid).
+        assert!((1..=5).contains(&FM_FALLBACK_MIN_STATIONS));
     }
 
     #[test]
@@ -872,5 +1059,117 @@ mod tests {
         // both axes, or it wouldn't find anything the primary pass missed.
         assert!(FM_FALLBACK_THRESHOLD_DBFS < -20.0);
         assert!(FM_FALLBACK_MIN_SNR_DB < 8.0);
+    }
+
+    #[test]
+    fn merge_frequencies_unions_without_duplicates() {
+        let merged = merge_frequencies(
+            vec![100_300_000, 88_500_000],
+            vec![88_500_000, 95_700_000],
+        );
+        assert_eq!(merged, vec![88_500_000, 95_700_000, 100_300_000]);
+    }
+
+    #[test]
+    fn merge_frequencies_never_loses_a_strict_result() {
+        // The relaxed pass is not guaranteed to re-find every strict hit; the
+        // strict result must survive regardless.
+        let merged = merge_frequencies(vec![107_900_000], vec![88_100_000]);
+        assert!(merged.contains(&107_900_000));
+        assert!(merged.contains(&88_100_000));
+    }
+
+    #[test]
+    fn merge_frequencies_handles_an_empty_relaxed_pass() {
+        let merged = merge_frequencies(vec![98_100_000], vec![]);
+        assert_eq!(merged, vec![98_100_000]);
+    }
+
+    // --- repeat discovery -------------------------------------------------
+
+    const SIX_HOURS: Duration = Duration::from_secs(21_600);
+
+    #[test]
+    fn rediscovery_required_before_the_first_discovery() {
+        assert!(should_rediscover(None, SIX_HOURS, 0, 3));
+    }
+
+    #[test]
+    fn rediscovery_not_triggered_before_the_interval_with_a_healthy_list() {
+        assert!(!should_rediscover(
+            Some(Duration::from_secs(3_600)),
+            SIX_HOURS,
+            12,
+            3
+        ));
+    }
+
+    #[test]
+    fn rediscovery_triggered_after_the_interval() {
+        assert!(should_rediscover(
+            Some(Duration::from_secs(21_601)),
+            SIX_HOURS,
+            12,
+            3
+        ));
+    }
+
+    #[test]
+    fn low_station_count_triggers_early_rediscovery() {
+        // The BUG-5 shape: one station found, so retry on the short leash
+        // rather than waiting the full six hours.
+        assert!(should_rediscover(
+            Some(Duration::from_secs(900)),
+            SIX_HOURS,
+            1,
+            3
+        ));
+    }
+
+    #[test]
+    fn low_station_count_still_respects_the_short_leash() {
+        assert!(!should_rediscover(
+            Some(Duration::from_secs(60)),
+            SIX_HOURS,
+            1,
+            3
+        ));
+    }
+
+    #[test]
+    fn zero_interval_disables_periodic_rediscovery() {
+        assert!(!should_rediscover(
+            Some(Duration::from_secs(86_400)),
+            Duration::ZERO,
+            12,
+            3
+        ));
+    }
+
+    #[test]
+    fn zero_min_stations_disables_the_low_yield_trigger() {
+        assert!(!should_rediscover(
+            Some(Duration::from_secs(1_000)),
+            SIX_HOURS,
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn fresh_scanner_needs_discovery_in_both_mode() {
+        // Scanner::new touches no hardware.
+        let scanner = Scanner::new(&ScanningConfig::default(), -30.0);
+        assert!(scanner.needs_discovery());
+    }
+
+    #[test]
+    fn config_mode_never_needs_discovery() {
+        let cfg = ScanningConfig {
+            mode: "config".to_string(),
+            ..Default::default()
+        };
+        let scanner = Scanner::new(&cfg, -30.0);
+        assert!(!scanner.needs_discovery());
     }
 }

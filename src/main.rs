@@ -3,6 +3,7 @@ mod config;
 mod dashboard;
 mod gps;
 mod identity;
+mod logging;
 mod observation;
 mod regions;
 mod sdr;
@@ -105,13 +106,19 @@ struct Cli {
     /// Region code (ISO country, e.g. US, DE, JP) or AUTO — overrides config `region`
     #[arg(long)]
     region: Option<String>,
+
+    /// Log filter, e.g. "warn,azimuth_daemon=debug". RUST_LOG still wins.
+    /// Lets a support session start the sidecar verbose without editing config.
+    #[arg(long)]
+    log_level: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
+    // Parse first: the log directory is derived from --config, and the desktop
+    // sidecar always passes an explicit path. Nothing logs before this point.
     let cli = Cli::parse();
+    let log_handle = logging::init(&cli.config, cli.log_level.as_deref());
 
     // Setup wizard mode
     if cli.setup {
@@ -163,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         scanner_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config_path: cli.config.clone(),
         api_key: Arc::clone(&api_key),
+        log: Arc::clone(&log_handle),
     });
 
     // Spawn status server early so sidecar can always query it
@@ -498,8 +506,13 @@ async fn main() -> anyhow::Result<()> {
     // GPS reader task — provides RTCM3 channel and auto-detection
     let (rtcm_tx, rtcm_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let app_state_gps = Arc::clone(&app_state);
+    // GpsConfig was dead code until now — nothing outside config.rs read it, so
+    // `enabled`/`port`/`baud_rate` had no effect at all. unwrap_or_default() is
+    // only safe because GpsConfig has a hand-written Default (a derived one
+    // would give enabled: false and silently kill GPS fleet-wide).
+    let gps_config = config.gps.clone().unwrap_or_default();
     tokio::spawn(async move {
-        gps::run_gps_task(Arc::clone(&app_state_gps.status), rtcm_rx).await;
+        gps::run_gps_task(Arc::clone(&app_state_gps.status), rtcm_rx, gps_config).await;
     });
 
     // Spawn NTRIP client task
@@ -540,12 +553,20 @@ async fn main() -> anyhow::Result<()> {
         let mut scanner = Scanner::new(scanning_config, config.sdr.dbm_offset);
         let scan_interval = Duration::from_secs(scanner.interval_seconds() as u64);
 
-        // Auto-discovery sweep on first run if mode is "sweep" or "both"
+        // Auto-discovery sweep on first run if mode is "sweep" or "both".
+        // Marked scanner_active so the UI doesn't read "idle" through the
+        // multi-minute sweep.
         if scanner.needs_discovery() {
             info!("Running first-time station discovery sweep");
+            app_state
+                .scanner_active
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let discovery = tokio::task::block_in_place(|| {
                 scanner.discover_stations(&mut sdr_manager)
             });
+            app_state
+                .scanner_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             info!(
                 fm = discovery.fm_stations.len(),
                 lte = discovery.lte_cells.len(),
@@ -602,6 +623,26 @@ async fn main() -> anyhow::Result<()> {
                 }
             } else {
                 cycles_without_sdr = 0;
+            }
+
+            // Repeat discovery. `needs_discovery()` returns false immediately
+            // after a sweep, so this cannot double-run; it fires on the
+            // configured interval, or sooner while the FM list is below the
+            // low-yield floor. Without this, whatever the single startup sweep
+            // happened to find is all the node ever scans.
+            if scanner.needs_discovery() {
+                info!("Re-running station discovery sweep");
+                scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                let discovery = tokio::task::block_in_place(|| {
+                    scanner.discover_stations(&mut sdr_manager)
+                });
+                scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    fm = discovery.fm_stations.len(),
+                    lte = discovery.lte_cells.len(),
+                    dtv = discovery.dtv_channels.len(),
+                    "Re-discovery complete"
+                );
             }
 
             scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);

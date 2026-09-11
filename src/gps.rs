@@ -1,10 +1,13 @@
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{info, warn, debug, error};
 
+use crate::config::GpsConfig;
 use crate::status_server::StatusState;
 
 /// Represents a serial port found on the system
@@ -75,38 +78,234 @@ pub fn list_serial_ports() -> Vec<SerialPortInfo> {
     }
 }
 
-/// Detect a GPS receiver on the available serial ports
-/// Returns (port_name, device_name) if found
-fn detect_gps_port() -> Option<(String, String)> {
+/// Probe priority for a candidate serial port. Lower is tried first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Explicitly pinned by `[gps] port` in config.
+    Configured = 0,
+    /// Matches a known GPS vendor id (u-blox).
+    KnownGps = 1,
+    /// Matches a generic USB-serial bridge commonly used by GPS modules.
+    UsbSerialBridge = 2,
+    /// No usable vid — probed only because valid NMEA is the real proof.
+    Unidentified = 3,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpsCandidate {
+    pub port_name: String,
+    pub device_name: String,
+    pub tier: Tier,
+}
+
+/// Everything `rank_candidates` needs to know, assembled per detection round so
+/// it can pick up live RTK state. Kept separate from `GpsConfig` so the ranker
+/// stays a pure function of its inputs.
+#[derive(Debug, Clone, Default)]
+pub struct GpsProbePolicy {
+    pub enabled: bool,
+    pub forced_port: Option<String>,
+    pub probe_unknown_ports: bool,
+    pub allow_ports: Vec<String>,
+    pub deny_ports: Vec<String>,
+    /// Serial port currently claimed by NTRIP/RTK. Windows COM ports are
+    /// exclusive, so probing this one is a self-inflicted ACCESS_DENIED.
+    pub rtk_serial_port: Option<String>,
+    pub retry_base: Duration,
+    pub retry_max: Duration,
+}
+
+/// Identity of the device behind a port name, so a cache entry can't outlive
+/// the device that earned it (COM numbers get reused).
+///
+/// On Windows an unidentified port reports no vid/pid/serial at all, so this
+/// degrades to name-only there. That is accepted: the disappearance check below
+/// is what actually protects a later hot-plug.
+type PortFingerprint = (Option<u16>, Option<u16>, Option<String>, String);
+
+fn fingerprint(p: &SerialPortInfo) -> PortFingerprint {
+    (
+        p.vid,
+        p.pid,
+        p.serial_number.clone(),
+        p.port_type.clone(),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct BadPort {
+    fingerprint: PortFingerprint,
+    failures: u32,
+    next_retry: Instant,
+}
+
+/// Ports that failed to yield NMEA, with exponential backoff.
+///
+/// Deliberately NOT a blacklist: entries expire, and any port that disappears
+/// from enumeration is dropped outright, so unplugging and replugging a
+/// receiver always re-probes immediately. The cap only ever applies to a port
+/// that is permanently present and permanently silent (an onboard COM port, an
+/// idle Bluetooth port).
+#[derive(Debug, Default)]
+pub struct ProbeCache {
+    entries: HashMap<String, BadPort>,
+}
+
+impl ProbeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop entries whose port is no longer enumerated. A returning port is a
+    /// fresh probe, not a resumed sentence.
+    fn retain_present(&mut self, ports: &[SerialPortInfo]) {
+        let present: std::collections::HashSet<&str> =
+            ports.iter().map(|p| p.port_name.as_str()).collect();
+        self.entries.retain(|name, _| present.contains(name.as_str()));
+    }
+
+    fn is_suppressed(&self, p: &SerialPortInfo, now: Instant) -> bool {
+        match self.entries.get(&p.port_name) {
+            // A different device on the same port name starts clean.
+            Some(bad) if bad.fingerprint != fingerprint(p) => false,
+            Some(bad) => now < bad.next_retry,
+            None => false,
+        }
+    }
+
+    pub fn record_failure(
+        &mut self,
+        p: &SerialPortInfo,
+        now: Instant,
+        base: Duration,
+        max: Duration,
+    ) {
+        let entry = self.entries.entry(p.port_name.clone()).or_insert(BadPort {
+            fingerprint: fingerprint(p),
+            failures: 0,
+            next_retry: now,
+        });
+        if entry.fingerprint != fingerprint(p) {
+            entry.fingerprint = fingerprint(p);
+            entry.failures = 0;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+        let shift = entry.failures.saturating_sub(1).min(16);
+        let backoff = base
+            .checked_mul(1u32 << shift)
+            .unwrap_or(max)
+            .min(max);
+        entry.next_retry = now + backoff;
+    }
+
+    pub fn record_success(&mut self, port_name: &str) {
+        self.entries.remove(port_name);
+    }
+}
+
+/// True for ports the OS tells us are Bluetooth. Only Linux/macOS actually
+/// report this: the Windows backend classifies every non-USB port as `Unknown`,
+/// so on Windows the deny list and the backoff cache are the real protection.
+fn is_bluetooth_port(p: &SerialPortInfo) -> bool {
+    if p.port_type == "bluetooth" {
+        return true;
+    }
+    let n = p.port_name.to_ascii_lowercase();
+    n.contains("rfcomm") || n.contains("bluetooth")
+}
+
+/// Rank the serial ports into a probe order. Pure: no enumeration, no serial
+/// I/O, no clock — so the whole policy is unit-testable, which the original
+/// `detect_gps_port()` was not (it called `list_serial_ports()` internally and
+/// took no arguments).
+pub fn rank_candidates(
+    ports: &[SerialPortInfo],
+    policy: &GpsProbePolicy,
+    cache: &ProbeCache,
+    now: Instant,
+) -> Vec<GpsCandidate> {
+    if !policy.enabled {
+        return Vec::new();
+    }
+
+    // An explicitly configured port wins outright and is exempt from every
+    // heuristic below — including the cache. An override that quietly probes
+    // something else is worse than one that fails loudly.
+    if let Some(forced) = policy.forced_port.as_ref().filter(|s| !s.is_empty()) {
+        let device_name = ports
+            .iter()
+            .find(|p| &p.port_name == forced)
+            .and_then(|p| p.product.clone())
+            .unwrap_or_else(|| "Configured GPS".to_string());
+        return vec![GpsCandidate {
+            port_name: forced.clone(),
+            device_name,
+            tier: Tier::Configured,
+        }];
+    }
+
+    let mut out: Vec<GpsCandidate> = Vec::new();
+
+    for p in ports {
+        if !policy.allow_ports.is_empty() && !policy.allow_ports.contains(&p.port_name) {
+            continue;
+        }
+        if policy.deny_ports.contains(&p.port_name) {
+            continue;
+        }
+        if policy.rtk_serial_port.as_deref() == Some(p.port_name.as_str()) {
+            continue;
+        }
+        if is_bluetooth_port(p) {
+            continue;
+        }
+
+        let tier = if p.vid == Some(UBLOX_VID) {
+            Tier::KnownGps
+        } else if matches!(
+            p.vid,
+            Some(PROLIFIC_VID) | Some(FTDI_VID) | Some(SILICON_LABS_VID) | Some(CH340_VID)
+        ) {
+            Tier::UsbSerialBridge
+        } else if p.vid.is_none() {
+            Tier::Unidentified
+        } else {
+            // A USB device with a vid we don't recognise. Treat it like any
+            // other unidentified port rather than dropping it outright.
+            Tier::Unidentified
+        };
+
+        if tier == Tier::Unidentified && !policy.probe_unknown_ports {
+            continue;
+        }
+        // Backoff applies only to the speculative tiers; a u-blox port keeps
+        // the original aggressive retry cadence.
+        if tier >= Tier::UsbSerialBridge && cache.is_suppressed(p, now) {
+            continue;
+        }
+
+        let device_name = p.product.clone().unwrap_or_else(|| match tier {
+            Tier::KnownGps => "u-blox GPS".to_string(),
+            Tier::UsbSerialBridge => "USB Serial (GPS)".to_string(),
+            _ => format!("Unknown serial device ({})", p.port_name),
+        });
+
+        out.push(GpsCandidate {
+            port_name: p.port_name.clone(),
+            device_name,
+            tier,
+        });
+    }
+
+    out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.port_name.cmp(&b.port_name)));
+    out
+}
+
+/// Thin I/O wrapper around `rank_candidates`.
+fn detect_gps_candidates(policy: &GpsProbePolicy, cache: &mut ProbeCache) -> Vec<GpsCandidate> {
     let ports = list_serial_ports();
-
-    // Highest priority: u-blox (known GPS vendor)
-    for port in &ports {
-        if port.vid == Some(UBLOX_VID) {
-            let device_name = port
-                .product
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| "u-blox GPS".to_string());
-            return Some((port.port_name.clone(), device_name));
-        }
-    }
-
-    // Second priority: other known GPS adapters
-    for port in &ports {
-        if let Some(vid) = port.vid {
-            if vid == PROLIFIC_VID || vid == FTDI_VID || vid == SILICON_LABS_VID || vid == CH340_VID {
-                let device_name = port
-                    .product
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| "USB Serial (GPS)".to_string());
-                return Some((port.port_name.clone(), device_name));
-            }
-        }
-    }
-
-    None
+    cache.retain_present(&ports);
+    rank_candidates(&ports, policy, cache, Instant::now())
 }
 
 /// Check if a line looks like valid NMEA
@@ -194,8 +393,30 @@ fn warn_permission_denied(port: &str) {
         .map(|mut set| set.insert(port.to_string()))
         .unwrap_or(true);
     if first {
-        error!(
-            port = %port,
+        error!(port = %port, "{}", permission_denied_hint(port));
+    } else {
+        debug!(port = %port, "GPS serial port still permission-denied");
+    }
+}
+
+/// Platform-appropriate advice for a permission-denied serial open.
+///
+/// Extracted so it is testable, and split per-OS because the previous single
+/// message told Windows users to run `sudo usermod -aG dialout` — advice that
+/// cannot apply and sends them down the wrong path.
+fn permission_denied_hint(port: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!(
+            "Access denied opening GPS serial port '{port}'. Windows serial ports are exclusive — \
+             exactly one process may hold a handle. Close u-center, PuTTY or any terminal on this \
+             port; check Task Manager for a second azimuth-daemon or an Azimuth Windows service; \
+             and confirm this is not the port configured for RTK/NTRIP serial forwarding."
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!(
             "Permission denied opening GPS serial port '{port}'.\n  \
              On Linux, your user must be in the 'dialout' group:\n    \
              sudo usermod -aG dialout $USER\n  \
@@ -203,9 +424,15 @@ fn warn_permission_denied(port: &str) {
              If running in Docker, ensure the device is passed through:\n    \
              devices: [\"/dev/ttyUSB0:/dev/ttyUSB0\"]\n  \
              and the container has sufficient privileges."
-        );
-    } else {
-        debug!(port = %port, "GPS serial port still permission-denied");
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        format!(
+            "Permission denied opening GPS serial port '{port}'. Another application is most \
+             likely holding the port open — close any other GPS or serial terminal software and \
+             confirm this is not the port configured for RTK/NTRIP serial forwarding."
+        )
     }
 }
 
@@ -275,30 +502,111 @@ fn parse_gga(sentence: &str) -> Option<(f64, f64, f64, u8, u8)> {
 pub async fn run_gps_task(
     state: Arc<RwLock<StatusState>>,
     _rtcm_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    gps_config: GpsConfig,
 ) {
     const DETECTION_INTERVAL_SECS: u64 = 5;
-    const SAMPLE_INTERVAL_SECS: u64 = 10;
     const ACCURACY_HISTORY_MAX: usize = 180;
     const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+    /// Wall-clock ceiling for speculative probing in one detection round, so a
+    /// machine with many unidentified COM ports doesn't stall the loop.
+    const TIER3_PROBE_BUDGET: Duration = Duration::from_secs(20);
 
-    let bauds = &[9600u32, 115200u32, 4800u32];
-    let mut last_sample_time = tokio::time::Instant::now(); // accuracy sampling interval (10s)
+    let sample_interval_secs = gps_config.sample_interval_secs.max(1);
+
+    if !gps_config.enabled {
+        info!("GPS disabled by config ([gps] enabled = false); GPS task parked");
+        return;
+    }
+
+    // A configured port skips auto-detection entirely, so it only needs the one
+    // baud (plus fallbacks). Unidentified ports get 9600 only on first contact —
+    // the VK-162 and u-blox modules default to it — and are promoted to the full
+    // sweep only once they have proven they emit bytes.
+    let full_bauds: Vec<u32> = match gps_config.baud_rate {
+        Some(b) => {
+            let mut v = vec![b, 9600, 115200, 4800];
+            v.dedup();
+            v
+        }
+        None => vec![9600, 115200, 4800],
+    };
+    let first_contact_bauds = &[9600u32];
+
+    let mut cache = ProbeCache::new();
+    let mut last_sample_time = tokio::time::Instant::now(); // accuracy sampling interval
 
     loop {
         debug!("GPS detection scan starting");
 
-        // Try to detect and open GPS
-        let (port_name, device_name) = match detect_gps_port() {
-            Some((port, name)) => (port, name),
+        let rtk_serial_port = {
+            let s = state.read().await;
+            s.rtk_config.as_ref().and_then(|c| c.serial_port.clone())
+        };
+        let policy = GpsProbePolicy {
+            enabled: gps_config.enabled,
+            forced_port: gps_config.port.clone(),
+            probe_unknown_ports: gps_config.probe_unknown_ports,
+            allow_ports: gps_config.allow_ports.clone(),
+            deny_ports: gps_config.deny_ports.clone(),
+            rtk_serial_port,
+            retry_base: Duration::from_secs(gps_config.probe_retry_base_secs.max(1)),
+            retry_max: Duration::from_secs(gps_config.probe_retry_max_secs.max(1)),
+        };
+
+        let candidates = detect_gps_candidates(&policy, &mut cache);
+        if candidates.is_empty() {
+            debug!("No GPS candidates, retrying in {}s", DETECTION_INTERVAL_SECS);
+            tokio::time::sleep(tokio::time::Duration::from_secs(DETECTION_INTERVAL_SECS)).await;
+            continue;
+        }
+
+        // Probe candidates in tier order until one yields valid NMEA. The old
+        // code returned only the first VID match and retried that same port
+        // forever; a port that merely LOOKS like a GPS could therefore mask a
+        // real receiver sitting behind it.
+        let budget_start = Instant::now();
+        let mut opened: Option<(BufReader<tokio_serial::SerialStream>, u32, GpsCandidate)> = None;
+        for cand in &candidates {
+            if cand.tier >= Tier::Unidentified && budget_start.elapsed() > TIER3_PROBE_BUDGET {
+                debug!("Tier-3 probe budget spent for this round; resuming next scan");
+                break;
+            }
+            let bauds: &[u32] = if cand.tier >= Tier::Unidentified {
+                first_contact_bauds
+            } else {
+                &full_bauds
+            };
+            debug!(port = %cand.port_name, tier = ?cand.tier, "Probing serial port for NMEA");
+            if let Some((reader, baud)) = try_open_serial(&cand.port_name, bauds).await {
+                opened = Some((reader, baud, cand.clone()));
+                break;
+            }
+            // Only speculative tiers earn a backoff entry.
+            if cand.tier >= Tier::UsbSerialBridge {
+                if let Some(info) = list_serial_ports()
+                    .into_iter()
+                    .find(|p| p.port_name == cand.port_name)
+                {
+                    cache.record_failure(&info, Instant::now(), policy.retry_base, policy.retry_max);
+                }
+            }
+        }
+
+        let (port_name, device_name) = match &opened {
+            Some((_, _, c)) => (c.port_name.clone(), c.device_name.clone()),
             None => {
-                debug!("No GPS detected, retrying in {}s", DETECTION_INTERVAL_SECS);
+                debug!("No GPS validated this round, retrying in {}s", DETECTION_INTERVAL_SECS);
                 tokio::time::sleep(tokio::time::Duration::from_secs(DETECTION_INTERVAL_SECS)).await;
                 continue;
             }
         };
 
+        // Only claim detection once NMEA actually validated. The previous code
+        // set gps_detected BEFORE try_open_serial, so the UI flashed "detected"
+        // for a port that then failed — and with speculative probing enabled it
+        // would have flashed for every COM port on the machine.
         info!(port = %port_name, device = %device_name, "GPS detected");
-
+        cache.record_success(&port_name);
         {
             let mut s = state.write().await;
             s.gps_detected = true;
@@ -306,8 +614,7 @@ pub async fn run_gps_task(
             s.gps_device_name = Some(device_name.clone());
         }
 
-        // Try to open the serial port with NMEA validation
-        match try_open_serial(&port_name, bauds).await {
+        match opened.map(|(r, b, _)| (r, b)) {
             Some((mut buf_reader, detected_baud)) => {
                 info!(port = %port_name, baud = detected_baud, "GPS connection established");
 
@@ -359,7 +666,7 @@ pub async fn run_gps_task(
                                     s.gps_last_fix = Some(chrono::Utc::now().to_rfc3339());
 
                                     // Sample accuracy history every 10s
-                                    if last_sample_time.elapsed() >= tokio::time::Duration::from_secs(SAMPLE_INTERVAL_SECS) {
+                                    if last_sample_time.elapsed() >= tokio::time::Duration::from_secs(sample_interval_secs) {
                                         last_sample_time = tokio::time::Instant::now();
 
                                         let point = AccuracyPoint {
@@ -501,5 +808,237 @@ mod tests {
     fn nmea_line_valid_accepts_with_trailing_whitespace() {
         // BufReader::read_line includes trailing \n but not leading whitespace from stream
         assert!(nmea_line_valid("$GNGGA,data\n"));
+    }
+
+    // --- detection / ranking ---------------------------------------------
+    //
+    // These are the regression coverage for BUG-4. The old detect_gps_port()
+    // took no arguments and called list_serial_ports() internally, so the
+    // selection policy could not be tested at all — and the policy was the bug:
+    // a port with no usable vid (which is how Windows reports anything it can't
+    // parse as USB) was dropped BEFORE the NMEA validator ever saw it, making a
+    // working receiver permanently invisible.
+
+    fn port(name: &str, vid: Option<u16>, kind: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: kind.to_string(),
+            vid,
+            pid: None,
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+        }
+    }
+
+    fn policy() -> GpsProbePolicy {
+        GpsProbePolicy {
+            enabled: true,
+            forced_port: None,
+            probe_unknown_ports: true,
+            allow_ports: Vec::new(),
+            deny_ports: Vec::new(),
+            rtk_serial_port: None,
+            retry_base: Duration::from_secs(60),
+            retry_max: Duration::from_secs(1800),
+        }
+    }
+
+    #[test]
+    fn unidentified_port_is_probed_not_dropped() {
+        // THE BUG-4 REGRESSION TEST. Previously this yielded zero candidates.
+        let ports = vec![port("COM7", None, "unknown")];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].port_name, "COM7");
+        assert_eq!(got[0].tier, Tier::Unidentified);
+    }
+
+    #[test]
+    fn ublox_vid_ranks_ahead_of_everything_else() {
+        let ports = vec![
+            port("COM3", None, "unknown"),
+            port("COM7", Some(UBLOX_VID), "usb"),
+            port("COM4", Some(FTDI_VID), "usb"),
+        ];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert_eq!(got[0].port_name, "COM7");
+        assert_eq!(got[0].tier, Tier::KnownGps);
+    }
+
+    #[test]
+    fn known_bridge_ranks_above_unidentified() {
+        let ports = vec![
+            port("COM3", None, "unknown"),
+            port("COM4", Some(CH340_VID), "usb"),
+        ];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert_eq!(got[0].port_name, "COM4");
+        assert_eq!(got[1].port_name, "COM3");
+    }
+
+    #[test]
+    fn bluetooth_typed_port_is_never_probed() {
+        let ports = vec![port("COM9", None, "bluetooth")];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn rfcomm_name_is_skipped_even_when_type_is_unknown() {
+        let ports = vec![port("/dev/rfcomm0", None, "unknown")];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn deny_list_wins_over_ublox_vid() {
+        let mut p = policy();
+        p.deny_ports = vec!["COM7".to_string()];
+        let ports = vec![port("COM7", Some(UBLOX_VID), "usb")];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn allow_list_restricts_every_tier() {
+        let mut p = policy();
+        p.allow_ports = vec!["COM4".to_string()];
+        let ports = vec![
+            port("COM7", Some(UBLOX_VID), "usb"),
+            port("COM4", None, "unknown"),
+        ];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].port_name, "COM4");
+    }
+
+    #[test]
+    fn rtk_serial_port_is_skipped_to_avoid_self_inflicted_access_denied() {
+        let mut p = policy();
+        p.rtk_serial_port = Some("COM5".to_string());
+        let ports = vec![port("COM5", Some(UBLOX_VID), "usb")];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn configured_port_is_the_only_candidate() {
+        let mut p = policy();
+        p.forced_port = Some("COM12".to_string());
+        let ports = vec![
+            port("COM7", Some(UBLOX_VID), "usb"),
+            port("COM12", None, "unknown"),
+        ];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].port_name, "COM12");
+        assert_eq!(got[0].tier, Tier::Configured);
+    }
+
+    #[test]
+    fn probe_unknown_ports_false_restores_whitelist_only_behavior() {
+        let mut p = policy();
+        p.probe_unknown_ports = false;
+        let ports = vec![port("COM7", None, "unknown")];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn disabled_policy_yields_no_candidates() {
+        let mut p = policy();
+        p.enabled = false;
+        let ports = vec![port("COM7", Some(UBLOX_VID), "usb")];
+        let got = rank_candidates(&ports, &p, &ProbeCache::new(), Instant::now());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn cache_suppresses_reprobe_until_backoff_expires() {
+        let now = Instant::now();
+        let p = policy();
+        let info = port("COM3", None, "unknown");
+        let mut cache = ProbeCache::new();
+        cache.record_failure(&info, now, Duration::from_secs(60), Duration::from_secs(1800));
+
+        assert!(rank_candidates(&[info.clone()], &p, &cache, now).is_empty());
+        let later = now + Duration::from_secs(61);
+        assert_eq!(rank_candidates(&[info], &p, &cache, later).len(), 1);
+    }
+
+    #[test]
+    fn cache_backoff_grows_then_caps() {
+        let now = Instant::now();
+        let info = port("COM3", None, "unknown");
+        let mut cache = ProbeCache::new();
+        let base = Duration::from_secs(60);
+        let max = Duration::from_secs(1800);
+        for _ in 0..12 {
+            cache.record_failure(&info, now, base, max);
+        }
+        let entry = cache.entries.get("COM3").expect("entry");
+        assert!(entry.next_retry <= now + max);
+    }
+
+    #[test]
+    fn cache_never_suppresses_a_ublox_port() {
+        // Tier 1 keeps the original aggressive 5s retry cadence.
+        let now = Instant::now();
+        let info = port("COM7", Some(UBLOX_VID), "usb");
+        let mut cache = ProbeCache::new();
+        cache.record_failure(&info, now, Duration::from_secs(60), Duration::from_secs(1800));
+        assert_eq!(rank_candidates(&[info], &policy(), &cache, now).len(), 1);
+    }
+
+    #[test]
+    fn cache_entry_dropped_when_port_disappears_so_replug_probes_immediately() {
+        let now = Instant::now();
+        let info = port("COM3", None, "unknown");
+        let mut cache = ProbeCache::new();
+        cache.record_failure(&info, now, Duration::from_secs(60), Duration::from_secs(1800));
+        // Port vanishes (unplugged), then comes back.
+        cache.retain_present(&[]);
+        assert_eq!(rank_candidates(&[info], &policy(), &cache, now).len(), 1);
+    }
+
+    #[test]
+    fn cache_entry_ignored_when_device_fingerprint_changes() {
+        let now = Instant::now();
+        let old = port("COM3", None, "unknown");
+        let mut cache = ProbeCache::new();
+        cache.record_failure(&old, now, Duration::from_secs(60), Duration::from_secs(1800));
+        // Same COM name, different device now behind it.
+        let new = port("COM3", Some(UBLOX_VID), "usb");
+        assert_eq!(rank_candidates(&[new], &policy(), &cache, now).len(), 1);
+    }
+
+    #[test]
+    fn permission_denied_hint_is_platform_appropriate() {
+        let hint = permission_denied_hint("COM7");
+        assert!(hint.contains("COM7"));
+        #[cfg(target_os = "windows")]
+        {
+            assert!(hint.contains("Access denied"));
+            // The old single message sent Windows users to a Linux group.
+            assert!(!hint.contains("dialout"));
+        }
+        #[cfg(target_os = "linux")]
+        assert!(hint.contains("dialout"));
+    }
+
+    #[test]
+    fn gps_config_default_is_enabled_and_probes_unknown_ports() {
+        // Guards the derived-Default trap: #[derive(Default)] ignores serde
+        // defaults and would yield enabled: false, disabling GPS fleet-wide.
+        let c = GpsConfig::default();
+        assert!(c.enabled);
+        assert!(c.probe_unknown_ports);
+    }
+
+    #[test]
+    fn gps_config_absent_section_deserializes_to_enabled() {
+        let cfg: GpsConfig = toml::from_str("").expect("empty [gps] table");
+        assert!(cfg.enabled);
     }
 }
