@@ -436,8 +436,8 @@ fn permission_denied_hint(port: &str) -> String {
     }
 }
 
-/// Extract latitude/longitude/altitude from a GGA sentence
-fn parse_gga(sentence: &str) -> Option<(f64, f64, f64, u8, u8)> {
+/// Extract latitude/longitude/altitude/HDOP from a GGA sentence
+fn parse_gga(sentence: &str) -> Option<(f64, f64, f64, u8, u8, Option<f32>)> {
     // Format: $GPGGA,HHMMSS.SS,DDMM.MMMMM,N/S,DDDMM.MMMMM,E/W,1,12,1.0,ALT,M,0.0,M,,*HH
     let parts: Vec<&str> = sentence.split(',').collect();
     if parts.len() < 10 {
@@ -491,7 +491,24 @@ fn parse_gga(sentence: &str) -> Option<(f64, f64, f64, u8, u8)> {
     // Parse altitude
     let alt: f64 = parts[9].parse().unwrap_or(0.0);
 
-    Some((lat, lon, alt, fix_quality, satellites))
+    // Parse HDOP. Some receivers/fixes leave this field blank, so a parse
+    // failure is a legitimate "unknown" rather than a hard error.
+    let hdop: Option<f32> = parts[8].trim().parse().ok();
+
+    Some((lat, lon, alt, fix_quality, satellites, hdop))
+}
+
+/// Extract ground speed (knots) from a VTG sentence.
+///
+/// Format: $GPVTG,track_true,T,track_mag,M,speed_knots,N,speed_kmh,K,mode*HH
+/// Field 5 is speed in knots; only that field feeds `gps_speed_knots`, which
+/// only GGA parsing was ever wired to (and GGA carries no speed field).
+fn parse_vtg(sentence: &str) -> Option<f32> {
+    let parts: Vec<&str> = sentence.split(',').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    parts[5].trim().parse().ok()
 }
 
 /// Run the GPS reader task
@@ -654,12 +671,13 @@ pub async fn run_gps_task(
 
                             // Try to parse GGA sentence
                             if trimmed.starts_with("$") && trimmed.contains("GGA") {
-                                if let Some((lat, lon, alt, fix_quality, satellites)) = parse_gga(trimmed) {
+                                if let Some((lat, lon, alt, fix_quality, satellites, hdop)) = parse_gga(trimmed) {
                                     let mut s = state.write().await;
 
                                     // Update state from GGA
                                     s.gps_fix_quality = fix_quality;
                                     s.gps_satellites = satellites;
+                                    s.gps_hdop = hdop;
                                     s.gps_latitude = Some(lat);
                                     s.gps_longitude = Some(lon);
                                     s.gps_altitude_m = Some(alt);
@@ -691,6 +709,14 @@ pub async fn run_gps_task(
                                         alt,
                                         "GPS GGA parsed"
                                     );
+                                }
+                            } else if trimmed.starts_with("$") && trimmed.contains("VTG") {
+                                // GGA carries no speed field — VTG is the only
+                                // sentence that ever populates gps_speed_knots.
+                                if let Some(speed_knots) = parse_vtg(trimmed) {
+                                    let mut s = state.write().await;
+                                    s.gps_speed_knots = Some(speed_knots);
+                                    debug!(speed_knots, "GPS VTG parsed");
                                 }
                             }
                         }
@@ -761,7 +787,7 @@ mod tests {
 
     #[test]
     fn parse_gga_accepts_gn_talker() {
-        let (lat, lon, _alt, fix, sats) = parse_gga(GNGGA).expect("$GNGGA must parse");
+        let (lat, lon, _alt, fix, sats, _hdop) = parse_gga(GNGGA).expect("$GNGGA must parse");
         assert!((lat - 41.662568).abs() < 0.001);
         assert!((lon + 91.356510).abs() < 0.001);
         assert_eq!(fix, 1);
@@ -772,6 +798,31 @@ mod tests {
     fn parse_gga_accepts_gp_talker() {
         let parsed = parse_gga(GPGGA).expect("$GPGGA must parse");
         assert_eq!(parsed.3, 1);
+    }
+
+    #[test]
+    fn parse_gga_returns_hdop() {
+        // THE BUG-4 HDOP REGRESSION TEST. Field 8 is documented directly above
+        // parse_gga as HDOP but was never read, so gps_hdop stayed None forever
+        // and a real 1.2 HDOP surfaced downstream as the 999.9 sentinel default.
+        let (.., hdop) = parse_gga(GNGGA).expect("$GNGGA must parse");
+        assert_eq!(hdop, Some(1.2));
+    }
+
+    #[test]
+    fn parse_vtg_returns_speed_knots() {
+        // THE BUG-4 VTG REGRESSION TEST. Only GGA sentences were ever parsed,
+        // and GGA carries no speed field, so gps_speed_knots stayed None for
+        // the lifetime of every GPS session regardless of receiver output.
+        const VTG: &str = "$GPVTG,054.7,T,034.4,M,005.5,N,010.2,K*48";
+        let speed = parse_vtg(VTG).expect("$GPVTG must parse");
+        assert!((speed - 5.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_vtg_rejects_garbage() {
+        assert!(parse_vtg("$GPVTG,too,few").is_none());
+        assert!(parse_vtg("").is_none());
     }
 
     #[test]
