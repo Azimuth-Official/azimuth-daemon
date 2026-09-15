@@ -3,7 +3,7 @@ config.toml
 config.toml.*
 config_*_test.toml
 .env
-*.bak.*
+*.bak*
 *.log
 .serena/
 .azimuth-fix-backups/
