@@ -26,9 +26,21 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build macOS binary
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features
-        env:
-          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=azimuth-daemon
+        # RUSTFLAGS is set inline rather than in an `env:` block on purpose. Actions substitutes
+        # `${{ }}` expressions before the step runs, but it passes `env:` values to the process
+        # verbatim — it does not run them through a shell. So `$HOME` in an `env:` value would stay
+        # the literal four characters `$HOME`, producing a remap rule for a directory of that name,
+        # matching nothing, and scrubbing nothing. Setting it on the command line means the shell
+        # expands `$HOME` while Actions still expands `${{ github.workspace }}`.
+        #
+        # Two rules, because the workspace rule alone was never enough: the paths that actually
+        # leaked into released binaries came from dependency crates under `$HOME/.cargo/registry`,
+        # embedded by `file!()` and panic metadata, not from our own sources. `$HOME` covers those
+        # and `.rustup` too. The rules overlap, which only affects how the workspace path is
+        # rendered — not whether the runner's home directory survives, which is the point.
+        run: |
+          RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=azimuth-daemon --remap-path-prefix=$HOME=/build" \
+            cargo build --release --target ${{ matrix.target }} --no-default-features
 
       - name: Create release archive
         run: |
