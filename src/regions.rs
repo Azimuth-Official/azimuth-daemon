@@ -30,7 +30,12 @@ pub struct DtvStandard {
     pub low_mhz: u64,
     pub high_mhz: u64,
     pub channel_mhz: u64,
+    /// Channel number of the first channel (the channel whose lower edge is `low_mhz`); 0 = unknown.
+    #[serde(default)]
+    pub first_channel: u32,
     pub name: String,
+    #[serde(default)]
+    pub _note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +58,10 @@ pub struct ResolvedRegion {
     pub dtv_sweep_start: u64,
     pub dtv_sweep_end: u64,
     pub dtv_sweep_step: u64,
+    /// DTV standard name from the region database ("DVB-T2-694", "ATSC", ...).
+    pub dtv_standard: String,
+    pub dtv_channel_mhz: u32,
+    pub dtv_first_channel: u32,
     pub skipped_bands: Vec<String>,
 }
 
@@ -156,7 +165,9 @@ impl RegionResolver {
                         low_mhz: 470,
                         high_mhz: 700,
                         channel_mhz: 6,
+                        first_channel: 14,
                         name: "fallback UHF".to_string(),
+                        _note: None,
                     })
             });
 
@@ -176,6 +187,9 @@ impl RegionResolver {
             dtv_sweep_start: dtv_standard.low_mhz * 1_000_000,
             dtv_sweep_end: dtv_end,
             dtv_sweep_step: dtv_standard.channel_mhz * 1_000_000,
+            dtv_standard: region.dtv_standard.clone(),
+            dtv_channel_mhz: dtv_standard.channel_mhz as u32,
+            dtv_first_channel: dtv_standard.first_channel,
             skipped_bands,
         })
     }
@@ -388,6 +402,20 @@ mod tests {
         assert!(resolved.fm_sweep_start > 0);
         assert!(resolved.fm_sweep_end > resolved.fm_sweep_start);
         assert!(resolved.fm_sweep_step > 0);
+    }
+
+    #[test]
+    fn dtt_plans_use_channel_centre_rasters_and_post_700mhz_edges() {
+        let resolver = RegionResolver::new(1766).unwrap();
+        for code in ["GB", "DE", "FR", "ES", "IT", "NL", "SE", "NO", "PL"] {
+            let r = resolver.resolve(code).unwrap();
+            assert_eq!((r.dtv_sweep_start, r.dtv_sweep_end, r.dtv_channel_mhz, r.dtv_first_channel), (470_000_000, 694_000_000, 8, 21), "{code}");
+            assert!(r.dtv_standard.starts_with("DVB"));
+        }
+        let au = resolver.resolve("AU").unwrap();
+        assert_eq!((au.dtv_sweep_start, au.dtv_sweep_end, au.dtv_channel_mhz, au.dtv_first_channel), (526_000_000, 694_000_000, 7, 28));
+        let us = resolver.resolve("US").unwrap();
+        assert_eq!((us.dtv_standard.as_str(), us.dtv_sweep_step, us.dtv_first_channel), ("ATSC", 6_000_000, 14));
     }
 
     #[test]
