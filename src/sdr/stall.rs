@@ -11,12 +11,15 @@
 
 use std::time::Duration;
 
-/// Re-issues of a stalled tune before the error is handed to the recovery ladder.
-pub const TUNE_STALL_RETRIES: u32 = 3;
+/// In-place re-issues of a stalled tune. Hardware showed an in-place retry never
+/// clears this stall (0 of 135), so one cheap attempt only, then the ladder.
+pub const TUNE_STALL_RETRIES: u32 = 1;
+/// Reset+reopen cycles tried for ONE channel before it counts as failed.
+pub const TUNE_LADDER_CYCLES: u32 = 2;
 /// Full open+init attempts before the device is reported as errored.
 pub const INIT_ATTEMPTS: u32 = 5;
 
-/// Wait before re-issue number `attempt` (1-based): 20, 40, 60 ms.
+/// Wait before re-issue number `attempt` (1-based): 20, 40, 60 ms ...
 pub fn stall_backoff(attempt: u32) -> Duration {
     Duration::from_millis(20 * attempt as u64)
 }
@@ -78,6 +81,40 @@ pub fn init_ladder<T, E>(
     }
 }
 
+/// One channel's tune under the full ladder. `slot` holds the open device (None
+/// = lost). On a stall the device is dropped, `reopen` (USB reset + full init)
+/// brings it back and the SAME tune is retried, at most `cycles` times; only
+/// then is the stall returned. A device that is already gone is reopened first,
+/// so one failed channel never strands the rest of the sweep.
+pub fn tune_ladder<D, E>(
+    slot: &mut Option<D>,
+    cycles: u32,
+    is_stall: impl Fn(&E) -> bool,
+    mut tune: impl FnMut(&mut D) -> Result<(), E>,
+    mut reopen: impl FnMut() -> Result<D, E>,
+    mut on_cycle: impl FnMut(u32),
+) -> Result<(), E> {
+    let mut cycle = 0;
+    loop {
+        if slot.is_none() {
+            *slot = Some(reopen()?);
+        }
+        let result = match slot.as_mut() {
+            Some(d) => tune(d),
+            None => continue, // unreachable: just filled above
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if cycle < cycles && is_stall(&e) => {
+                cycle += 1;
+                on_cycle(cycle);
+                *slot = None; // drop the stalled handle before the reset
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,7 +135,7 @@ mod tests {
         let slept = RefCell::new(Vec::new());
         let seen = RefCell::new(Vec::new());
         let r = retry_stalls(
-            TUNE_STALL_RETRIES,
+            3, // the generic helper, independent of the production budget
             is_stall,
             |d| slept.borrow_mut().push(d),
             |a| seen.borrow_mut().push(a),
@@ -183,5 +220,66 @@ mod tests {
             Err(E::Other)
         });
         assert_eq!((r, inits.get(), resets.get()), (Err(E::Other), 1, 0));
+    }
+
+    #[test]
+    fn production_budget_is_one_cheap_retry_then_two_ladder_cycles() {
+        assert_eq!((TUNE_STALL_RETRIES, TUNE_LADDER_CYCLES, INIT_ATTEMPTS), (1, 2, 5));
+    }
+
+    #[test]
+    fn tune_ladder_resets_reopens_and_retries_the_same_tune() {
+        let mut slot = Some(0u32); // handle generation
+        let (tunes, reopens, cycles) = (Cell::new(0), Cell::new(0), RefCell::new(Vec::new()));
+        let r = tune_ladder(
+            &mut slot,
+            TUNE_LADDER_CYCLES,
+            is_stall,
+            |gen| {
+                tunes.set(tunes.get() + 1);
+                // Only a freshly reopened handle (generation >= 1) can tune.
+                if *gen >= 1 { Ok(()) } else { Err(E::Stall) }
+            },
+            || {
+                reopens.set(reopens.get() + 1);
+                Ok(reopens.get())
+            },
+            |c| cycles.borrow_mut().push(c),
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!((tunes.get(), reopens.get()), (2, 1));
+        assert_eq!(*cycles.borrow(), vec![1]);
+        assert_eq!(slot, Some(1));
+    }
+
+    #[test]
+    fn tune_ladder_gives_up_after_two_cycles_and_a_lost_device_heals_on_the_next_call() {
+        let mut slot = Some(0u32);
+        let reopens = Cell::new(0);
+        let r = tune_ladder(&mut slot, 2, is_stall, |_| Err(E::Stall), || {
+            reopens.set(reopens.get() + 1);
+            Ok(9)
+        }, |_| {});
+        assert_eq!((r, reopens.get()), (Err(E::Stall), 2));
+        // Reopen fails: the error comes back, the slot stays empty ...
+        let mut slot: Option<u32> = Some(0);
+        let r = tune_ladder(&mut slot, 2, is_stall, |_| Err(E::Stall), || Err(E::Other), |_| {});
+        assert_eq!(r, Err(E::Other));
+        assert!(slot.is_none());
+        // ... and the next channel reopens first, then tunes.
+        let r = tune_ladder(&mut slot, 2, is_stall, |_| Ok(()), || Ok(5), |_| {});
+        assert_eq!(r, Ok(()));
+        assert_eq!(slot, Some(5));
+    }
+
+    #[test]
+    fn tune_ladder_never_resets_for_a_non_stall_error() {
+        let mut slot = Some(0u32);
+        let reopens = Cell::new(0);
+        let r = tune_ladder(&mut slot, 2, is_stall, |_| Err(E::Other), || {
+            reopens.set(reopens.get() + 1);
+            Ok(1)
+        }, |_| {});
+        assert_eq!((r, reopens.get(), slot), (Err(E::Other), 0, Some(0)));
     }
 }

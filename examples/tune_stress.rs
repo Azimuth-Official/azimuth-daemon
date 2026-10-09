@@ -150,7 +150,7 @@ pub fn main() {
     }
 
     let t0 = Instant::now();
-    let (mut steps, mut failures, mut reopens) = (0u32, 0u32, 0u32);
+    let (mut steps, mut failures) = (0u32, 0u32);
     let mut buf = vec![0u8; o.capture_bytes];
     let counter = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     for pass in 0..o.passes {
@@ -160,49 +160,37 @@ pub fn main() {
             let t = Instant::now();
             let stalls_before = counter(&dongle::TUNE_STALL_RETRIES_TOTAL);
 
-            // Device lost earlier (reopen failed)? Keep trying: never abort the sweep.
-            if sdr.is_none() && tolerant {
-                reopens += 1;
-                sdr = dongle::reset_and_reopen(&params).ok();
-            }
-
-            let (tune, capture) = match sdr.as_mut() {
-                None => (Err("no device".to_string()), Err("no device".to_string())),
-                Some(d) => {
-                    let mut tune = if tolerant {
-                        dongle::tune(d, f).map_err(|e| e.to_string())
-                    } else {
-                        d.set_center_freq(f).map_err(|e| e.to_string())
-                    };
-                    if tolerant && tune.is_err() {
-                        // Persistent stall: the daemon's recovery, USB reset first.
-                        println!("STALL_PERSISTENT f={f}: reset and reopen");
-                        reopens += 1;
-                        drop(sdr.take());
-                        sdr = dongle::reset_and_reopen(&params).ok();
-                        tune = match sdr.as_mut() {
-                            Some(d) => dongle::tune(d, f).map_err(|e| e.to_string()),
-                            None => Err("reopen failed".to_string()),
-                        };
-                    }
-                    if o.settle_ms > 0 {
-                        std::thread::sleep(Duration::from_millis(o.settle_ms));
-                    }
-                    let mut capture = Ok(0usize);
-                    if tune.is_ok() && o.capture_bytes > 0 {
-                        if let Some(d) = sdr.as_mut() {
-                            if o.reset_buffer {
-                                let _ = d.reset_buffer();
-                            }
-                            capture = d.read_sync(&mut buf).map_err(|e| e.to_string());
-                            if o.reset_after {
-                                let _ = d.reset_buffer();
-                            }
-                        }
-                    }
-                    (tune, capture)
+            // Tolerant = the daemon's own per-channel ladder: one in-place retry,
+            // then up to two USB-reset + full-init cycles that retry the SAME tune.
+            // A device lost earlier is reopened first, so a failed channel never
+            // strands the rest of the sweep.
+            let tune: Result<(), String> = if tolerant {
+                dongle::tune_with_ladder(&mut sdr, &params, f).map_err(|e| e.to_string())
+            } else {
+                match sdr.as_mut() {
+                    Some(d) => d.set_center_freq(f).map_err(|e| e.to_string()),
+                    None => Err("no device".to_string()),
                 }
             };
+            if o.settle_ms > 0 {
+                std::thread::sleep(Duration::from_millis(o.settle_ms));
+            }
+            let mut capture: Result<usize, String> = Ok(0);
+            if tune.is_ok() && o.capture_bytes > 0 {
+                capture = match sdr.as_mut() {
+                    Some(d) => {
+                        if o.reset_buffer {
+                            let _ = d.reset_buffer();
+                        }
+                        let r = d.read_sync(&mut buf).map_err(|e| e.to_string());
+                        if o.reset_after {
+                            let _ = d.reset_buffer();
+                        }
+                        r
+                    }
+                    None => Err("no device".to_string()),
+                };
+            }
             let ok = tune.is_ok() && capture.is_ok();
             println!(
                 "pass={pass} step={steps} f={f} elapsed_ms={} step_ms={} stall_retries={} tune={} capture={}",
@@ -227,11 +215,12 @@ pub fn main() {
         }
     }
     println!(
-        "SUMMARY steps={steps} failures={failures} tune_stall_retries={} tune_stalls_recovered={} init_stall_resets={} init_failures={} reopens={reopens} device_error={:?} elapsed_ms={}",
+        "SUMMARY steps={steps} failures={failures} tune_stall_retries={} tune_stalls_recovered={} init_stall_resets={} init_failures={} ladder_cycles={} device_error={:?} elapsed_ms={}",
         counter(&dongle::TUNE_STALL_RETRIES_TOTAL),
         counter(&dongle::TUNE_STALLS_RECOVERED),
         counter(&dongle::INIT_STALL_RESETS),
         counter(&dongle::INIT_FAILURES),
+        counter(&dongle::TUNE_LADDER_CYCLES_TOTAL),
         dongle::device_error(),
         t0.elapsed().as_millis()
     );

@@ -28,6 +28,8 @@ pub static TUNE_STALLS_RECOVERED: AtomicU64 = AtomicU64::new(0);
 pub static TUNE_STALL_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Init attempts that stalled and were answered with a USB reset + redo.
 pub static INIT_STALL_RESETS: AtomicU64 = AtomicU64::new(0);
+/// Reset+reopen cycles run for a channel whose tune kept stalling.
+pub static TUNE_LADDER_CYCLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Opens that exhausted the whole init ladder.
 pub static INIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Last reason the device could not be brought up; cleared on success.
@@ -222,6 +224,30 @@ pub fn tune(dev: &mut RtlSdr, freq_hz: u32) -> Result<(), RtlsdrError> {
         || dev.set_center_freq(freq_hz),
     );
     if result.is_ok() && stalled.get() > 0 {
+        TUNE_STALLS_RECOVERED.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// One channel's tune under the full ladder: an in-place retry (cheap, rarely
+/// useful), then up to two USB-reset + full-init cycles that retry the SAME tune
+/// before the channel counts as failed. `slot` is the open device; None means it
+/// was lost and is reopened first.
+pub fn tune_with_ladder(slot: &mut Option<RtlSdr>, p: &InitParams, freq_hz: u32) -> Result<(), RtlsdrError> {
+    let cycled = std::cell::Cell::new(0u32);
+    let result = stall::tune_ladder(
+        slot,
+        stall::TUNE_LADDER_CYCLES,
+        is_rtl_stall,
+        |d| tune(d, freq_hz),
+        || reset_and_reopen(p),
+        |c| {
+            cycled.set(c);
+            TUNE_LADDER_CYCLES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            warn!(index = p.index, freq_hz, cycle = c, "Tune still stalling; USB reset, reinit, same tune again");
+        },
+    );
+    if result.is_ok() && cycled.get() > 0 {
         TUNE_STALLS_RECOVERED.fetch_add(1, Ordering::Relaxed);
     }
     result

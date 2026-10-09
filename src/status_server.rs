@@ -113,6 +113,8 @@ pub struct SdrDiagnostics {
     /// Every re-issued tune after a stall, and open attempts that exhausted the ladder.
     pub tune_stall_retries: u64,
     pub init_failures: u64,
+    /// USB-reset + reinit cycles run because a channel's tune kept stalling.
+    pub tune_ladder_cycles: u64,
     /// Why the dongle could not be brought up (null when it is fine).
     pub device_error: Option<String>,
 }
@@ -382,6 +384,7 @@ impl StatusState {
                 open_usb_resets: crate::sdr::INIT_STALL_RESETS.load(Ordering::Relaxed),
                 tune_stall_retries: crate::sdr::dongle::TUNE_STALL_RETRIES_TOTAL.load(Ordering::Relaxed),
                 init_failures: crate::sdr::dongle::INIT_FAILURES.load(Ordering::Relaxed),
+                tune_ladder_cycles: crate::sdr::dongle::TUNE_LADDER_CYCLES_TOTAL.load(Ordering::Relaxed),
                 device_error: crate::sdr::dongle::device_error(),
             },
         }

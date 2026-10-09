@@ -136,6 +136,13 @@ fn tuner_gain_from_setting(gain: &GainSetting) -> TunerGain {
     }
 }
 
+fn gain_to_dongle(gain: &GainSetting) -> dongle::Gain {
+    match tuner_gain_from_setting(gain) {
+        TunerGain::Manual(t) => dongle::Gain::ManualTenthsDb(t),
+        _ => dongle::Gain::Auto,
+    }
+}
+
 /// Generate machine-scoped SDR serial number from fingerprint and index.
 /// Format: SDR-{fingerprint_prefix}-{index:04}
 /// Example: SDR-a1b2c3d4-0001
@@ -155,7 +162,10 @@ pub struct SdrDeviceConfig {
 
 /// Individual SDR device handle.
 pub struct SdrDevice {
-    device: RtlSdr,
+    /// None only after a failed reopen; the next tune reopens it.
+    device: Option<RtlSdr>,
+    /// False for an Android USB-fd device, which cannot be reopened by index.
+    reopenable: bool,
     index: u32,
     serial: String,
     config: SdrDeviceConfig,
@@ -178,7 +188,7 @@ impl SdrDevice {
 
     /// Tuner chip name ("R820T", "R828D", ...), read from the open handle.
     pub fn tuner_id(&self) -> Option<String> {
-        self.device.get_tuner_id().ok().map(|t| t.to_string())
+        self.device.as_ref()?.get_tuner_id().ok().map(|t| t.to_string())
     }
 
     /// Prove the open handle still streams: read a small IQ block.
@@ -208,28 +218,51 @@ impl SdrDevice {
             );
         }
         CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
-        // Stall-tolerant tune (see `dongle`): re-issued on a USB control stall,
-        // and only a stall that persists is handed to the recovery ladder.
-        dongle::tune(&mut self.device, freq_hz as u32)
-            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
+        // Stall-tolerant tune (see `dongle`): one cheap in-place retry, then up to
+        // two USB-reset + full-init cycles that retry the SAME tune. Only then is
+        // the stall handed to the scanner's recovery ladder.
+        let result = if self.reopenable {
+            let params = self.init_params();
+            dongle::tune_with_ladder(&mut self.device, &params, freq_hz as u32)
+        } else {
+            match self.device.as_mut() {
+                Some(d) => dongle::tune(d, freq_hz as u32),
+                None => Err(rtl_sdr_rs::error::RtlsdrError::RtlsdrErr("device not open".to_string())),
+            }
+        };
+        result.map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
+    }
+
+    fn init_params(&self) -> dongle::InitParams {
+        dongle::InitParams {
+            index: self.index,
+            sample_rate: self.config.sample_rate,
+            gain: gain_to_dongle(&self.config.gain),
+            freq_correction_ppm: self.config.freq_correction_ppm,
+        }
     }
 
     #[allow(dead_code)]
     pub fn set_gain(&mut self, gain: &GainSetting) -> anyhow::Result<()> {
-        self.device
+        let Some(device) = self.device.as_mut() else {
+            anyhow::bail!("device not open");
+        };
+        device
             .set_tuner_gain(tuner_gain_from_setting(gain))
             .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))
     }
 
     /// Capture raw IQ bytes. num_bytes should be even (2 bytes per sample).
     pub fn capture_raw(&self, num_bytes: usize) -> anyhow::Result<Vec<u8>> {
-        if let Err(e) = self.device.reset_buffer() {
+        let Some(device) = self.device.as_ref() else {
+            anyhow::bail!("device not open");
+        };
+        if let Err(e) = device.reset_buffer() {
             warn!(error = %e, "reset_buffer before read failed");
         }
 
         let mut buf = vec![0u8; num_bytes];
-        let n_read = self
-            .device
+        let n_read = device
             .read_sync(&mut buf)
             .map_err(|e| anyhow::Error::new(e).context("read_sync"))?;
 
@@ -246,7 +279,7 @@ impl SdrDevice {
 impl Drop for SdrDevice {
     fn drop(&mut self) {
         info!(index = self.index, serial = %self.serial, "Closing SDR device");
-        if let Err(e) = self.device.close() {
+        if let Some(Err(e)) = self.device.as_mut().map(|d| d.close()) {
             warn!(index = self.index, serial = %self.serial, error = %e, "Failed to close SDR device cleanly");
         }
     }
@@ -338,10 +371,7 @@ impl SdrManager {
         let params = dongle::InitParams {
             index,
             sample_rate,
-            gain: match tuner_gain_from_setting(gain) {
-                TunerGain::Manual(t) => dongle::Gain::ManualTenthsDb(t),
-                _ => dongle::Gain::Auto,
-            },
+            gain: gain_to_dongle(gain),
             freq_correction_ppm,
         };
         let device = dongle::open_with_ladder(&params)
@@ -351,7 +381,8 @@ impl SdrManager {
         let serial = generate_sdr_serial(index);
 
         Ok(SdrDevice {
-            device,
+            device: Some(device),
+            reopenable: true,
             index,
             serial,
             config: SdrDeviceConfig {
@@ -405,7 +436,8 @@ impl SdrManager {
 
         Ok(Self {
             devices: vec![SdrDevice {
-                device,
+                device: Some(device),
+                reopenable: false,
                 index: 0,
                 serial,
                 config: SdrDeviceConfig {
