@@ -1070,4 +1070,28 @@ mod tests {
         assert_eq!(estimate_sdr_multiplier(&fm, 4), 2.0);
         assert_eq!(estimate_sdr_multiplier(&lte, 4), 1.0);
     }
+
+    // X4: real signal type names (not bare categories) must map to their
+    // category before the spacing rule is applied.
+    #[test]
+    fn real_fm_rds_type_uses_fm_spacing() {
+        let signals = [signal("fm_rds", 98_500_000), signal("fm_rds", 98_600_000)];
+        assert_eq!(estimate_sdr_multiplier(&signals, 4), 1.0);
+    }
+
+    #[test]
+    fn real_lte_pss_type_uses_lte_spacing() {
+        let signals = [signal("lte_pss", 750_000_000), signal("lte_pss", 753_000_000)];
+        assert_eq!(estimate_sdr_multiplier(&signals, 4), 1.0);
+    }
+
+    #[test]
+    fn real_dtv_types_use_dtv_spacing() {
+        for t in ["dtv_atsc", "dtv_dvbt", "dtv_dvbt2"] {
+            let close = [signal(t, 600_000_000), signal(t, 602_000_000)];
+            assert_eq!(estimate_sdr_multiplier(&close, 4), 1.0, "{t} 2 MHz apart counts once");
+            let far = [signal(t, 600_000_000), signal(t, 606_000_000)];
+            assert_eq!(estimate_sdr_multiplier(&far, 4), 2.0, "{t} 6 MHz apart counts twice");
+        }
+    }
 }
