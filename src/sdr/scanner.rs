@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use super::dtv::dvb;
-use super::fm_demod::survey::{evaluate_adaptive, plan_captures, CapturePlan, SurveyConfig};
+use super::fm_demod::survey::{evaluate_adaptive, plan_captures, update_hold_streaks, CapturePlan, SurveyConfig};
 
 /// Result from a single scan operation.
 pub struct ScanResult {
@@ -161,6 +161,8 @@ pub struct Scanner {
     sweep_shared: Arc<Mutex<SweepReport>>,
     /// Running count of tunes that returned failure (see `tune_with_recovery`).
     tune_fail_count: u32,
+    /// Consecutive sweeps each FM station has been kept on power alone (`held`).
+    fm_hold: HashMap<u64, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -299,6 +301,7 @@ impl Scanner {
             sweep: SweepReport::default(),
             sweep_shared: Arc::new(Mutex::new(SweepReport::default())),
             tune_fail_count: 0,
+            fm_hold: HashMap::new(),
         };
         scanner.fm_frequencies.sort_unstable();
         scanner.lte_frequencies.sort_unstable();
@@ -332,6 +335,7 @@ impl Scanner {
         self.max_observations_per_cycle = fresh.max_observations_per_cycle;
         self.dtv_plan = fresh.dtv_plan;
         self.sweep = SweepReport::default();
+        self.fm_hold.clear();
         self.publish_sweep();
         info!(
             fm_range_mhz = format!("{}-{}", self.fm_config.sweep_start / 1_000_000, self.fm_config.sweep_end / 1_000_000),
@@ -571,7 +575,7 @@ impl Scanner {
         let sample_rate = sdr_manager.device(0).map(|d| d.sample_rate()).unwrap_or(2_048_000);
         let plans = plan_captures(self.fm_config.sweep_start, self.fm_config.sweep_end, self.fm_config.sweep_step, sample_rate);
         // Hysteresis: stations known from earlier sweeps (or configured) keep lowered gates.
-        let cfg = SurveyConfig { channel_step_hz: self.fm_config.sweep_step as f64, known: self.fm_frequencies.clone(), ..SurveyConfig::default() };
+        let cfg = SurveyConfig { channel_step_hz: self.fm_config.sweep_step as f64, known: self.fm_frequencies.clone(), held_streak: self.fm_hold.iter().map(|(k, v)| (*k, *v)).collect(), ..SurveyConfig::default() };
         self.fm_survey_run(plans, |sc, plan| sc.survey_capture(sdr_manager, plan, sample_rate, &cfg))
     }
 
@@ -594,6 +598,7 @@ impl Scanner {
             match capture(self, plan) {
                 Some(r) => {
                     consecutive = 0;
+                    update_hold_streaks(&mut self.fm_hold, &r);
                     Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
                 }
                 None => {
@@ -620,6 +625,7 @@ impl Scanner {
                 match capture(self, plan) {
                     Some(r) => {
                         consecutive = 0;
+                        update_hold_streaks(&mut self.fm_hold, &r);
                         Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
                     }
                     None => {
@@ -672,7 +678,7 @@ impl Scanner {
                 "FM channel evaluated"
             );
             if c.confirmed {
-                info!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), marginal = c.marginal, "FM station found");
+                info!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), marginal = c.marginal, held = c.held, "FM station found");
                 found.push(c.freq_hz);
             } else if c.image_of_mirror || c.spill_of_neighbour {
                 *images += 1;
