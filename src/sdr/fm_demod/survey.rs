@@ -44,17 +44,21 @@ pub const CHANNEL_HZ: f64 = 200_000.0;
 
 #[derive(Debug, Clone)]
 pub struct SurveyConfig {
-    /// Candidate gate: power within +-50 kHz of the channel centre above the capture noise floor (dB).
+    /// Candidate pre-filter (low on purpose; the discriminator `min_quality_db` gate decides, being much steeper than power): power within +-50 kHz of the channel centre above the capture noise floor (dB).
     pub min_excess_db: f64,
     /// Confirmation gate: discriminator quality (dB, noise reads about 0).
     pub min_quality_db: f64,
     /// Channel raster spacing (Hz): 200 kHz in the Americas/Korea, 100 kHz elsewhere.
     pub channel_step_hz: f64,
+    /// Stations found earlier (previous sweeps / configured): they stay with
+    /// both gates lowered by `hysteresis_db`, a new one needs the full gate.
+    pub known: Vec<u64>,
+    pub hysteresis_db: f64,
 }
 
 impl Default for SurveyConfig {
     fn default() -> Self {
-        SurveyConfig { min_excess_db: 6.0, min_quality_db: 10.0, channel_step_hz: 200_000.0 }
+        SurveyConfig { min_excess_db: 3.0, min_quality_db: 10.0, channel_step_hz: 200_000.0, known: Vec::new(), hysteresis_db: 2.0 }
     }
 }
 
@@ -72,6 +76,8 @@ pub struct FmChannel {
     pub image_of_mirror: bool,
     /// Rejected as the spill of a much stronger neighbouring channel (same audio, same sign).
     pub spill_of_neighbour: bool,
+    /// Mirror channel >20 dB stronger: needs `IMAGE_PRONE_MIN_EXCESS_DB` to be a station.
+    pub image_prone: bool,
     pub confirmed: bool,
 }
 
@@ -104,6 +110,89 @@ pub fn plan_captures(start: u64, end: u64, step: u64, sample_rate: u32) -> Vec<C
             CapturePlan { centre_hz: centre, channels: c.to_vec() }
         })
         .collect()
+}
+
+/// Median of the finite values; non-finite (not evaluated) count as -inf. For an
+/// even count the lower middle element is used (conservative).
+fn median_or_neg_inf(v: &[f64]) -> f64 {
+    let mut x: Vec<f64> = v.iter().map(|a| if a.is_finite() { *a } else { f64::NEG_INFINITY }).collect();
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x[(x.len() - 1) / 2]
+}
+
+/// How many extra captures a borderline plan gets.
+pub const EXTRA_CAPTURES: usize = 2;
+
+/// A capture is borderline when some channel sits near either gate: its
+/// decision would flip with ordinary noise or fading.
+pub fn is_borderline(r: &[FmChannel], cfg: &SurveyConfig) -> bool {
+    r.iter().any(|c| {
+        let relax = if cfg.known.contains(&c.freq_hz) { cfg.hysteresis_db } else { 0.0 };
+        let (gx, gq) = (cfg.min_excess_db - relax, cfg.min_quality_db - relax);
+        c.excess_db >= gx - 1.0 && (c.excess_db < gx + 8.0 || (c.quality_db.is_nan() || c.quality_db < gq + 8.0))
+    })
+}
+
+/// Decide each channel on the median evidence of several captures of the same
+/// tune: median excess and median quality against the gates, image/spill by
+/// majority. Deterministic for a given set of captures.
+pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmChannel> {
+    let n = runs.iter().map(Vec::len).min().unwrap_or(0);
+    (0..n)
+        .map(|i| {
+            let col: Vec<&FmChannel> = runs.iter().map(|r| &r[i]).collect();
+            let best = col.iter().copied().max_by(|a, b| a.quality_db.partial_cmp(&b.quality_db).unwrap_or(std::cmp::Ordering::Less)).unwrap_or(col[0]);
+            let f = col[0].freq_hz;
+            let relax = if cfg.known.contains(&f) { cfg.hysteresis_db } else { 0.0 };
+            let excess = median_or_neg_inf(&col.iter().map(|c| c.excess_db).collect::<Vec<_>>());
+            let quality = median_or_neg_inf(&col.iter().map(|c| c.quality_db).collect::<Vec<_>>());
+            let spill_votes = col.iter().filter(|c| c.image_of_mirror || c.spill_of_neighbour).count();
+            let rejected = spill_votes * 2 > col.len();
+            let prone = col.iter().filter(|c| c.image_prone).count() * 2 > col.len();
+            let confirmed = excess >= cfg.min_excess_db - relax
+                && quality >= cfg.min_quality_db - relax
+                && !rejected
+                && (!prone || excess >= IMAGE_PRONE_MIN_EXCESS_DB);
+            FmChannel {
+                freq_hz: f,
+                power_dbfs: col[0].power_dbfs,
+                excess_db: excess,
+                quality_db: quality,
+                pilot_db: if confirmed { best.pilot_db } else { None },
+                rds_pi: if confirmed { col.iter().find_map(|c| c.rds_pi) } else { None },
+                image_of_mirror: rejected && col.iter().filter(|c| c.image_of_mirror).count() * 2 > col.len(),
+                spill_of_neighbour: rejected && col.iter().filter(|c| c.spill_of_neighbour).count() * 2 > col.len(),
+                image_prone: prone,
+                confirmed,
+            }
+        })
+        .collect()
+}
+
+/// Evaluate a capture; if any channel is borderline, take up to `EXTRA_CAPTURES`
+/// more captures through `more` (same tune) and decide on the combined evidence.
+pub fn evaluate_adaptive(
+    first_iq: &[u8],
+    sample_rate: u32,
+    centre_hz: u64,
+    channels: &[u64],
+    cfg: &SurveyConfig,
+    more: &mut dyn FnMut() -> Option<Vec<u8>>,
+) -> Vec<FmChannel> {
+    let first = evaluate_capture(first_iq, sample_rate, centre_hz, channels, cfg);
+    if first.is_empty() || !is_borderline(&first, cfg) {
+        return first;
+    }
+    let mut runs = vec![first];
+    for _ in 0..EXTRA_CAPTURES {
+        if let Some(iq) = more() {
+            let r = evaluate_capture(&iq, sample_rate, centre_hz, channels, cfg);
+            if r.len() == runs[0].len() {
+                runs.push(r);
+            }
+        }
+    }
+    if runs.len() == 1 { runs.pop().unwrap_or_default() } else { combine_captures(&runs, cfg) }
 }
 
 fn abs_corr(a: &[f32], b: &[f32]) -> f64 {
@@ -203,6 +292,9 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
         // leaks into the OUTER part of the channel (its energy sits at +-100 kHz).
         let inner_power = inner_of(k0);
         let excess_db = 10.0 * (inner_power / (floor_bin * (2 * inner) as f64)).log10();
+        let relax = if cfg.known.contains(&f) { cfg.hysteresis_db } else { 0.0 };
+        let gate_x = cfg.min_excess_db - relax;
+        let gate_q = cfg.min_quality_db - relax;
         let mut ch = FmChannel {
             freq_hz: f,
             power_dbfs: 10.0 * ch_power.max(1e-18).log10(),
@@ -212,9 +304,10 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             rds_pi: None,
             image_of_mirror: false,
             spill_of_neighbour: false,
+            image_prone: false,
             confirmed: false,
         };
-        if off.abs() < 0.95e6 && excess_db >= cfg.min_excess_db {
+        if off.abs() < 0.95e6 && excess_db >= gate_x {
             let d_raw = discriminator(k0);
             let mut d: Vec<C32> = d_raw.iter().map(|v| C32::new(*v, 0.0)).collect();
             fft_d.process(&mut d);
@@ -234,7 +327,15 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             } else {
                 false
             };
+            // A channel whose mirror is >20 dB stronger can hold nothing but the
+            // -27 dB image of it unless a real station clearly exceeds that image
+            // (the image is only a few dB above the noise floor). Demand 8 dB there;
+            // a station weaker than that, sitting exactly on the image of a much
+            // stronger one, is indistinguishable and is not reported.
+            let image_prone = mirror_power > inner_power * 100.0 && off.abs() > 25_000.0;
+            let image_floor_ok = !image_prone || excess_db >= IMAGE_PRONE_MIN_EXCESS_DB;
             ch.image_of_mirror = image;
+            ch.image_prone = image_prone;
             // Adjacent-channel spill: a much stronger channel within 400 kHz
             // leaks into this channel's window with ITS audio (same sign). Independent
             // programmes do not correlate, so a high correlation means spill, not a
@@ -248,7 +349,7 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             let (min_ratio, min_corr, max_m) = if dense { (2.0, 0.3, 2) } else { (10.0, 0.5, 1) };
             let reach = max_m * step_k;
             let mut spill = false;
-            if ch.quality_db >= cfg.min_quality_db && !image && step_k > 0 {
+            if ch.quality_db >= gate_q && !image && step_k > 0 {
                 let mut m = 1;
                 'outer: while m * step_k <= reach {
                     for nk in [k0 - m * step_k, k0 + m * step_k] {
@@ -267,7 +368,7 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             // centre). One-sided energy: a station is centred in its window, so its power is
             // balanced either side of the centre; energy piled up against ONE window
             // edge belongs to a neighbour centred outside (the 100 kHz raster case).
-            if dense && ch.quality_db >= cfg.min_quality_db && !image && !spill {
+            if dense && ch.quality_db >= gate_q && !image && !spill {
                 let gap = ((5_000.0 / bin_hz).round() as isize).max(1);
                 let half = (b / 2) as isize;
                 let side = |from: isize, to: isize| -> f64 { (from..to).map(|j| power((k0 + j).rem_euclid(m as isize) as usize)).sum() };
@@ -277,7 +378,7 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
                 }
             }
             ch.spill_of_neighbour = spill;
-            if ch.quality_db >= cfg.min_quality_db && !image && !spill {
+            if ch.quality_db >= gate_q && !image && !spill && image_floor_ok {
                 ch.confirmed = true;
                 let pil = mean_of(band(18_900.0, 19_100.0));
                 let nb = (mean_of(band(17_000.0, 18_500.0)) + mean_of(band(19_500.0, 21_000.0))) / 2.0;
@@ -290,6 +391,9 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
     }
     out
 }
+
+/// Minimum excess for a channel whose mirror channel is >20 dB stronger (see `evaluate_capture`).
+pub const IMAGE_PRONE_MIN_EXCESS_DB: f64 = 8.0;
 
 /// Discriminator-noise calibration: with pure noise in the channel the ratio of
 /// 0.1-15 kHz to 72-90 kHz density is about -20 dB (noise density rises with
@@ -529,5 +633,112 @@ mod tests {
             println!("100 kHz raster, station 200 kHz from a strong one, {weak_db} dB: found {found}/20");
             assert_eq!(found, 20, "100 kHz raster, weak {weak_db} dB");
         }
+    }
+
+    /// One simulated sweep of the 8-channel scene: station levels are jittered by
+    /// slow fading (sigma 1.5 dB, fixed for the sweep) plus 0.5 dB per capture.
+    /// Returns the set of confirmed channel indices.
+    fn faded_sweep(sweep: u64, base: &[(usize, f64)], total_snr_db: f64, cfg: &SurveyConfig, adaptive: bool) -> Vec<usize> {
+        let mut rng = Rng::new(0xFADE + sweep * 7919);
+        let slow: Vec<f64> = base.iter().map(|_| 1.5 * rng.gauss()).collect();
+        let mut cap = 0u64;
+        let mut make = |sweep: u64, cap: u64, rng_extra: f64| {
+            let mut r2 = Rng::new(0xC0FFEE + sweep * 104_729 + cap * 31);
+            let st: Vec<(usize, f64)> = base.iter().zip(&slow).map(|((i, db), sl)| (*i, db + sl + 0.5 * r2.gauss() + rng_extra)).collect();
+            scene(70_000 + sweep * 100 + cap, &st, total_snr_db)
+        };
+        let (iq, chans, centre) = make(sweep, cap, 0.0);
+        let r = if adaptive {
+            let mut more = || {
+                cap += 1;
+                Some(make(sweep, cap, 0.0).0)
+            };
+            evaluate_adaptive(&iq, 2_048_000, centre, &chans, cfg, &mut more)
+        } else {
+            evaluate_capture(&iq, 2_048_000, centre, &chans, cfg)
+        };
+        r.iter().enumerate().filter(|(_, c)| c.confirmed).map(|(i, _)| i).collect()
+    }
+
+    fn jaccard(a: &[usize], b: &[usize]) -> f64 {
+        let inter = a.iter().filter(|x| b.contains(x)).count() as f64;
+        let uni = (a.len() + b.len()) as f64 - inter;
+        if uni == 0.0 { 1.0 } else { inter / uni }
+    }
+
+    /// Strong stations at ch0 (0 dB) and ch7 (-6 dB); marginal stations at ch3, ch4, ch5 with
+    /// in-channel SNR near the decision boundary. ch2 is left empty and is neither adjacent to a
+    /// strong station nor the image of one. A weak station sitting on the image of a strong one,
+    /// or an empty channel right beside one, is inherently ambiguous and not part of this test.
+    fn marginal_base(ch_snr: [f64; 3], total: f64) -> Vec<(usize, f64)> {
+        let off = total + 10.1;
+        vec![(0, 0.0), (7, -6.0), (3, ch_snr[0] - off), (4, ch_snr[1] - off), (5, ch_snr[2] - off)]
+    }
+
+    #[test]
+    fn marginal_station_sets_are_stable_across_sweeps() {
+        let total = 30.0;
+        let base = marginal_base([1.0, 2.5, 4.0], total);
+        let mut known: Vec<u64> = Vec::new();
+        let mut sets: Vec<Vec<usize>> = Vec::new();
+        let chans: Vec<u64> = (0..8).map(|i| 98_000_000 - 700_000 + 200_000 * i as u64).collect();
+        for sweep in 0..6u64 {
+            let cfg = SurveyConfig { known: known.clone(), ..SurveyConfig::default() };
+            let set = faded_sweep(sweep, &base, total, &cfg, true);
+            // Hysteresis memory: stations found stay known for later sweeps.
+            for &i in &set {
+                if !known.contains(&chans[i]) {
+                    known.push(chans[i]);
+                }
+            }
+            println!("sweep {sweep}: {set:?}");
+            sets.push(set);
+        }
+        let mut min_j: f64 = 1.0;
+        for a in 0..sets.len() {
+            for b in a + 1..sets.len() {
+                min_j = min_j.min(jaccard(&sets[a], &sets[b]));
+            }
+        }
+        println!("min pairwise Jaccard over {} sweeps: {min_j:.2}", sets.len());
+        for s in &sets {
+            assert!(s.contains(&0) && s.contains(&7), "strong stations must always be found: {s:?}");
+            assert!(!s.contains(&2), "empty channels must stay empty: {s:?}");
+        }
+        assert!(min_j >= 0.8, "min Jaccard {min_j}");
+    }
+
+    #[test]
+    fn marginal_stability_without_memory_across_fresh_runs() {
+        // "Fresh process" case: no hysteresis memory, only the extra-capture median.
+        let total = 30.0;
+        let base = marginal_base([1.0, 2.5, 4.0], total);
+        let mut sets = Vec::new();
+        for sweep in 10..16u64 {
+            let set = faded_sweep(sweep, &base, total, &SurveyConfig::default(), true);
+            println!("fresh {sweep}: {set:?}");
+            sets.push(set);
+        }
+        let mut min_j: f64 = 1.0;
+        for a in 0..sets.len() {
+            for b in a + 1..sets.len() {
+                min_j = min_j.min(jaccard(&sets[a], &sets[b]));
+            }
+        }
+        println!("fresh runs: min pairwise Jaccard {min_j:.2}");
+        // Baseline for the record: single capture, no extra captures.
+        let single: Vec<Vec<usize>> = (10..16u64).map(|sw| faded_sweep(sw, &base, total, &SurveyConfig::default(), false)).collect();
+        let mut min_single: f64 = 1.0;
+        for a in 0..single.len() {
+            for b in a + 1..single.len() {
+                min_single = min_single.min(jaccard(&single[a], &single[b]));
+            }
+        }
+        println!("same sweeps with one capture per plan: min pairwise Jaccard {min_single:.2}");
+        for s in &sets {
+            assert!(s.contains(&0) && s.contains(&7));
+            assert!(!s.contains(&2));
+        }
+        assert!(min_j >= 0.8, "min Jaccard {min_j}");
     }
 }
