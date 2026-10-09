@@ -92,7 +92,7 @@ fn parse() -> Opts {
     o
 }
 
-fn main() {
+pub fn main() {
     let _ = log::set_logger(&StderrLog);
     log::set_max_level(log::LevelFilter::Info);
     let o = parse();
@@ -105,6 +105,9 @@ fn main() {
         }
     };
     println!("tuner={:?}", sdr.get_tuner_id().map(str::to_string));
+    for k in ["AZ_RTL_PLL_SLEEP_MS", "AZ_RTL_I2C_EXACT", "AZ_RTL_CHUNK_FIX"] {
+        println!("{k}={}", std::env::var(k).unwrap_or_else(|_| "(unset)".to_string()));
+    }
     sdr.set_sample_rate(o.sample_rate).expect("set_sample_rate");
     sdr.set_tuner_gain(TunerGain::Auto).expect("set_tuner_gain");
     let _ = sdr.reset_buffer();

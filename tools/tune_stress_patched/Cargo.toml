@@ -1,0 +1,13 @@
+[package]
+name = "tune_stress_patched"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone repro (not part of the daemon build): tune_stress against the
+# vendored, switchable copy of rtl-sdr-rs.
+[dependencies]
+rtl-sdr-rs = { path = "../../third_party/rtl-sdr-rs", features = ["rtl_sdr_blog"] }
+log = "0.4"
+
+[workspace]

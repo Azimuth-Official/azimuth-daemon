@@ -15,3 +15,4 @@ smoke_*.log
 smoke2_*.log
 .cargo/config.toml
 /dist/
+tools/*/target/
