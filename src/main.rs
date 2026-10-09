@@ -13,6 +13,7 @@ mod ntrip;
 mod request_guard;
 mod rtk;
 mod status_server;
+mod tuner_log;
 
 use std::path::PathBuf;
 use std::sync::Arc;

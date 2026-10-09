@@ -44,6 +44,13 @@ Section "Azimuth Daemon" SecDaemon
     File "nssm.exe"
     File "..\config.example.toml"
 
+    ; LGPL-3.0 (libwdi, linked into the daemon for driver installation) and the
+    ; third-party notices must travel with the binary.
+    SetOutPath "$INSTDIR\licenses"
+    File "..\licenses\LGPL-3.0.txt"
+    File "..\THIRD_PARTY_NOTICES.md"
+    SetOutPath "$INSTDIR"
+
     ; Create logs directory
     CreateDirectory "$INSTDIR\logs"
 
@@ -113,6 +120,9 @@ Section "Uninstall"
     Delete "$INSTDIR\azimuth-daemon.exe"
     Delete "$INSTDIR\nssm.exe"
     Delete "$INSTDIR\config.example.toml"
+    Delete "$INSTDIR\licenses\LGPL-3.0.txt"
+    Delete "$INSTDIR\licenses\THIRD_PARTY_NOTICES.md"
+    RMDir "$INSTDIR\licenses"
     Delete "$INSTDIR\uninstall.exe"
     Delete "$INSTDIR\logs\daemon.log"
     Delete "$INSTDIR\logs\daemon-error.log"

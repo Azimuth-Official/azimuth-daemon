@@ -146,7 +146,9 @@ baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
 
 ### Local control API safety
 
-Every state-changing request (`POST`) must carry a `Host` of `127.0.0.1`, `localhost` or `[::1]` on the bound port, and either no `Origin` or the desktop webview / the daemon's own dashboard. Other web pages, including pages on a DNS name rebound to 127.0.0.1, get `403`. In Docker (bound to `0.0.0.0`) the same host names are accepted on any published port; add other names with `AZIMUTH_ALLOWED_HOSTS` (comma-separated `host:port`).
+Every state-changing request (`POST`) must carry a `Host` of `127.0.0.1`, `localhost` or `[::1]` on the bound port, and either no `Origin` or the desktop webview / the daemon's own dashboard. Other web pages, including pages on a DNS name rebound to 127.0.0.1, get `403`; so does any request, reads included, whose `Host` is not one of those names.
+
+**The API has no authentication.** The checks stop web browsers only; a script or `curl` that can reach the port can spoof the headers. Never publish port 8420 beyond loopback (the shipped `docker-compose.yml` binds `127.0.0.1`) without an authenticating reverse proxy. `AZIMUTH_ALLOWED_HOSTS` only adds names to the accepted `Host`; it does not widen the `Origin` rule. In Docker (bound to `0.0.0.0`) the same host names are accepted on any published port; add other names with `AZIMUTH_ALLOWED_HOSTS` (comma-separated `host:port`).
 
 ## Dashboard
 

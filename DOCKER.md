@@ -176,6 +176,14 @@ daemon is up but does not scan or register until setup is complete) or `"invalid
 real configuration problem, described in `config_error`). Check `docker logs` or
 `curl http://127.0.0.1:8420/status` for the exact reason.
 
-> **Security:** `/status` is unauthenticated. `docker-compose.yml` binds it to
-> `127.0.0.1` on the host by default. Only expose it publicly behind an authenticating
-> reverse proxy.
+> **Security:** the control API has NO authentication. Publishing port 8420 beyond
+> loopback exposes it to everyone who can reach it: anyone can read `/status` (node id,
+> location, GPS position) and, with a spoofed `Host` header, call `POST /config/write`.
+> The daemon's Host/Origin checks only stop *web browsers* (CSRF and DNS rebinding); a
+> script or `curl` on your LAN passes them trivially. The shipped `docker-compose.yml`
+> therefore binds `127.0.0.1:8420:8420`; keep it that way, or put an authenticating
+> reverse proxy in front. `AZIMUTH_ALLOWED_HOSTS` (comma-separated `host:port`) only
+> adds names to the accepted `Host` header, for example a LAN name you reach the
+> dashboard by; it does not widen the `Origin` rule, so the dashboard opened through
+> such a name can read but its POSTs are still refused. Every request, reads included,
+> needs an accepted `Host`.

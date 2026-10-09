@@ -75,10 +75,7 @@ fn targets(devices: &[Device], vid: Option<u16>, pid: Option<u16>, interface: u8
 }
 
 fn bound_is_usable(d: &Device) -> bool {
-    d.driver
-        .as_deref()
-        .map(super::driver_state::bound_driver_name)
-        .is_some_and(|(_, usable)| usable)
+    !super::driver_state::needs_winusb(d.driver.as_deref())
 }
 
 /// A fresh, unpredictable directory for the generated INF and catalog. It is

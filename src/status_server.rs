@@ -1406,7 +1406,7 @@ async fn stop_handler(
 ) -> impl IntoResponse {
     // Host/Origin are checked for every mutating route by `request_guard`; stopping
     // the daemon additionally stays loopback-only even in the Docker case.
-    if !peer.ip().is_loopback() {
+    if !peer.ip().to_canonical().is_loopback() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"message": "loopback callers only"})),
@@ -2166,6 +2166,14 @@ mod tests {
 
         // The desktop app: loopback Host, no Origin (and the webview's own origin).
         assert_eq!(post_json(&base, "/gps/preview", &serde_json::json!({}), &[]).await, 400, "reaches the handler");
+        // DNS rebinding must not READ the node or GPS position either.
+        let c = reqwest::Client::new();
+        for path in ["/status", "/gps/status", "/gps/nmea"] {
+            let evil = c.get(format!("{base}{path}")).header("host", format!("rebind.evil.example:{port}")).send().await.unwrap();
+            assert_eq!(evil.status(), 403, "GET {path} with a rebound Host");
+            let ok = c.get(format!("{base}{path}")).send().await.unwrap();
+            assert_eq!(ok.status(), 200, "GET {path} with a loopback Host");
+        }
         // An unlisted device node is never opened by the preview.
         for bad in ["/etc/passwd", "/dev/definitely-not-a-listed-port"] {
             let r = post_json(&base, "/gps/preview", &serde_json::json!({"port": bad}), &[]).await;

@@ -2,15 +2,19 @@
 //!
 //! The status server listens on loopback, but a page in the user's browser can
 //! still send requests to `127.0.0.1:8420` (CSRF), and a page on a hostile DNS
-//! name that is rebound to 127.0.0.1 can do so same-origin (DNS rebinding). Every
-//! state-changing request (anything but GET/HEAD/OPTIONS) must therefore have:
+//! name that is rebound to 127.0.0.1 can do so same-origin (DNS rebinding), which
+//! also lets it READ `/status`, `/gps/status` and `/gps/nmea` (node and GPS
+//! position). Therefore:
 //!
-//! 1. a `Host` header naming this server: `127.0.0.1`, `localhost` or `[::1]` on
-//!    the bound port (plus anything listed in `AZIMUTH_ALLOWED_HOSTS`);
-//! 2. no `Origin` header, or an exact match of the desktop webview
+//! 1. EVERY request, whatever the method, needs a `Host` header naming this
+//!    server: `127.0.0.1`, `localhost` or `[::1]` on the bound port (plus anything
+//!    listed in `AZIMUTH_ALLOWED_HOSTS`). The desktop app, the dashboard and the
+//!    Docker HEALTHCHECK all send such a Host;
+//! 2. every state-changing request (anything but GET/HEAD/OPTIONS) has no `Origin`
+//!    header, or an exact match of the desktop webview
 //!    (`tauri://localhost`, `http(s)://tauri.localhost`) or of the server itself
 //!    (`http://{127.0.0.1|localhost|[::1]}:<bound port>`);
-//! 3. a loopback peer, unless the server is bound to a non-loopback address
+//! 3. every state-changing request comes from a loopback peer, unless the server is bound to a non-loopback address
 //!    (the Docker case, where the peer is the bridge gateway).
 //!
 //! The desktop app calls the daemon from Rust (reqwest: a loopback `Host`, no
@@ -125,16 +129,14 @@ fn refuse(why: &'static str) -> Response {
     (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "forbidden", "reason": why}))).into_response()
 }
 
-/// Middleware: apply the policy to every state-changing request.
+/// Middleware: Host check on every request; Origin and peer checks on every
+/// state-changing one.
 pub async fn guard_mutations(
     State(policy): State<Arc<GuardPolicy>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
-    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
-        return next.run(req).await;
-    }
     let host_ok = req
         .headers()
         .get(header::HOST)
@@ -143,12 +145,15 @@ pub async fn guard_mutations(
     if !host_ok {
         return refuse("host not allowed");
     }
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         if !origin.to_str().is_ok_and(|o| policy.origin_allowed(o)) {
             return refuse("origin not allowed");
         }
     }
-    if !peer.ip().is_loopback() && !policy.non_loopback_bind {
+    if !peer.ip().to_canonical().is_loopback() && !policy.non_loopback_bind {
         return refuse("loopback callers only");
     }
     next.run(req).await
@@ -285,14 +290,13 @@ mod tests {
         // DNS rebinding: right peer, wrong Host.
         assert_eq!(post_with(&base, &[("host", format!("evil.example:{port}"))]).await, 403);
         assert_eq!(post_with(&base, &[("host", "127.0.0.1".into())]).await, 403);
-        // Reads are not guarded.
-        let r = reqwest::Client::new()
-            .get(format!("{base}/read"))
-            .header("host", "evil.example")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
+        // Reads need a loopback Host too (DNS rebinding must not read /status).
+        let get = |host: String| {
+            reqwest::Client::new().get(format!("{base}/read")).header("host", host).send()
+        };
+        assert_eq!(get("evil.example".into()).await.unwrap().status(), 403);
+        assert_eq!(get(format!("evil.example:{port}")).await.unwrap().status(), 403);
+        assert_eq!(get(format!("127.0.0.1:{port}")).await.unwrap().status(), 200);
     }
 
     #[tokio::test(flavor = "multi_thread")]

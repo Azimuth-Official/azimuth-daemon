@@ -152,6 +152,16 @@ pub fn bound_driver_name(service: &str) -> (String, bool) {
     }
 }
 
+/// Does Interface 0 need WinUSB bound? True for no driver at all and for any
+/// driver `rusb` cannot use (including libusb-win32 `libusb0`): `--install-driver`
+/// installs WinUSB over all of those, and skips only a usable binding.
+pub fn needs_winusb(bound_service: Option<&str>) -> bool {
+    !bound_service
+        .filter(|s| !s.is_empty())
+        .map(bound_driver_name)
+        .is_some_and(|(_, usable)| usable)
+}
+
 fn classify_device(vid: u16, pid: u16, interface0: Option<&UsbNode>) -> DriverInfo {
     let mut info = DriverInfo::new(DriverStateKind::DriverMissing, "");
     info.vid = Some(format!("{vid:04x}"));
@@ -470,6 +480,20 @@ mod tests {
         let i = classify_nodes(&nodes);
         assert_eq!(i.state, DriverStateKind::Ok);
         assert_eq!(i.bound_driver.as_deref(), Some("WinUSB"));
+    }
+
+    #[test]
+    fn install_driver_replaces_libusb0_and_every_other_unusable_binding() {
+        for needs in [None, Some(""), Some("libusb0"), Some("LIBUSB0"), Some("usbser"), Some("usbccgp")] {
+            assert!(needs_winusb(needs), "{needs:?} must be replaced with WinUSB");
+        }
+        for fine in [Some("WinUSB"), Some("winusb"), Some("libusbK")] {
+            assert!(!needs_winusb(fine), "{fine:?} is already usable");
+        }
+        // Consistency with the state reported by /status.
+        let wrong = classify_nodes(&[node(Some(0), true, Some("libusb0"))]);
+        assert_eq!(wrong.state, DriverStateKind::WrongDriver);
+        assert_eq!(wrong.bound_driver.as_deref(), Some("libusb0"));
     }
 
     #[test]
