@@ -114,14 +114,9 @@ pub struct ApplyMsg {
 /// in-memory one: the in-memory config carries the region-derived scan plan and
 /// any `--region` override, which must not be frozen into the file.
 pub fn persist_node_id(config_path: &std::path::Path, node_id: &str) {
-    match Config::load(config_path) {
-        Ok(mut on_disk) => {
-            on_disk.node.id = node_id.to_string();
-            if let Err(e) = on_disk.save(config_path) {
-                warn!(error = %e, "Failed to save node_id to config");
-            }
-        }
-        Err(e) => warn!(error = %e, "Config not readable; node_id kept in the identity file only"),
+    let id = node_id.to_string();
+    if let Err(e) = Config::update_on_disk(config_path, |c| c.node.id = id) {
+        warn!(error = %e, "Could not save node_id to config; kept in the identity file only");
     }
 }
 
@@ -153,6 +148,10 @@ pub struct Registrar {
     pub config_path: PathBuf,
     pub fingerprint: String,
     running: AtomicBool,
+    /// Wakes a chain that is sleeping between attempts.
+    wake: tokio::sync::Notify,
+    /// The newest node settings; every attempt registers with these.
+    latest: std::sync::Mutex<Option<NodeConfig>>,
     /// Delay before attempt N; the last entry repeats.
     delays: Vec<Duration>,
     max_attempts: u32,
@@ -171,6 +170,8 @@ impl Registrar {
             config_path,
             fingerprint,
             running: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            latest: std::sync::Mutex::new(None),
             delays: [0, 5, 15, 60, 300].iter().map(|s| Duration::from_secs(*s)).collect(),
             max_attempts: 288, // ~24 h at the 300 s steady state
         }
@@ -183,25 +184,32 @@ impl Registrar {
         self
     }
 
-    /// Start registering unless a chain is already running. Returns whether a
-    /// new chain was started.
+    /// Register with `node`. If a chain is already running (possibly asleep
+    /// between attempts) it is woken and uses these newer settings at once.
+    /// Returns whether a new chain was started.
     pub fn kick(self: &Arc<Self>, node: NodeConfig) -> bool {
+        *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(node);
         if self.running.swap(true, Ordering::SeqCst) {
+            self.wake.notify_one();
             return false;
         }
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            me.run(node).await;
+            me.run().await;
             me.running.store(false, Ordering::SeqCst);
         });
         true
+    }
+
+    fn latest_node(&self) -> Option<NodeConfig> {
+        self.latest.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     async fn set_state(&self, value: String) {
         self.state.write().await.registration_state = value;
     }
 
-    async fn run(&self, node: NodeConfig) {
+    async fn run(&self) {
         for attempt in 0..self.max_attempts {
             let delay = self
                 .delays
@@ -210,8 +218,15 @@ impl Registrar {
                 .copied()
                 .unwrap_or_default();
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                // A kick with newer settings cuts the wait short.
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = self.wake.notified() => {}
+                }
             }
+            let Some(node) = self.latest_node() else {
+                return;
+            };
             // A later write may have registered us (or reset the key): re-check.
             if !is_placeholder(&self.state.read().await.node_id) {
                 self.set_state("registered".to_string()).await;
@@ -416,5 +431,66 @@ mod tests {
         assert!(is_placeholder("pending"));
         assert!(is_placeholder("placeholder-1234"));
         assert!(!is_placeholder("0f0e-real"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kick_wakes_a_sleeping_chain_and_registers_with_the_new_settings() {
+        // The first register call fails; the chain then sleeps for an hour.
+        let calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let rec = Arc::clone(&calls);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let rec = Arc::clone(&rec);
+            async move {
+                if uri.path() != "/api/nodes/register" {
+                    return (axum::http::StatusCode::NOT_FOUND, String::new());
+                }
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let mut c = rec.lock().unwrap();
+                c.push(v);
+                if c.len() == 1 {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())
+                } else {
+                    (axum::http::StatusCode::OK, r#"{"node_id":"real-9"}"#.to_string())
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let dir = std::env::temp_dir().join(format!("az-kick-{}", std::process::id()));
+        let key = Arc::new(std::sync::RwLock::new("k".to_string()));
+        let client = Arc::new(ApiClient::new(&base, key));
+        let state = Arc::new(RwLock::new(StatusState::new("placeholder-t".into(), "tier1_rtlsdr".into())));
+        let reg = Arc::new(
+            Registrar::new(client, Arc::clone(&state), dir.join("config.toml"), "fp".into())
+                .with_schedule(vec![Duration::ZERO, Duration::from_secs(3600)], 5),
+        );
+        let mut old = Config::default().node;
+        old.label = "old-label".into();
+        assert!(reg.kick(old));
+        for _ in 0..100 {
+            if calls.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await; // now asleep
+        let mut new = Config::default().node;
+        new.label = "new-label".into();
+        assert!(!reg.kick(new), "a chain is running: it is woken, not duplicated");
+        for _ in 0..100 {
+            if state.read().await.registration_state == "registered" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.read().await.registration_state, "registered");
+        let c = calls.lock().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["label"], "old-label");
+        assert_eq!(c[1]["label"], "new-label", "the second attempt uses the NEW settings");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

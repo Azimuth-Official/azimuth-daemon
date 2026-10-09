@@ -142,7 +142,11 @@ includes `sweep` (per band: when the last sweep started and finished, channels
 evaluated of total, stations found, tune failures, next rediscovery), `gps` (state, port,
 baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
 `[R82xx] PLL not locked!` message from the tuner driver is counted in
-`sdr_diagnostics.pll_lock_failures` instead of being printed.
+`sdr_diagnostics.pll_lock_failures` instead of being printed. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
+
+### Local control API safety
+
+Every state-changing request (`POST`) must carry a `Host` of `127.0.0.1`, `localhost` or `[::1]` on the bound port, and either no `Origin` or the desktop webview / the daemon's own dashboard. Other web pages, including pages on a DNS name rebound to 127.0.0.1, get `403`. In Docker (bound to `0.0.0.0`) the same host names are accepted on any published port; add other names with `AZIMUTH_ALLOWED_HOSTS` (comma-separated `host:port`).
 
 ## Dashboard
 

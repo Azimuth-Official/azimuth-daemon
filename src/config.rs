@@ -783,6 +783,21 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        self.save_unlocked(path)
+    }
+
+    /// Read-modify-write of the file ON DISK under the same lock `save` takes, so
+    /// a background update (the issued node id) can never overwrite a newer
+    /// config with stale content.
+    pub fn update_on_disk(path: &Path, change: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut on_disk = Config::load(path)?;
+        change(&mut on_disk);
+        on_disk.save_unlocked(path)
+    }
+
+    fn save_unlocked(&self, path: &Path) -> anyhow::Result<()> {
         // Fresh installs may not have the config directory yet (e.g. AppData\Roaming\<app>
         // on Windows) — create it or the write fails with os error 3.
         if let Some(parent) = path.parent() {
@@ -792,9 +807,9 @@ impl Config {
         }
         let content = toml::to_string_pretty(self)?;
         // Write beside the target and rename, so a crash or a concurrent reader
-        // never sees a half-written config.toml.
+        // never sees a half-written config.toml. The temp name is unique per call.
         let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
+        tmp.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
         let tmp = std::path::PathBuf::from(tmp);
         std::fs::write(&tmp, content)?;
         std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -803,6 +818,9 @@ impl Config {
         Ok(())
     }
 }
+
+/// Serialises every write of config.toml made by this process.
+static CONFIG_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1143,5 +1161,32 @@ gain = -1
         assert!(!toml.contains("first_channel") && !toml.contains("channel_mhz"), "{toml}");
         // ...and a config written by an older daemon still loads.
         let _: Config = toml::from_str(&toml).unwrap();
+    }
+
+    #[test]
+    fn auto_resolves_to_a_concrete_code_before_the_plan_is_applied() {
+        // Paris + AUTO (any case) must take the FR plan *including* the FM step the
+        // region database gives FR (100 kHz outside the Americas/Korea), exactly as
+        // an explicit "FR" does: the code is resolved first, then the plan applied.
+        let want_step = RegionResolver::new(1766).unwrap().resolve("FR").unwrap().fm_sweep_step;
+        let mut explicit = at(48.8566, 2.3522, Some("FR"));
+        explicit.apply_region_with(fake_locate);
+        assert_eq!(explicit.scanning.as_ref().unwrap().fm.sweep_step, want_step);
+        for spelling in ["AUTO", "auto", "Auto"] {
+            let mut auto = at(48.8566, 2.3522, Some(spelling));
+            let r = auto.apply_region_with(fake_locate);
+            assert_eq!(r.effective, "FR", "{spelling}");
+            let fm = &auto.scanning.as_ref().unwrap().fm;
+            assert_eq!(fm.sweep_step, want_step, "{spelling}: AUTO must use FR's FM step");
+            let (a, e) = (auto.scanning.as_ref().unwrap(), explicit.scanning.as_ref().unwrap());
+            assert_eq!(
+                (a.fm.sweep_start, a.fm.sweep_end, a.dtv.sweep_start, a.dtv.sweep_end, a.dtv.sweep_step),
+                (e.fm.sweep_start, e.fm.sweep_end, e.dtv.sweep_start, e.dtv.sweep_end, e.dtv.sweep_step)
+            );
+        }
+        // Americas for contrast: the US keeps 200 kHz.
+        let mut us = at(39.8283, -98.5795, Some("AUTO"));
+        us.apply_region_with(fake_locate);
+        assert_eq!(us.scanning.as_ref().unwrap().fm.sweep_step, 200_000);
     }
 }

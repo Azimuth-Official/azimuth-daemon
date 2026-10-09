@@ -145,7 +145,9 @@ pub fn bound_driver_name(service: &str) -> (String, bool) {
     match service.to_ascii_lowercase().as_str() {
         "winusb" => ("WinUSB".to_string(), true),
         "libusbk" => ("libusbK".to_string(), true),
-        "libusb0" => ("libusb0".to_string(), true),
+        // libusb-win32 (libusb0.sys) is NOT usable: rusb/libusb 1.0 talks to
+        // WinUSB and libusbK on Windows only, so it must read as wrong_driver.
+        "libusb0" => ("libusb0".to_string(), false),
         _ => (service.to_string(), false),
     }
 }
@@ -329,6 +331,9 @@ pub enum SdrTestState {
     DriverMissing,
     WrongDriver,
     InUse,
+    /// This daemon's own scanner holds the device (a sweep is running), so no
+    /// test through its handle was possible. NOT a pass.
+    Busy,
     NotFound,
     UsbError,
 }
@@ -468,12 +473,16 @@ mod tests {
     }
 
     #[test]
-    fn other_usable_libusb_variants_are_ok() {
-        for (svc, name) in [("libusbK", "libusbK"), ("libusb0", "libusb0"), ("LIBUSBK", "libusbK")] {
+    fn libusbk_is_ok_but_libusb0_is_not_usable() {
+        for (svc, name) in [("libusbK", "libusbK"), ("LIBUSBK", "libusbK")] {
             let i = classify_nodes(&[node(Some(0), true, Some(svc))]);
             assert_eq!(i.state, DriverStateKind::Ok, "{svc}");
             assert_eq!(i.bound_driver.as_deref(), Some(name));
         }
+        // libusb-win32 is not supported by libusb 1.0 on Windows.
+        let i = classify_nodes(&[node(Some(0), true, Some("libusb0"))]);
+        assert_eq!(i.state, DriverStateKind::WrongDriver);
+        assert_eq!(i.bound_driver.as_deref(), Some("libusb0"));
     }
 
     #[test]

@@ -81,15 +81,19 @@ fn bound_is_usable(d: &Device) -> bool {
         .is_some_and(|(_, usable)| usable)
 }
 
-fn work_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("azimuth-wdi-{}", std::process::id()))
+/// A fresh, unpredictable directory for the generated INF and catalog. It is
+/// created exclusively (`create_dir`, never `create_dir_all`), so a directory
+/// pre-made by another process makes the install fail instead of being reused.
+fn work_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("azimuth-wdi-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Bind WinUSB to the given interface of one device, replacing whatever
 /// driver is there. Needs elevation.
 fn install_one(device: &Device) -> Result<(), String> {
-    let dir = work_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let dir = work_dir()?;
     let dir_s = dir.to_string_lossy().to_string();
     let inf = format!("rtl2832u_if{}.inf", device.mi);
     let prep = PrepareDriverOptions { driver_type: DriverType::WinUsb, ..Default::default() };

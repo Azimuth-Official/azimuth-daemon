@@ -482,6 +482,18 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     ca.len().cmp(&cb.len())
 }
 
+/// The enumerated port that `requested` names, or None. Only ports the OS
+/// lists can be opened by `/gps/preview`; Windows names are matched without case
+/// and without a `\\.\` device prefix.
+pub fn canonical_listed_port(requested: &str, ports: &[SerialPortInfo], case_insensitive: bool) -> Option<String> {
+    let norm = |s: &str| {
+        let s = s.trim().trim_start_matches("\\\\.\\");
+        if case_insensitive { s.to_ascii_lowercase() } else { s.to_string() }
+    };
+    let want = norm(requested);
+    ports.iter().find(|p| norm(&p.port_name) == want).map(|p| p.port_name.clone())
+}
+
 /// Phones and cellular modems expose AT/diagnostic serial ports that can never
 /// be a GPS receiver. They are not auto-probed (still selectable by hand).
 pub fn is_modem_port(p: &SerialPortInfo) -> bool {
@@ -941,11 +953,14 @@ pub async fn run_gps_task(
             let mut contact = contacts.get(&cand.port_name).cloned().unwrap_or_default();
             let was_escalated = contact.escalated;
             let name = cand.port_name.clone();
+            // Tell /gps/preview this port is being probed right now.
+            state.write().await.gps_probing = Some(name.clone());
             let search = probe_with(speculative, &mut contact, &full_bauds, |baud| {
                 let name = name.clone();
                 async move { attempt_port(&name, baud, window).await }
             })
             .await;
+            state.write().await.gps_probing = None;
             contacts.insert(cand.port_name.clone(), contact);
 
             match search {
@@ -1674,6 +1689,19 @@ mod tests {
         }
         for k in ["port_name", "port_type", "vid", "pid", "product", "probed", "last_result"] {
             assert!(v["candidates"][0].get(k).is_some(), "candidate missing {k}");
+        }
+    }
+
+    #[test]
+    fn preview_only_opens_ports_the_os_lists() {
+        let ports = vec![port("COM5", None, "unknown"), port("/dev/ttyUSB0", None, "usb")];
+        assert_eq!(canonical_listed_port("COM5", &ports, true).as_deref(), Some("COM5"));
+        assert_eq!(canonical_listed_port("com5", &ports, true).as_deref(), Some("COM5"));
+        assert_eq!(canonical_listed_port("\\\\.\\COM5", &ports, true).as_deref(), Some("COM5"));
+        assert_eq!(canonical_listed_port("/dev/ttyUSB0", &ports, false).as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(canonical_listed_port("com5", &ports, false), None, "unix names are case-sensitive");
+        for bad in ["/dev/sda", "/etc/passwd", "COM99", "", "../COM5"] {
+            assert_eq!(canonical_listed_port(bad, &ports, true), None, "{bad}");
         }
     }
 }

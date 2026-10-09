@@ -10,6 +10,7 @@ mod regions;
 mod sdr;
 mod setup;
 mod ntrip;
+mod request_guard;
 mod rtk;
 mod status_server;
 
@@ -366,21 +367,17 @@ async fn main() -> anyhow::Result<()> {
     // SDR manager: enumerates and opens all devices. Driver installation is
     // never attempted here (it needs administrator rights): the driver state is
     // reported through /status instead.
-    let opened = SdrManager::new(
-        config.sdr.device_index,
-        config.sdr.sample_rate,
-        config.sdr.gain,
-    );
-    let (heartbeat_device_count, heartbeat_serials) =
-        (opened.device_count(), opened.device_serials());
+    let startup_params = SdrParams::from_config(&config);
+    replace_sdr(&app_state.status, &sdr, &startup_params).await;
+    let (heartbeat_device_count, heartbeat_serials) = {
+        let m = lock_sdr(&sdr);
+        (m.device_count(), m.device_serials())
+    };
     info!(
         devices = heartbeat_device_count,
         serials = ?heartbeat_serials,
         "SDR devices initialized"
     );
-    publish_sdr(&app_state.status, &opened).await;
-    *lock_sdr(&sdr) = opened;
-    refresh_driver_state(&app_state.status).await;
     spawn_driver_refresh(Arc::clone(&app_state.status));
 
     // Spawn heartbeat loop with device info. The node id is re-read from
@@ -600,15 +597,8 @@ async fn main() -> anyhow::Result<()> {
                         cycles = cycles_without_sdr,
                         "No SDR devices open — attempting re-detection"
                     );
-                    let fresh = SdrManager::new(
-                        sdr_params.device_index,
-                        sdr_params.sample_rate,
-                        sdr_params.gain,
-                    );
-                    let found = fresh.device_count() > 0;
-                    publish_sdr(&app_state.status, &fresh).await;
-                    *lock_sdr(&sdr) = fresh;
-                    refresh_driver_state(&app_state.status).await;
+                    replace_sdr(&app_state.status, &sdr, &sdr_params).await;
+                    let found = lock_sdr(&sdr).device_count() > 0;
                     if found {
                         info!("SDR re-detected — resuming scanning");
                         cycles_without_sdr = 0;
@@ -736,6 +726,18 @@ fn lock_sdr(sdr: &SharedSdr) -> std::sync::MutexGuard<'_, SdrManager> {
     sdr.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Replace the SDR manager. The old one is swapped for an empty manager FIRST so
+/// its handle is closed (a second claim on the same interface would fail), and
+/// the blocking open (USB resets and backoff sleeps in the stall ladder) runs in
+/// `block_in_place`, never on an async worker.
+async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &SdrParams) {
+    *lock_sdr(sdr) = SdrManager::empty();
+    let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
+    publish_sdr(status, &fresh).await;
+    *lock_sdr(sdr) = fresh;
+    refresh_driver_state(status).await;
+}
+
 /// Copy the manager's device facts into the live status.
 async fn publish_sdr(status: &Arc<RwLock<StatusState>>, manager: &SdrManager) {
     let mut state = status.write().await;
@@ -824,10 +826,7 @@ async fn apply_config_msg(
         || msg.sdr.gain != sdr_params.gain
     {
         info!("SDR settings changed — reopening the device");
-        let fresh = SdrManager::new(msg.sdr.device_index, msg.sdr.sample_rate, msg.sdr.gain);
-        publish_sdr(&app_state.status, &fresh).await;
-        *lock_sdr(sdr) = fresh;
-        refresh_driver_state(&app_state.status).await;
+        replace_sdr(&app_state.status, sdr, &msg.sdr).await;
     }
     *sdr_params = msg.sdr;
 }

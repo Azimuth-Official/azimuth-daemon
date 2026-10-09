@@ -156,6 +156,8 @@ pub struct StatusState {
     pub gps_info: crate::gps::GpsInfo,
     /// Last NMEA sentences read from the detected receiver (live preview).
     pub gps_nmea_tail: VecDeque<String>,
+    /// Port the GPS task is probing at this moment (guards `/gps/preview`).
+    pub gps_probing: Option<String>,
     pub config_error: Option<String>,
     pub auth_error: Option<String>,
     pub config_state: ConfigState,
@@ -272,6 +274,7 @@ impl StatusState {
             gps_accuracy_history: VecDeque::new(),
             gps_info: crate::gps::GpsInfo::default(),
             gps_nmea_tail: VecDeque::new(),
+            gps_probing: None,
             config_error: None,
             auth_error: None,
             config_state: ConfigState::AwaitingSetup,
@@ -519,8 +522,8 @@ struct ScannerFacts {
 ///     already holds (tuner name + a live read), or open the device fresh when
 ///     none is held;
 ///   - lock busy for the whole wait: a sweep is in progress, so this daemon itself
-///     holds the device and is streaming from it (`ok`, with that detail);
-///     if no sweep is active the timeout is reported as a USB error.
+///     holds the device: `busy` (never `ok`, nothing was read); with no sweep
+///     active the timeout is reported as a USB error.
 fn run_sdr_test(
     sdr: &std::sync::Mutex<SdrManager>,
     index: u32,
@@ -530,11 +533,11 @@ fn run_sdr_test(
     let driver = crate::sdr::current_driver_info();
     let access_means_in_use = cfg!(windows);
     let Some(mut guard) = lock_with_timeout(sdr, lock_wait) else {
-        let streaming = facts.scanner_active && facts.sdr_connected;
-        let verdict = if streaming {
+        let verdict = if facts.scanner_active && facts.sdr_connected {
+            // Not a pass: nothing was read through the handle.
             driver_state::SdrTestVerdict {
-                state: SdrTestState::Ok,
-                detail: "The scanner is using the RTL-SDR right now (a sweep is in progress).".to_string(),
+                state: SdrTestState::Busy,
+                detail: "The scanner is using the RTL-SDR right now (a sweep is in progress), so it could not be tested. Try again in a moment.".to_string(),
                 tuner: None,
             }
         } else {
@@ -1174,14 +1177,31 @@ async fn gps_preview_handler(
     };
     let baud = body.get("baud").and_then(|b| b.as_u64()).map(|b| b as u32);
     let seconds = body.get("seconds").and_then(|x| x.as_f64()).unwrap_or(2.0) as f32;
+    // Only a port the OS actually lists may be opened (no arbitrary device nodes).
+    let requested = port.to_string();
+    let listed = tokio::task::spawn_blocking(move || {
+        crate::gps::canonical_listed_port(&requested, &crate::gps::list_serial_ports(), cfg!(windows))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(port) = listed else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown_port", "message": "That port is not in the list of serial ports."})),
+        );
+    };
+    let port = port.as_str();
     {
         let s = state.status.read().await;
-        if s.gps_detected && s.gps_port.as_deref() == Some(port) {
+        let held = s.gps_detected && s.gps_port.as_deref() == Some(port);
+        let probing = s.gps_probing.as_deref() == Some(port);
+        if held || probing {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": "in_use_by_daemon",
-                    "message": "The daemon is already reading this port; see /gps/nmea.",
+                    "error": if held { "in_use_by_daemon" } else { "probing" },
+                    "message": "The daemon is using this port right now; try again in a few seconds, or see /gps/nmea.",
                 })),
             );
         }
@@ -1379,35 +1399,18 @@ pub async fn bind_with_policy(
     }
 }
 
-/// Browser origins allowed to ask the daemon to stop: the desktop webview and
-/// the daemon's own local dashboard. Any other web page is refused.
-pub fn origin_allowed(origin: &str) -> bool {
-    matches!(
-        origin,
-        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
-    ) || origin.starts_with("http://127.0.0.1")
-        || origin.starts_with("http://localhost")
-}
-
 /// POST /shutdown: graceful stop, loopback callers only.
 async fn stop_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Host/Origin are checked for every mutating route by `request_guard`; stopping
+    // the daemon additionally stays loopback-only even in the Docker case.
     if !peer.ip().is_loopback() {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"message": "loopback callers only"})),
         );
-    }
-    if let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|o| o.to_str().ok()) {
-        if !origin_allowed(origin) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"message": "origin not allowed"})),
-            );
-        }
     }
     info!(peer = %peer, "Stop requested over HTTP");
     state.stop_signal.notify_one();
@@ -1417,8 +1420,9 @@ async fn stop_handler(
     )
 }
 
-pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
-    let app = Router::new()
+/// The control API, wrapped in the request guard and an explicit CORS allowlist.
+pub fn build_router(state: Arc<AppState>, policy: Arc<crate::request_guard::GuardPolicy>) -> Router {
+    Router::new()
         .route("/", get(crate::dashboard::dashboard_handler))
         .route("/status", get(status_handler))
         .route("/sdr/list", get(sdr_list_handler))
@@ -1437,10 +1441,17 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/log/level", post(log_level_handler))
         .route("/log/path", get(log_path_handler))
         .route("/shutdown", post(stop_handler))
-        // The desktop app's webview calls this loopback-only server cross-origin
-        // (tauri.localhost -> 127.0.0.1); without CORS every fetch is blocked.
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(Arc::clone(&state));
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&policy),
+            crate::request_guard::guard_mutations,
+        ))
+        .layer(crate::request_guard::cors_layer(policy))
+        .with_state(state)
+}
+
+pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
+    let policy = Arc::new(crate::request_guard::GuardPolicy::from_bind(bind_addr));
+    let app = build_router(Arc::clone(&state), policy);
 
     // A daemon without its status server is invisible to the desktop app
     // ("never fully loads"), so if the port stays taken we exit rather than
@@ -1909,15 +1920,6 @@ mod tests {
         assert_eq!(decide_sibling(ours, Some(&sib(None, None))), SiblingAction::ExitSibling);
     }
 
-    #[test]
-    fn stop_origin_allowlist() {
-        assert!(origin_allowed("tauri://localhost"));
-        assert!(origin_allowed("http://tauri.localhost"));
-        assert!(origin_allowed("http://127.0.0.1:8420"));
-        assert!(!origin_allowed("https://evil.example"));
-        assert!(!origin_allowed("null"));
-    }
-
     /// A fake daemon on an ephemeral port: serves /status and, when it is
     /// asked to stop, releases the port.
     async fn fake_daemon(status: serde_json::Value) -> String {
@@ -2027,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn sdr_test_while_a_sweep_holds_the_device_is_ok_only_if_the_scanner_is_active() {
+    fn sdr_test_while_a_sweep_holds_the_device_is_busy_never_ok() {
         let m = std::sync::Mutex::new(SdrManager::empty());
         let _held = m.lock().unwrap();
         let wait = std::time::Duration::from_millis(150);
@@ -2035,7 +2037,7 @@ mod tests {
         let (v, _) = std::thread::scope(|sc| {
             sc.spawn(|| run_sdr_test(&m, 0, active, wait)).join().unwrap()
         });
-        assert_eq!(v.state, SdrTestState::Ok);
+        assert_eq!(v.state, SdrTestState::Busy, "no read happened, so it must not pass");
         let idle = ScannerFacts { scanner_active: false, sdr_connected: true };
         let (v, _) = std::thread::scope(|sc| {
             sc.spawn(|| run_sdr_test(&m, 0, idle, wait)).join().unwrap()
@@ -2109,5 +2111,69 @@ mod tests {
         handle.lock().unwrap().fm.evaluated = 103;
         let v = serde_json::to_value(st.to_info(true, false)).unwrap();
         assert_eq!(v["sweep"]["fm"]["evaluated"], 103);
+    }
+
+    // --- CSRF / DNS rebinding on the real routes ---------------------------------
+
+    async fn serve_real_router(h: &Harness) -> (String, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let policy = Arc::new(crate::request_guard::GuardPolicy::from_bind(&format!("127.0.0.1:{port}")));
+        let app = build_router(Arc::clone(&h.state), policy);
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+                .ok();
+        });
+        (format!("http://127.0.0.1:{port}"), port)
+    }
+
+    async fn post_json(
+        base: &str,
+        path: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, String)],
+    ) -> reqwest::StatusCode {
+        let mut r = reqwest::Client::new().post(format!("{base}{path}")).json(body);
+        for (k, v) in headers {
+            r = r.header(*k, v);
+        }
+        r.send().await.unwrap().status()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_write_and_gps_preview_refuse_evil_origin_and_host_but_serve_the_desktop() {
+        let h = harness("guard").await;
+        let (base, port) = serve_real_router(&h).await;
+        let body = wizard_body(39.8283, -98.5795, "k-evil");
+
+        for evil_origin in [
+            "https://evil.example".to_string(),
+            "http://127.0.0.1.evil.tld".to_string(),
+            format!("http://127.0.0.1:{port}.evil.tld"),
+        ] {
+            let hdr = [("origin", evil_origin.clone())];
+            assert_eq!(post_json(&base, "/config/write", &body, &hdr).await, 403, "{evil_origin}");
+            let pv = serde_json::json!({"port": "COM5"});
+            assert_eq!(post_json(&base, "/gps/preview", &pv, &hdr).await, 403, "{evil_origin}");
+        }
+        // DNS rebinding: attacker name resolving to 127.0.0.1.
+        let rebind = [("host", format!("rebind.evil.example:{port}"))];
+        assert_eq!(post_json(&base, "/config/write", &body, &rebind).await, 403);
+        assert_eq!(post_json(&base, "/gps/preview", &serde_json::json!({}), &rebind).await, 403);
+        assert!(!h.state.config_path.exists(), "a refused write must not touch disk");
+        assert_ne!(h.state.api_key.read().unwrap().as_str(), "k-evil");
+
+        // The desktop app: loopback Host, no Origin (and the webview's own origin).
+        assert_eq!(post_json(&base, "/gps/preview", &serde_json::json!({}), &[]).await, 400, "reaches the handler");
+        // An unlisted device node is never opened by the preview.
+        for bad in ["/etc/passwd", "/dev/definitely-not-a-listed-port"] {
+            let r = post_json(&base, "/gps/preview", &serde_json::json!({"port": bad}), &[]).await;
+            assert_eq!(r, 404, "{bad}");
+        }
+        let tauri = [("origin", "tauri://localhost".to_string())];
+        assert_eq!(post_json(&base, "/config/write", &body, &tauri).await, 200);
+        assert_eq!(h.state.api_key.read().unwrap().as_str(), "k-evil");
+        let _ = std::fs::remove_dir_all(&h.dir);
     }
 }

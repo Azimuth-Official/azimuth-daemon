@@ -8,7 +8,7 @@ bind the WinUSB driver to Interface 0 of an RTL-SDR (`azimuth-daemon --install-d
 
 - **License.** libwdi is available under the GNU GPL and the GNU Lesser General Public
   License (version 3 or later). Azimuth uses it under the **LGPL v3** option.
-  Text: <https://www.gnu.org/licenses/lgpl-3.0.txt>.
+  The full text ships in `licenses/LGPL-3.0.txt` (source: <https://www.gnu.org/licenses/lgpl-3.0.txt>); installers must include that file next to the daemon.
 - **What is linked.** `wdi-rs` links a prebuilt static `libwdi.lib` that its author
   built from a fork of libwdi (<https://github.com/piersfinlayson/libwdi>) whose only
   changes to the upstream code are to the CI jobs. SHA-256 of that file in `wdi-rs`
@@ -20,6 +20,8 @@ bind the WinUSB driver to Interface 0 of an RTL-SDR (`azimuth-daemon --install-d
 - **Certificate behaviour.** libwdi generates the WinUSB driver package on the fly,
   signs its catalog with a self-signed certificate created at install time, and adds
   that certificate to the machine's trusted publishers store so Windows accepts the
-  package. The certificate is created locally; no key material is shipped.
+  package. The certificate is created locally; no key material is shipped. It is NOT
+  removed again when the driver or the app is uninstalled: it stays in the machine's
+  trusted publishers store until an administrator deletes it.
 - **Microsoft SDK.** libwdi is built with the Microsoft Windows SDK; its redistributable
   components fall under the SDK license.
