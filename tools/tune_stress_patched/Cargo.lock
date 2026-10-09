@@ -306,6 +306,7 @@ version = "0.0.0"
 dependencies = [
  "log",
  "rtl-sdr-rs",
+ "rusb",
 ]
 
 [[package]]

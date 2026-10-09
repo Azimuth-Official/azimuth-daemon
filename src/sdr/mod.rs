@@ -7,6 +7,7 @@ pub mod fm_demod;
 pub mod holders;
 pub mod lte;
 pub mod rds;
+pub mod stall;
 pub mod scanner;
 pub mod recovery;
 
@@ -53,6 +54,30 @@ fn detach_rtl_kernel_drivers() {}
 pub static PLL_LOCK_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Frequency of the most recent tune, for diagnostics that fire from a log hook.
 pub static CURRENT_TUNE_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Control-transfer stalls that were re-issued successfully / USB resets done
+/// while opening a device (see `stall`). Shown in /status.sdr_diagnostics.
+pub static TUNE_STALLS_RECOVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static OPEN_USB_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// True for the USB transport errors an RTL2832U produces when it stalls a
+/// control transfer (`Pipe`) or loses the transaction (`Io`).
+fn is_usb_stall(e: &anyhow::Error) -> bool {
+    use rtl_sdr_rs::error::RtlsdrError;
+    if let Some(r) = e.downcast_ref::<RtlsdrError>() {
+        return matches!(r, RtlsdrError::Usb(rusb::Error::Pipe) | RtlsdrError::Usb(rusb::Error::Io));
+    }
+    e.downcast_ref::<rusb::Error>()
+        .is_some_and(|u| matches!(u, rusb::Error::Pipe | rusb::Error::Io))
+}
+
+fn is_rtl_stall(e: &rtl_sdr_rs::error::RtlsdrError) -> bool {
+    matches!(
+        e,
+        rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Pipe)
+            | rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Io)
+    )
+}
 
 pub fn pll_lock_failures() -> u64 {
     PLL_LOCK_FAILS.load(std::sync::atomic::Ordering::Relaxed)
@@ -237,19 +262,30 @@ impl SdrDevice {
             );
         }
         CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
-        let before = pll_lock_failures();
-        self.device
-            .set_center_freq(freq_hz as u32)
-            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))?;
-        if pll_lock_failures() > before {
-            // The tuner reported "PLL not locked" (rtl-sdr-rs still returns
-            // success). One short settle and re-tune; the failure stays counted
-            // in /status.sdr_diagnostics so a frequency that never locks shows.
-            tracing::debug!(freq_hz, "tuner reported PLL not locked; settling and re-tuning once");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let _ = self.device.set_center_freq(freq_hz as u32);
+        // An RTL2832U can stall a control transfer now and then (librtlsdr just
+        // logs it and carries on). Re-issue the whole tune, repeater switching
+        // included, instead of failing the channel; only a stall that persists
+        // is handed to the recovery ladder.
+        let stalled = std::cell::Cell::new(0u32);
+        let device = &mut self.device;
+        let result = stall::retry_stalls(
+            stall::TUNE_STALL_RETRIES,
+            is_usb_stall,
+            std::thread::sleep,
+            |attempt| {
+                stalled.set(attempt);
+                tracing::debug!(freq_hz, attempt, "USB control stall while tuning; re-issuing the tune");
+            },
+            || {
+                device
+                    .set_center_freq(freq_hz as u32)
+                    .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
+            },
+        );
+        if result.is_ok() && stalled.get() > 0 {
+            TUNE_STALLS_RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(())
+        result
     }
 
     #[allow(dead_code)]
@@ -375,8 +411,22 @@ impl SdrManager {
         // Linux/usbip: detach the kernel dvb_usb_rtl28xxu driver before opening, or
         // rtl-sdr-rs's open() fails ("open device N"). No-op on Windows.
         detach_rtl_kernel_drivers();
-        let mut device = RtlSdr::open_with_index(index as usize)
-            .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
+        // Like librtlsdr: a device that stalls its very first control write is
+        // USB-reset and opened again, instead of staying wedged.
+        let mut device = stall::open_with_reset(
+            stall::OPEN_RESET_ATTEMPTS,
+            is_rtl_stall,
+            || {
+                OPEN_USB_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(index, "Device stalled while opening; resetting the USB device");
+                if let Err(e) = recovery::reset_usb_bus_device(index as usize) {
+                    warn!(index, error = %e, "USB reset before reopen failed");
+                }
+            },
+            std::thread::sleep,
+            || RtlSdr::open_with_index(index as usize),
+        )
+        .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
 
         device
             .set_sample_rate(sample_rate)
@@ -544,7 +594,13 @@ impl SdrManager {
         let old_device = self.devices.remove(pos);
         drop(old_device);
 
-        info!(index, serial = %serial, "Reopening SDR device after repeated pipe errors");
+        // Reset the USB device BEFORE reopening: reopening a stalled device
+        // without a reset left it wedged (every later open and tune failed).
+        info!(index, serial = %serial, "Resetting and reopening SDR device after repeated pipe errors");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Err(e) = recovery::reset_usb_bus_device(index) {
+            warn!(index, error = %e, "USB reset before reopen failed; reopening anyway");
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let new_device = Self::open_device(

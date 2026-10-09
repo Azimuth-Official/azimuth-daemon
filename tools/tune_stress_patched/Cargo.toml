@@ -9,5 +9,6 @@ publish = false
 [dependencies]
 rtl-sdr-rs = { path = "../../third_party/rtl-sdr-rs", features = ["rtl_sdr_blog"] }
 log = "0.4"
+rusb = { version = "0.9", features = ["vendored"] }
 
 [workspace]

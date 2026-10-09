@@ -106,6 +106,10 @@ pub struct StatusInfo {
 pub struct SdrDiagnostics {
     /// "[R82xx] PLL not locked!" records seen from the tuner driver.
     pub pll_lock_failures: u64,
+    /// Tunes that hit a USB control stall and succeeded after being re-issued.
+    pub tune_stalls_recovered: u64,
+    /// USB resets done while opening a device that stalled its first write.
+    pub open_usb_resets: u64,
 }
 
 pub struct StatusState {
@@ -369,6 +373,8 @@ impl StatusState {
                 .unwrap_or(serde_json::Value::Null),
             sdr_diagnostics: SdrDiagnostics {
                 pll_lock_failures: crate::sdr::pll_lock_failures(),
+                tune_stalls_recovered: crate::sdr::TUNE_STALLS_RECOVERED.load(Ordering::Relaxed),
+                open_usb_resets: crate::sdr::OPEN_USB_RESETS.load(Ordering::Relaxed),
             },
         }
     }

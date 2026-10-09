@@ -10,7 +10,45 @@
 
 use std::time::{Duration, Instant};
 
+use rtl_sdr_rs::error::RtlsdrError;
 use rtl_sdr_rs::{RtlSdr, TunerGain};
+
+// The same stall handling the daemon uses (src/sdr/stall.rs).
+#[path = "../src/sdr/stall.rs"]
+mod stall;
+
+fn is_stall(e: &RtlsdrError) -> bool {
+    matches!(e, RtlsdrError::Usb(rusb::Error::Pipe) | RtlsdrError::Usb(rusb::Error::Io))
+}
+
+/// libusb_reset_device on the first RTL2832U found.
+fn usb_reset() {
+    let Ok(list) = rusb::devices() else { return };
+    for d in list.iter() {
+        if let Ok(desc) = d.device_descriptor() {
+            if desc.vendor_id() == 0x0bda && matches!(desc.product_id(), 0x2832 | 0x2838) {
+                match d.open().and_then(|h| h.reset()) {
+                    Ok(()) => println!("USB_RESET ok"),
+                    Err(e) => println!("USB_RESET failed: {e}"),
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn open_dongle(reset_on_open: bool) -> Result<RtlSdr, RtlsdrError> {
+    if !reset_on_open {
+        return RtlSdr::open_with_index(0);
+    }
+    stall::open_with_reset(
+        stall::OPEN_RESET_ATTEMPTS,
+        is_stall,
+        usb_reset,
+        std::thread::sleep,
+        || RtlSdr::open_with_index(0),
+    )
+}
 
 /// Prints `log` records (rtl-sdr-rs reports USB errors through them).
 struct StderrLog;
@@ -36,6 +74,8 @@ struct Opts {
     reset_buffer: bool,
     reset_after: bool,
     retry_tune: u32,
+    tolerant: bool,
+    reset_on_open: bool,
     keep_going: bool,
 }
 
@@ -50,6 +90,9 @@ fn usage() -> ! {
          \x20 [--reset-after-capture]  FIX CANDIDATE 1: reset_buffer() right after each read\n\
          \x20                         (stops the endpoint FIFO before the next control write)\n\
          \x20 [--retry-tune N]      FIX CANDIDATE 2: retry a failed tune up to N times\n\
+         \x20 [--tolerant]         THE DAEMON FIX: re-issue a stalled tune (3x, 20/40/60 ms); if it\n\
+         \x20                         still fails, USB-reset, reopen and carry on (never abort)\n\
+         \x20 [--reset-on-open]     like librtlsdr: if open stalls, USB-reset the dongle and reopen\n\
          \x20 [--continue]          keep going after a failure"
     );
     std::process::exit(2)
@@ -68,6 +111,8 @@ fn parse() -> Opts {
         reset_buffer: true,
         reset_after: false,
         retry_tune: 0,
+        tolerant: false,
+        reset_on_open: false,
         keep_going: false,
     };
     let mut args = std::env::args().skip(1);
@@ -85,6 +130,8 @@ fn parse() -> Opts {
             "--no-reset-buffer" => o.reset_buffer = false,
             "--reset-after-capture" => o.reset_after = true,
             "--retry-tune" => o.retry_tune = num() as u32,
+            "--tolerant" => o.tolerant = true,
+            "--reset-on-open" => o.reset_on_open = true,
             "--continue" => o.keep_going = true,
             _ => usage(),
         }
@@ -97,7 +144,7 @@ pub fn main() {
     log::set_max_level(log::LevelFilter::Info);
     let o = parse();
 
-    let mut sdr = match RtlSdr::open_with_index(0) {
+    let mut sdr = match open_dongle(o.reset_on_open) {
         Ok(s) => s,
         Err(e) => {
             println!("OPEN_FAILED {e}");
@@ -113,14 +160,50 @@ pub fn main() {
     let _ = sdr.reset_buffer();
 
     let t0 = Instant::now();
-    let (mut steps, mut failures) = (0u32, 0u32);
+    let (mut steps, mut failures, mut stall_retries, mut resets) = (0u32, 0u32, 0u32, 0u32);
     let mut buf = vec![0u8; o.capture_bytes];
     for pass in 0..o.passes {
         let mut f = o.start;
         while f <= o.end {
             steps += 1;
             let t = Instant::now();
-            let mut tune = sdr.set_center_freq(f);
+            let mut tune = if o.tolerant {
+                let first = stall::retry_stalls(
+                    stall::TUNE_STALL_RETRIES,
+                    is_stall,
+                    std::thread::sleep,
+                    |a| {
+                        stall_retries += 1;
+                        println!("STALL_RETRY f={f} attempt={a}");
+                    },
+                    || sdr.set_center_freq(f),
+                );
+                match first {
+                    Err(e) if is_stall(&e) => {
+                        // Persistent stall: reset, reopen, and keep sweeping.
+                        resets += 1;
+                        println!("STALL_PERSISTENT f={f}: resetting and reopening");
+                        drop(sdr);
+                        std::thread::sleep(Duration::from_millis(200));
+                        usb_reset();
+                        std::thread::sleep(Duration::from_millis(500));
+                        sdr = match open_dongle(true) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                println!("REOPEN_FAILED {e}");
+                                std::process::exit(3);
+                            }
+                        };
+                        sdr.set_sample_rate(o.sample_rate).expect("set_sample_rate");
+                        sdr.set_tuner_gain(TunerGain::Auto).expect("set_tuner_gain");
+                        let _ = sdr.reset_buffer();
+                        sdr.set_center_freq(f)
+                    }
+                    other => other,
+                }
+            } else {
+                sdr.set_center_freq(f)
+            };
             for _ in 0..o.retry_tune {
                 if tune.is_ok() {
                     break;
@@ -164,6 +247,6 @@ pub fn main() {
             f += o.step;
         }
     }
-    println!("SUMMARY steps={steps} failures={failures} elapsed_ms={}", t0.elapsed().as_millis());
+    println!("SUMMARY steps={steps} failures={failures} stall_retries={stall_retries} resets={resets} elapsed_ms={}", t0.elapsed().as_millis());
     std::process::exit(if failures == 0 { 0 } else { 1 });
 }

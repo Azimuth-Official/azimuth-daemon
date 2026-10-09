@@ -157,17 +157,14 @@ impl RecoveryManager {
     }
 }
 
-/// Open a separate `rusb` handle to the Nth RTL2832U device (`VID=0x0BDA`,
-/// `PID=0x2832`) and perform a USB bus reset. This does not touch the
-/// rtl-sdr-rs handle, so the caller must reopen the device afterwards.
+/// Open a separate `rusb` handle to the Nth supported RTL2832U device (any
+/// VID:PID rtl-sdr-rs accepts) and perform a USB bus reset. This does not touch
+/// the rtl-sdr-rs handle, so the caller must reopen the device afterwards.
 pub fn reset_usb_bus_device(device_index: usize) -> anyhow::Result<()> {
-    let vid = 0x0BDA;
-    let pid = 0x2832;
-
     let mut matched = 0usize;
     for device in rusb::devices()?.iter() {
         let desc = device.device_descriptor()?;
-        if desc.vendor_id() == vid && desc.product_id() == pid {
+        if super::driver_state::is_known_device(desc.vendor_id(), desc.product_id()) {
             if matched == device_index {
                 info!(
                     device_index,
@@ -184,12 +181,7 @@ pub fn reset_usb_bus_device(device_index: usize) -> anyhow::Result<()> {
         }
     }
 
-    anyhow::bail!(
-        "No RTL-SDR device at index {} (VID={:04X}, PID={:04X})",
-        device_index,
-        vid,
-        pid
-    );
+    anyhow::bail!("No RTL-SDR device at index {}", device_index);
 }
 
 /// Restart the OS-level USB device. On Windows this disables then re-enables
