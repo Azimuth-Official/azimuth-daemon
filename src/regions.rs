@@ -244,3 +244,8 @@ mod tests {
         assert!(resolved.fm_sweep_step > 0);
     }
 }
+
+/// STUB(contract C7) - DROP AT MERGE: DAEMON-DSP's real implementation replaces this.
+pub fn resolve_for_location(_lat: f64, _lon: f64) -> Option<&'static str> {
+    None
+}

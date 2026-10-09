@@ -1173,3 +1173,37 @@ mod tests {
         assert!(!scanner.needs_discovery());
     }
 }
+
+// STUB(contract C7) - DROP AT MERGE: DAEMON-DSP's real implementation replaces this.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BandSweep {
+    pub started_at: Option<chrono::DateTime<Utc>>,
+    pub completed_at: Option<chrono::DateTime<Utc>>,
+    pub evaluated: u32,
+    pub total: u32,
+    pub found: u32,
+    pub tune_failed: u32,
+    pub in_progress: bool,
+    pub next_rediscovery_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SweepReport {
+    pub fm: BandSweep,
+    pub lte: BandSweep,
+    pub dtv: BandSweep,
+}
+
+impl Scanner {
+    pub fn apply_plan(&mut self, plan: &ScanningConfig) {
+        *self = Scanner::new(plan, self.dbm_offset);
+    }
+
+    pub fn sweep_report(&self) -> SweepReport {
+        SweepReport::default()
+    }
+
+    pub fn sweep_handle(&self) -> std::sync::Arc<std::sync::Mutex<SweepReport>> {
+        std::sync::Arc::new(std::sync::Mutex::new(SweepReport::default()))
+    }
+}
