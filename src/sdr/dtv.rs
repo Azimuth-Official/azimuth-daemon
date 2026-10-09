@@ -2,6 +2,12 @@
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
+pub mod dvb;
+#[cfg(test)]
+pub(crate) mod testgen;
+#[cfg(test)]
+mod validation;
+
 /// Result from ATSC DTV pilot tone detection.
 ///
 /// Contains pilot frequency measurement, signal quality, and channel power estimates.
