@@ -97,7 +97,7 @@ fn run_positive(trials: usize, snr_db: f64, cells: &[Cell], salt: u64) -> Vec<(C
     out
 }
 
-fn pct(v: &mut Vec<f64>, q: f64) -> f64 {
+fn pct(v: &mut [f64], q: f64) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[((v.len() as f64 - 1.0) * q).round() as usize]
 }

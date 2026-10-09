@@ -200,9 +200,8 @@ pub struct DvbDetection {
 
 /// Convert RTL-SDR interleaved u8 IQ to centred complex samples (DC removed).
 pub fn iq_u8_to_complex(iq_bytes: &[u8]) -> Vec<Complex<f32>> {
-    let mut x: Vec<Complex<f32>> = iq_bytes
-        .chunks_exact(2)
-        .map(|c| Complex::new((f32::from(c[0]) - 127.5) / 127.5, (f32::from(c[1]) - 127.5) / 127.5))
+    let mut x: Vec<Complex<f32>> = (0..iq_bytes.len() / 2)
+        .map(|i| Complex::new((f32::from(iq_bytes[2 * i]) - 127.5) / 127.5, (f32::from(iq_bytes[2 * i + 1]) - 127.5) / 127.5))
         .collect();
     if !x.is_empty() {
         let n = x.len() as f64;

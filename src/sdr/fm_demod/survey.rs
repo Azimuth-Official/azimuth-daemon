@@ -99,9 +99,8 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
     if m < 16_384 {
         return Vec::new();
     }
-    let mut x: Vec<C32> = iq_bytes
-        .chunks_exact(2)
-        .map(|c| C32::new((f32::from(c[0]) - 127.5) / 127.5, (f32::from(c[1]) - 127.5) / 127.5))
+    let mut x: Vec<C32> = (0..m)
+        .map(|i| C32::new((f32::from(iq_bytes[2 * i]) - 127.5) / 127.5, (f32::from(iq_bytes[2 * i + 1]) - 127.5) / 127.5))
         .collect();
     let mean = x.iter().fold(C32::new(0.0, 0.0), |a, b| a + *b) / m as f32;
     for v in &mut x {

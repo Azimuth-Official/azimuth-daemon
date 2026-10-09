@@ -59,8 +59,11 @@ pub struct ResolvedRegion {
     pub dtv_sweep_end: u64,
     pub dtv_sweep_step: u64,
     /// DTV standard name from the region database ("DVB-T2-694", "ATSC", ...).
+    #[allow(dead_code)] // read by Config::apply_region (DAEMON-CORE) once wired
     pub dtv_standard: String,
+    #[allow(dead_code)]
     pub dtv_channel_mhz: u32,
+    #[allow(dead_code)]
     pub dtv_first_channel: u32,
     pub skipped_bands: Vec<String>,
 }

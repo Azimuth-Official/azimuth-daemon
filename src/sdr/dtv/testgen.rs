@@ -130,7 +130,7 @@ pub fn noise_record(rng: &mut Rng, n: usize) -> Vec<C32> {
 
 /// A few CW tones inside the capture window (offset from the tuner centre, Hz).
 pub fn cw_record(rng: &mut Rng, fs_n: f64, n: usize, tones: &[(f64, f64)]) -> Vec<C32> {
-    let phases: Vec<f64> = tones.iter().map(|_| rng.range(0.0, 6.283)).collect();
+    let phases: Vec<f64> = tones.iter().map(|_| rng.range(0.0, std::f64::consts::TAU)).collect();
     (0..n)
         .map(|i| {
             let t = i as f64 / fs_n;
@@ -150,9 +150,9 @@ pub fn cw_record(rng: &mut Rng, fs_n: f64, n: usize, tones: &[(f64, f64)]) -> Ve
 pub fn fm_record(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)]) -> Vec<C32> {
     let mut rec = vec![C32::new(0.0, 0.0); n];
     for &(off, amp) in stations {
-        let tones: Vec<(f64, f64, f64)> = (0..4).map(|_| (rng.range(200.0, 6000.0), rng.range(0.05, 0.25), rng.range(0.0, 6.283))).collect();
+        let tones: Vec<(f64, f64, f64)> = (0..4).map(|_| (rng.range(200.0, 6000.0), rng.range(0.05, 0.25), rng.range(0.0, std::f64::consts::TAU))).collect();
         let slow = rng.range(0.5, 3.0);
-        let mut phase = rng.range(0.0, 6.283);
+        let mut phase = rng.range(0.0, std::f64::consts::TAU);
         for (i, v) in rec.iter_mut().enumerate() {
             let t = i as f64 / fs_n;
             let mut m = 0.1 * (2.0 * std::f64::consts::PI * 19_000.0 * t).sin();
