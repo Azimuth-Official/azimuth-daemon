@@ -352,8 +352,9 @@ pub struct DtvScanConfig {
     #[serde(default = "default_dtv_sweep_threshold")]
     pub sweep_threshold: f32,
     /// Region-derived (never written to config.toml): the DTV standard the
-    /// scanner routes on ("ATSC", "DVB-T2-694", ...), the channel width and the
-    /// first channel number of the raster.
+    /// scanner routes on ("" or "ATSC" = legacy path, "DVB-T"/"DVB-T2" = DVB
+    /// detector), the channel width (0 = derive from sweep_step) and the first
+    /// channel number (0 = legacy). sweep_start is the lower edge of channel 0.
     #[serde(default = "default_dtv_standard", skip_serializing)]
     pub standard: String,
     #[serde(default = "default_dtv_channel_mhz", skip_serializing)]
@@ -378,13 +379,13 @@ impl Default for DtvScanConfig {
 }
 
 fn default_dtv_standard() -> String {
-    "ATSC".to_string()
+    String::new() // "" = legacy ATSC path
 }
 fn default_dtv_channel_mhz() -> u32 {
-    6
+    0 // 0 = derive from sweep_step
 }
 fn default_dtv_first_channel() -> u32 {
-    14
+    0 // 0 = legacy channel numbering
 }
 
 fn default_dtv_sweep_start() -> u64 {
