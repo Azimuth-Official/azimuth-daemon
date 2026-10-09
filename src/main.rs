@@ -488,13 +488,12 @@ async fn main() -> anyhow::Result<()> {
     // GPS reader task — provides RTCM3 channel and auto-detection
     let (rtcm_tx, rtcm_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let app_state_gps = Arc::clone(&app_state);
-    // GpsConfig was dead code until now — nothing outside config.rs read it, so
-    // `enabled`/`port`/`baud_rate` had no effect at all. unwrap_or_default() is
-    // only safe because GpsConfig has a hand-written Default (a derived one
-    // would give enabled: false and silently kill GPS fleet-wide).
-    let gps_config = config.gps.clone().unwrap_or_default();
+    // The GPS task reads its settings from the watch channel built above from
+    // `config.gps.unwrap_or_default()` (safe only because GpsConfig has a
+    // hand-written Default: a derived one would give enabled: false and
+    // silently kill GPS fleet-wide). POST /config/write updates the channel.
     tokio::spawn(async move {
-        gps::run_gps_task(Arc::clone(&app_state_gps.status), rtcm_rx, gps_config).await;
+        gps::run_gps_task(Arc::clone(&app_state_gps.status), rtcm_rx, gps_cfg_rx).await;
     });
 
     // Spawn NTRIP client task

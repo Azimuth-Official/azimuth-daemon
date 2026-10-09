@@ -89,6 +89,9 @@ pub enum Tier {
     UsbSerialBridge = 2,
     /// No usable vid — probed only because valid NMEA is the real proof.
     Unidentified = 3,
+    /// A USB device with a vendor id we don't recognise (and not a phone or
+    /// modem). Tried only after the ports that reported no vid at all.
+    UnknownUsb = 4,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -260,6 +263,12 @@ pub fn rank_candidates(
             continue;
         }
 
+        // Phones and cellular modems expose AT/diagnostic ports that are never
+        // a GPS; skip them (they stay selectable by hand).
+        if is_modem_port(p) {
+            continue;
+        }
+
         let tier = if p.vid == Some(UBLOX_VID) {
             Tier::KnownGps
         } else if matches!(
@@ -270,12 +279,13 @@ pub fn rank_candidates(
         } else if p.vid.is_none() {
             Tier::Unidentified
         } else {
-            // A USB device with a vid we don't recognise. Treat it like any
-            // other unidentified port rather than dropping it outright.
-            Tier::Unidentified
+            // A USB device with a vid we don't recognise. Probed, but only after
+            // the ports that reported no vid at all (a VK-162 on a generic
+            // driver shows up as such a plain COM port).
+            Tier::UnknownUsb
         };
 
-        if tier == Tier::Unidentified && !policy.probe_unknown_ports {
+        if tier >= Tier::Unidentified && !policy.probe_unknown_ports {
             continue;
         }
         // Backoff applies only to the speculative tiers; a u-blox port keeps
@@ -297,7 +307,7 @@ pub fn rank_candidates(
         });
     }
 
-    out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.port_name.cmp(&b.port_name)));
+    out.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| natural_cmp(&a.port_name, &b.port_name)));
     out
 }
 
@@ -511,6 +521,383 @@ fn parse_vtg(sentence: &str) -> Option<f32> {
     parts[5].trim().parse().ok()
 }
 
+// ---------------------------------------------------------------------------
+// M2: natural port ordering, modem exclusion, baud promotion, precise errors
+// ---------------------------------------------------------------------------
+
+/// Natural ordering for port names: `COM5` sorts before `COM11` (a plain string
+/// compare put COM11..COM14 ahead of COM5 and spent the probe budget on them).
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, buf)) if *d == digit => buf.push(c),
+                _ => out.push((digit, c.to_string())),
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for (x, y) in ca.iter().zip(cb.iter()) {
+        let ord = if x.0 && y.0 {
+            let (nx, ny) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
+            nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny))
+        } else {
+            x.1.to_ascii_lowercase().cmp(&y.1.to_ascii_lowercase())
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    ca.len().cmp(&cb.len())
+}
+
+/// Phones and cellular modems expose AT/diagnostic serial ports that can never
+/// be a GPS receiver. They are not auto-probed (still selectable by hand).
+pub fn is_modem_port(p: &SerialPortInfo) -> bool {
+    let text = format!(
+        "{} {}",
+        p.product.as_deref().unwrap_or(""),
+        p.manufacturer.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    text.contains("modem") || text.contains("mobile usb") || text.contains("diagnostic")
+}
+
+/// Result of one baud attempt on one port.
+pub enum Attempt<T> {
+    /// Valid NMEA arrived.
+    Nmea(T),
+    /// Bytes arrived but no valid NMEA line: a receiver at another baud rate
+    /// (or something that is not a GPS at all).
+    Bytes,
+    /// Nothing arrived.
+    Silent,
+    /// The OS refused to open the port: another program holds it.
+    Denied,
+    Failed(String),
+}
+
+pub enum BaudSearch<T> {
+    Found(T, u32),
+    NotFound { saw_bytes: bool, denied: bool, error: Option<String> },
+}
+
+/// Try `bauds` in order until one yields NMEA. A denied open ends the search at
+/// once (permission does not depend on baud rate).
+pub async fn find_baud<T, F, Fut>(bauds: &[u32], mut attempt: F) -> BaudSearch<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Attempt<T>>,
+{
+    let (mut saw_bytes, mut error) = (false, None);
+    for &baud in bauds {
+        match attempt(baud).await {
+            Attempt::Nmea(t) => return BaudSearch::Found(t, baud),
+            Attempt::Bytes => saw_bytes = true,
+            Attempt::Silent => {}
+            Attempt::Denied => return BaudSearch::NotFound { saw_bytes, denied: true, error: None },
+            Attempt::Failed(e) => error = Some(e),
+        }
+    }
+    BaudSearch::NotFound { saw_bytes, denied: false, error }
+}
+
+/// What the daemon has learned about a port in this session.
+#[derive(Debug, Default, Clone)]
+pub struct PortContact {
+    /// First contact (9600 only) has happened; the next probe sweeps every baud.
+    pub escalated: bool,
+}
+
+/// Probe one port. Speculative (unidentified) ports get 9600 on first contact,
+/// then the REST of the sweep as soon as they show bytes, or on the next round
+/// after a silent first contact. Known receivers sweep every baud at once.
+pub async fn probe_with<T, F, Fut>(
+    speculative: bool,
+    contact: &mut PortContact,
+    full_bauds: &[u32],
+    mut attempt: F,
+) -> BaudSearch<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Attempt<T>>,
+{
+    if !speculative || contact.escalated {
+        return find_baud(full_bauds, &mut attempt).await;
+    }
+    let first = find_baud(&[9600], &mut attempt).await;
+    contact.escalated = true;
+    match first {
+        BaudSearch::NotFound { saw_bytes: true, denied: false, .. } => {
+            let rest: Vec<u32> = full_bauds.iter().copied().filter(|b| *b != 9600).collect();
+            match find_baud(&rest, &mut attempt).await {
+                BaudSearch::NotFound { error, denied, .. } => {
+                    BaudSearch::NotFound { saw_bytes: true, denied, error }
+                }
+                found => found,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Short, user-facing explanation of an access-denied open. The log has the
+/// long form (`permission_denied_hint`); this is what `/status` carries.
+pub fn access_denied_hint(port: &str) -> String {
+    access_denied_hint_for(port, cfg!(windows))
+}
+
+pub fn access_denied_hint_for(port: &str, windows: bool) -> String {
+    if windows {
+        format!(
+            "{port} is held by another program. Close u-center, PuTTY or any serial terminal that \
+             has it open, and any other azimuth-daemon. If Windows installed \"Microsoft Serial \
+             BallPoint\" (or a vendor GNSS sensor driver) for this receiver, disable that device in \
+             Device Manager so the port is free."
+        )
+    } else {
+        format!(
+            "Permission denied on {port}. Add your user to the 'dialout' group and sign in again, or \
+             close any program that has the port open."
+        )
+    }
+}
+
+/// Plain-language reason for a failed probe, for `/status.gps` and the
+/// candidate list. `(last_result, error_kind)`.
+pub fn describe_failure(saw_bytes: bool, denied: bool, error: Option<&str>) -> (String, Option<&'static str>) {
+    if denied {
+        ("access_denied".to_string(), Some("access_denied"))
+    } else if saw_bytes {
+        ("wrong_baud".to_string(), Some("wrong_baud"))
+    } else if let Some(e) = error {
+        (format!("open_failed: {e}"), Some("no_data"))
+    } else {
+        ("no_data".to_string(), Some("no_data"))
+    }
+}
+
+/// One entry of `/status.gps.candidates`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpsCandidateInfo {
+    pub port_name: String,
+    pub port_type: String,
+    pub vid: Option<u16>,
+    pub pid: Option<u16>,
+    pub product: Option<String>,
+    pub probed: bool,
+    pub last_result: String,
+}
+
+/// `/status.gps`: what the GPS task is doing and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpsInfo {
+    /// "absent" | "searching" | "fix" | "error"
+    pub state: String,
+    pub port: Option<String>,
+    pub baud: Option<u32>,
+    /// null | "access_denied" | "no_data" | "wrong_baud"
+    pub error_kind: Option<String>,
+    pub error_hint: Option<String>,
+    pub candidates: Vec<GpsCandidateInfo>,
+}
+
+impl Default for GpsInfo {
+    fn default() -> Self {
+        Self {
+            state: "absent".to_string(),
+            port: None,
+            baud: None,
+            error_kind: None,
+            error_hint: None,
+            candidates: Vec::new(),
+        }
+    }
+}
+
+/// Build the candidate list shown to the user: every port with its type, ids,
+/// whether it is probed automatically, and the latest probe result.
+pub fn ui_candidates(
+    ports: &[SerialPortInfo],
+    probed: &[GpsCandidate],
+    results: &HashMap<String, String>,
+) -> Vec<GpsCandidateInfo> {
+    let mut v: Vec<GpsCandidateInfo> = ports
+        .iter()
+        .map(|p| {
+            let auto = probed.iter().any(|c| c.port_name == p.port_name);
+            let last_result = results.get(&p.port_name).cloned().unwrap_or_else(|| {
+                if auto {
+                    "pending".to_string()
+                } else if is_modem_port(p) {
+                    "skipped: phone or modem port".to_string()
+                } else {
+                    "not probed".to_string()
+                }
+            });
+            GpsCandidateInfo {
+                port_name: p.port_name.clone(),
+                port_type: p.port_type.clone(),
+                vid: p.vid,
+                pid: p.pid,
+                product: p.product.clone(),
+                probed: auto,
+                last_result,
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| natural_cmp(&a.port_name, &b.port_name));
+    v
+}
+
+/// Read from an opened port for up to `window`, classifying what arrives.
+async fn read_window(
+    reader: &mut BufReader<tokio_serial::SerialStream>,
+    window: Duration,
+    keep: &mut Vec<String>,
+) -> Attempt<()> {
+    use tokio::io::AsyncReadExt;
+    let deadline = tokio::time::Instant::now() + window;
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, reader.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                data.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&data);
+                if text.lines().any(nmea_line_valid) && text.contains('\n') {
+                    for l in text.lines().filter(|l| nmea_line_valid(l)).take(20) {
+                        keep.push(l.trim().to_string());
+                    }
+                    return Attempt::Nmea(());
+                }
+                if data.len() > 4096 {
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    if data.is_empty() {
+        Attempt::Silent
+    } else {
+        Attempt::Bytes
+    }
+}
+
+/// One real attempt at one baud: open, read for `window`, classify. On NMEA the
+/// still-open reader is returned.
+async fn attempt_port(
+    port: &str,
+    baud: u32,
+    window: Duration,
+) -> Attempt<BufReader<tokio_serial::SerialStream>> {
+    match tokio_serial::new(port, baud).open_native_async() {
+        Ok(stream) => {
+            debug!(port = %port, baud, "Serial port opened, validating NMEA");
+            let mut reader = BufReader::new(stream);
+            let mut lines = Vec::new();
+            match read_window(&mut reader, window, &mut lines).await {
+                Attempt::Nmea(()) => {
+                    info!(port = %port, baud, "NMEA validated on serial port");
+                    Attempt::Nmea(reader)
+                }
+                Attempt::Bytes => Attempt::Bytes,
+                Attempt::Silent => Attempt::Silent,
+                Attempt::Denied => Attempt::Denied,
+                Attempt::Failed(e) => Attempt::Failed(e),
+            }
+        }
+        Err(e) => {
+            if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
+                warn_permission_denied(port);
+                Attempt::Denied
+            } else {
+                debug!(port = %port, baud, error = %e, "Serial port open failed");
+                Attempt::Failed(e.to_string())
+            }
+        }
+    }
+}
+
+/// Outcome of `preview_port`, returned by `POST /gps/preview`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewResult {
+    pub lines: Vec<String>,
+    /// "nmea" | "wrong_baud" | "no_data" | "access_denied" | "open_failed"
+    pub verdict: String,
+    pub baud: Option<u32>,
+    pub error_kind: Option<String>,
+    pub error_hint: Option<String>,
+}
+
+/// Open `port` briefly, show what it sends and close it again. `baud` None
+/// means auto (sweep). Never keeps the port open afterwards.
+pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> PreviewResult {
+    let total = Duration::from_secs_f32(seconds.clamp(0.5, 3.0));
+    let bauds: Vec<u32> = match baud {
+        Some(b) => vec![b],
+        None => vec![9600, 4800, 38400, 115200],
+    };
+    let per = total / bauds.len() as u32;
+    let (mut saw_bytes, mut error) = (false, None::<String>);
+    for &b in &bauds {
+        match tokio_serial::new(port, b).open_native_async() {
+            Ok(stream) => {
+                let mut reader = BufReader::new(stream);
+                let mut lines = Vec::new();
+                match read_window(&mut reader, per, &mut lines).await {
+                    Attempt::Nmea(()) => {
+                        return PreviewResult {
+                            lines,
+                            verdict: "nmea".to_string(),
+                            baud: Some(b),
+                            error_kind: None,
+                            error_hint: None,
+                        }
+                    }
+                    Attempt::Bytes => saw_bytes = true,
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
+                    return PreviewResult {
+                        lines: vec![],
+                        verdict: "access_denied".to_string(),
+                        baud: None,
+                        error_kind: Some("access_denied".to_string()),
+                        error_hint: Some(access_denied_hint(port)),
+                    };
+                }
+                error = Some(e.to_string());
+            }
+        }
+    }
+    let (verdict, kind) = describe_failure(saw_bytes, false, error.as_deref());
+    let verdict = if verdict.starts_with("open_failed") { "open_failed".to_string() } else { verdict };
+    PreviewResult {
+        lines: vec![],
+        verdict,
+        baud: None,
+        error_kind: kind.map(str::to_string),
+        error_hint: Some(match kind {
+            Some("wrong_baud") => format!(
+                "{port} sends data that is not NMEA at the rates tried. Pick the receiver's baud rate explicitly."
+            ),
+            _ => format!("{port} sent nothing. Check that this is the GPS receiver's port and that it is plugged in."),
+        }),
+    }
+}
+
 /// Run the GPS reader task
 /// - Detects GPS on available serial ports every 5s
 /// - Parses NMEA GGA sentences and updates StatusState
@@ -519,40 +906,57 @@ fn parse_vtg(sentence: &str) -> Option<f32> {
 pub async fn run_gps_task(
     state: Arc<RwLock<StatusState>>,
     _rtcm_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    gps_config: GpsConfig,
+    mut cfg_rx: tokio::sync::watch::Receiver<GpsConfig>,
 ) {
     const DETECTION_INTERVAL_SECS: u64 = 5;
     const ACCURACY_HISTORY_MAX: usize = 180;
+    const NMEA_TAIL_MAX: usize = 20;
     const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
     /// Wall-clock ceiling for speculative probing in one detection round, so a
     /// machine with many unidentified COM ports doesn't stall the loop.
     const TIER3_PROBE_BUDGET: Duration = Duration::from_secs(20);
+    /// An access-denied port is retried quickly: the holder (u-center, a
+    /// terminal) is often closed within seconds of reading the hint.
+    const DENIED_RETRY: Duration = Duration::from_secs(30);
 
-    let sample_interval_secs = gps_config.sample_interval_secs.max(1);
-
-    if !gps_config.enabled {
-        info!("GPS disabled by config ([gps] enabled = false); GPS task parked");
-        return;
+    /// Sleep, but wake early when the GPS settings change.
+    async fn pause(cfg_rx: &mut tokio::sync::watch::Receiver<GpsConfig>, secs: u64) {
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(secs)) => {}
+            _ = cfg_rx.changed() => {}
+        }
     }
 
-    // A configured port skips auto-detection entirely, so it only needs the one
-    // baud (plus fallbacks). Unidentified ports get 9600 only on first contact —
-    // the VK-162 and u-blox modules default to it — and are promoted to the full
-    // sweep only once they have proven they emit bytes.
-    let full_bauds: Vec<u32> = match gps_config.baud_rate {
-        Some(b) => {
-            let mut v = vec![b, 9600, 115200, 4800];
-            v.dedup();
-            v
-        }
-        None => vec![9600, 115200, 4800],
-    };
-    let first_contact_bauds = &[9600u32];
-
     let mut cache = ProbeCache::new();
+    let mut contacts: HashMap<String, PortContact> = HashMap::new();
+    let mut results: HashMap<String, String> = HashMap::new();
     let mut last_sample_time = tokio::time::Instant::now(); // accuracy sampling interval
 
     loop {
+        // Settings can change at runtime (a manual port pick from the app).
+        let gps_config = cfg_rx.borrow_and_update().clone();
+        let sample_interval_secs = gps_config.sample_interval_secs.max(1);
+
+        if !gps_config.enabled {
+            info!("GPS disabled by config ([gps] enabled = false); GPS task parked");
+            state.write().await.gps_info = GpsInfo::default();
+            if cfg_rx.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // A configured port skips auto-detection entirely, so it only needs the one
+        // baud (plus fallbacks). Unidentified ports get 9600 only on first contact —
+        // the VK-162 and u-blox modules default to it — and are promoted to the full
+        // sweep once they show bytes or after a silent first contact.
+        let mut full_bauds: Vec<u32> = Vec::new();
+        for b in gps_config.baud_rate.into_iter().chain([9600, 4800, 38400, 115200]) {
+            if !full_bauds.contains(&b) {
+                full_bauds.push(b);
+            }
+        }
+
         debug!("GPS detection scan starting");
 
         let rtk_serial_port = {
@@ -570,10 +974,23 @@ pub async fn run_gps_task(
             retry_max: Duration::from_secs(gps_config.probe_retry_max_secs.max(1)),
         };
 
-        let candidates = detect_gps_candidates(&policy, &mut cache);
+        let ports = list_serial_ports();
+        cache.retain_present(&ports);
+        contacts.retain(|name, _| ports.iter().any(|p| &p.port_name == name));
+        results.retain(|name, _| ports.iter().any(|p| &p.port_name == name));
+        let candidates = rank_candidates(&ports, &policy, &cache, Instant::now());
+        let forced = policy.forced_port.clone().filter(|p| !p.is_empty());
+
         if candidates.is_empty() {
             debug!("No GPS candidates, retrying in {}s", DETECTION_INTERVAL_SECS);
-            tokio::time::sleep(tokio::time::Duration::from_secs(DETECTION_INTERVAL_SECS)).await;
+            {
+                let mut s = state.write().await;
+                s.gps_info.state = "absent".to_string();
+                s.gps_info.error_kind = None;
+                s.gps_info.error_hint = None;
+                s.gps_info.candidates = ui_candidates(&ports, &candidates, &results);
+            }
+            pause(&mut cfg_rx, DETECTION_INTERVAL_SECS).await;
             continue;
         }
 
@@ -583,28 +1000,51 @@ pub async fn run_gps_task(
         // real receiver sitting behind it.
         let budget_start = Instant::now();
         let mut opened: Option<(BufReader<tokio_serial::SerialStream>, u32, GpsCandidate)> = None;
+        let mut denied_port: Option<String> = None;
         for cand in &candidates {
             if cand.tier >= Tier::Unidentified && budget_start.elapsed() > TIER3_PROBE_BUDGET {
                 debug!("Tier-3 probe budget spent for this round; resuming next scan");
                 break;
             }
-            let bauds: &[u32] = if cand.tier >= Tier::Unidentified {
-                first_contact_bauds
-            } else {
-                &full_bauds
-            };
+            let speculative = cand.tier >= Tier::Unidentified;
+            let window = Duration::from_millis(if speculative { 1500 } else { 2000 });
             debug!(port = %cand.port_name, tier = ?cand.tier, "Probing serial port for NMEA");
-            if let Some((reader, baud)) = try_open_serial(&cand.port_name, bauds).await {
-                opened = Some((reader, baud, cand.clone()));
-                break;
-            }
-            // Only speculative tiers earn a backoff entry.
-            if cand.tier >= Tier::UsbSerialBridge {
-                if let Some(info) = list_serial_ports()
-                    .into_iter()
-                    .find(|p| p.port_name == cand.port_name)
-                {
-                    cache.record_failure(&info, Instant::now(), policy.retry_base, policy.retry_max);
+
+            let mut contact = contacts.get(&cand.port_name).cloned().unwrap_or_default();
+            let was_escalated = contact.escalated;
+            let name = cand.port_name.clone();
+            let search = probe_with(speculative, &mut contact, &full_bauds, |baud| {
+                let name = name.clone();
+                async move { attempt_port(&name, baud, window).await }
+            })
+            .await;
+            contacts.insert(cand.port_name.clone(), contact);
+
+            match search {
+                BaudSearch::Found(reader, baud) => {
+                    results.insert(cand.port_name.clone(), format!("nmea@{baud}"));
+                    opened = Some((reader, baud, cand.clone()));
+                    break;
+                }
+                BaudSearch::NotFound { saw_bytes, denied, error } => {
+                    let (result, _kind) = describe_failure(saw_bytes, denied, error.as_deref());
+                    results.insert(cand.port_name.clone(), result);
+                    if denied {
+                        denied_port.get_or_insert_with(|| cand.port_name.clone());
+                    }
+                    // Only speculative tiers earn a backoff entry, and a silent
+                    // first contact does not: the next round sweeps every baud.
+                    let first_contact_miss = speculative && !was_escalated && !saw_bytes && !denied;
+                    if cand.tier >= Tier::UsbSerialBridge && !first_contact_miss {
+                        if let Some(info) = ports.iter().find(|p| p.port_name == cand.port_name) {
+                            let (base, max) = if denied {
+                                (DENIED_RETRY, DENIED_RETRY)
+                            } else {
+                                (policy.retry_base, policy.retry_max)
+                            };
+                            cache.record_failure(info, Instant::now(), base, max);
+                        }
+                    }
                 }
             }
         }
@@ -612,8 +1052,37 @@ pub async fn run_gps_task(
         let (port_name, device_name) = match &opened {
             Some((_, _, c)) => (c.port_name.clone(), c.device_name.clone()),
             None => {
+                // Publish WHY nothing was found: a held port (access denied) is
+                // an error the user can fix; plain silence is just "absent".
+                {
+                    let mut s = state.write().await;
+                    s.gps_info.candidates = ui_candidates(&ports, &candidates, &results);
+                    s.gps_info.port = None;
+                    s.gps_info.baud = None;
+                    if let Some(p) = denied_port.as_ref() {
+                        s.gps_info.state = "error".to_string();
+                        s.gps_info.error_kind = Some("access_denied".to_string());
+                        s.gps_info.error_hint = Some(access_denied_hint(p));
+                        s.gps_info.port = Some(p.clone());
+                    } else if let Some(f) = forced.as_ref() {
+                        let r = results.get(f).cloned().unwrap_or_default();
+                        let kind = if r == "wrong_baud" { "wrong_baud" } else { "no_data" };
+                        s.gps_info.state = "error".to_string();
+                        s.gps_info.error_kind = Some(kind.to_string());
+                        s.gps_info.error_hint = Some(if kind == "wrong_baud" {
+                            format!("{f} sends data that is not NMEA at the rates tried; set the receiver's baud rate explicitly.")
+                        } else {
+                            format!("Nothing was read from the selected port {f}. Check the port choice and the cable.")
+                        });
+                        s.gps_info.port = Some(f.clone());
+                    } else {
+                        s.gps_info.state = "absent".to_string();
+                        s.gps_info.error_kind = None;
+                        s.gps_info.error_hint = None;
+                    }
+                }
                 debug!("No GPS validated this round, retrying in {}s", DETECTION_INTERVAL_SECS);
-                tokio::time::sleep(tokio::time::Duration::from_secs(DETECTION_INTERVAL_SECS)).await;
+                pause(&mut cfg_rx, DETECTION_INTERVAL_SECS).await;
                 continue;
             }
         };
@@ -629,6 +1098,9 @@ pub async fn run_gps_task(
             s.gps_detected = true;
             s.gps_port = Some(port_name.clone());
             s.gps_device_name = Some(device_name.clone());
+            s.gps_info.baud = opened.as_ref().map(|(_, b, _)| *b);
+            s.gps_info.candidates = ui_candidates(&ports, &candidates, &results);
+            s.refresh_gps_state();
         }
 
         match opened.map(|(r, b, _)| (r, b)) {
@@ -640,12 +1112,17 @@ pub async fn run_gps_task(
                 let mut consecutive_timeouts: u32 = 0;
 
                 loop {
-                    // Check if GPS task should stop (detection re-triggered)
+                    // Check if GPS task should stop (detection re-triggered, or the
+                    // settings changed: e.g. the user picked another port)
                     {
                         let s = state.read().await;
                         if !s.gps_detected {
                             break;
                         }
+                    }
+                    if cfg_rx.has_changed().unwrap_or(false) {
+                        info!("GPS settings changed — re-detecting");
+                        break;
                     }
 
                     line.clear();
@@ -668,6 +1145,13 @@ pub async fn run_gps_task(
                             if trimmed.is_empty() {
                                 continue;
                             }
+                            if trimmed.starts_with('$') {
+                                let mut s = state.write().await;
+                                s.gps_nmea_tail.push_back(trimmed.to_string());
+                                while s.gps_nmea_tail.len() > NMEA_TAIL_MAX {
+                                    s.gps_nmea_tail.pop_front();
+                                }
+                            }
 
                             // Try to parse GGA sentence
                             if trimmed.starts_with("$") && trimmed.contains("GGA") {
@@ -682,6 +1166,7 @@ pub async fn run_gps_task(
                                     s.gps_longitude = Some(lon);
                                     s.gps_altitude_m = Some(alt);
                                     s.gps_last_fix = Some(chrono::Utc::now().to_rfc3339());
+                                    s.refresh_gps_state();
 
                                     // Sample accuracy history every 10s
                                     if last_sample_time.elapsed() >= tokio::time::Duration::from_secs(sample_interval_secs) {
@@ -762,6 +1247,10 @@ pub async fn run_gps_task(
                     s.gps_lat_error_m = None;
                     s.gps_lon_error_m = None;
                     s.gps_last_fix = None;
+                    s.gps_nmea_tail.clear();
+                    s.gps_info.state = "absent".to_string();
+                    s.gps_info.port = None;
+                    s.gps_info.baud = None;
                 }
 
                 info!("GPS disconnected, restarting detection");
@@ -1091,5 +1580,170 @@ mod tests {
     fn gps_config_absent_section_deserializes_to_enabled() {
         let cfg: GpsConfig = toml::from_str("").expect("empty [gps] table");
         assert!(cfg.enabled);
+    }
+
+    // --- M2: the reporter's real port list, ordering, baud promotion --------
+
+    fn usb(name: &str, vid: u16, pid: u16, product: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: "usb".to_string(),
+            vid: Some(vid),
+            pid: Some(pid),
+            manufacturer: Some("SAMSUNG Electronics Co., Ltd.".to_string()),
+            product: Some(product.to_string()),
+            serial_number: None,
+        }
+    }
+
+    /// The exact 5-port list from the field report (COM5 is the VK-162).
+    fn reporter_ports() -> Vec<SerialPortInfo> {
+        vec![
+            port("COM5", None, "unknown"),
+            usb("COM11", 1256, 26720, "SAMSUNG Mobile USB Modem"),
+            usb("COM12", 1256, 26720, "SAMSUNG Mobile USB Modem #2"),
+            usb("COM13", 1256, 26720, "SAMSUNG Mobile USB Modem #3"),
+            usb("COM14", 1256, 26720, "SAMSUNG Mobile USB Modem #4"),
+        ]
+    }
+
+    #[test]
+    fn reporters_port_list_probes_com5_and_no_phone_modem() {
+        let got = rank_candidates(&reporter_ports(), &policy(), &ProbeCache::new(), Instant::now());
+        let names: Vec<&str> = got.iter().map(|c| c.port_name.as_str()).collect();
+        assert_eq!(names, vec!["COM5"], "phone modems must not be auto-probed");
+    }
+
+    #[test]
+    fn modem_ports_stay_listed_for_manual_choice_but_are_not_probed() {
+        let ports = reporter_ports();
+        let probed = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        let ui = ui_candidates(&ports, &probed, &HashMap::new());
+        assert_eq!(ui.len(), 5);
+        let com5 = ui.iter().find(|c| c.port_name == "COM5").unwrap();
+        assert!(com5.probed);
+        let com11 = ui.iter().find(|c| c.port_name == "COM11").unwrap();
+        assert!(!com11.probed);
+        assert!(com11.last_result.contains("modem"), "{}", com11.last_result);
+        assert_eq!(com11.vid, Some(1256));
+        assert_eq!(com11.product.as_deref(), Some("SAMSUNG Mobile USB Modem"));
+    }
+
+    #[test]
+    fn com5_sorts_before_com11_naturally() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp("COM5", "COM11"), Less);
+        assert_eq!(natural_cmp("COM11", "COM5"), Greater);
+        assert_eq!(natural_cmp("COM14", "COM14"), Equal);
+        assert_eq!(natural_cmp("/dev/ttyUSB2", "/dev/ttyUSB10"), Less);
+        // Two plain no-VID ports (no modems): numeric, not lexicographic.
+        let ports = vec![
+            port("COM12", None, "unknown"),
+            port("COM5", None, "unknown"),
+            port("COM3", None, "unknown"),
+        ];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        let names: Vec<&str> = got.iter().map(|c| c.port_name.as_str()).collect();
+        assert_eq!(names, vec!["COM3", "COM5", "COM12"]);
+    }
+
+    #[test]
+    fn no_vid_ports_rank_before_unknown_usb_devices() {
+        let ports = vec![
+            usb("COM3", 0x1234, 0x5678, "Some USB Serial Thing"),
+            port("COM12", None, "unknown"),
+        ];
+        let got = rank_candidates(&ports, &policy(), &ProbeCache::new(), Instant::now());
+        assert_eq!(got[0].port_name, "COM12");
+        assert_eq!(got[0].tier, Tier::Unidentified);
+        assert_eq!(got[1].port_name, "COM3");
+        assert_eq!(got[1].tier, Tier::UnknownUsb);
+    }
+
+    #[tokio::test]
+    async fn no_vid_port_at_4800_is_detected_after_first_contact_shows_bytes() {
+        // The receiver streams NMEA at 4800 only. At 9600 the same stream is
+        // garbled but non-empty ("bytes seen"): promotion must follow at once.
+        let mut contact = PortContact::default();
+        let tried = std::sync::Mutex::new(Vec::new());
+        let r = probe_with(true, &mut contact, &[9600, 4800, 38400, 115200], |baud| {
+            tried.lock().unwrap().push(baud);
+            async move {
+                match baud {
+                    4800 => Attempt::Nmea("reader"),
+                    9600 => Attempt::Bytes,
+                    _ => Attempt::Silent,
+                }
+            }
+        })
+        .await;
+        assert!(matches!(r, BaudSearch::Found("reader", 4800)));
+        assert_eq!(*tried.lock().unwrap(), vec![9600, 4800]);
+    }
+
+    #[tokio::test]
+    async fn silent_first_contact_escalates_to_the_full_sweep_next_round() {
+        let mut contact = PortContact::default();
+        let attempt = |baud: u32| async move {
+            if baud == 4800 { Attempt::Nmea(()) } else { Attempt::Silent }
+        };
+        let first = probe_with(true, &mut contact, &[9600, 4800, 38400, 115200], attempt).await;
+        assert!(matches!(first, BaudSearch::NotFound { saw_bytes: false, .. }));
+        assert!(contact.escalated, "a first-contact miss must promote the port");
+        let second = probe_with(true, &mut contact, &[9600, 4800, 38400, 115200], attempt).await;
+        assert!(matches!(second, BaudSearch::Found((), 4800)));
+    }
+
+    #[tokio::test]
+    async fn known_receivers_sweep_every_baud_immediately() {
+        let mut contact = PortContact::default();
+        let r = probe_with(false, &mut contact, &[9600, 4800], |b| async move {
+            if b == 4800 { Attempt::Nmea(()) } else { Attempt::Silent }
+        })
+        .await;
+        assert!(matches!(r, BaudSearch::Found((), 4800)));
+    }
+
+    #[tokio::test]
+    async fn access_denied_stops_the_search_and_is_reported() {
+        let mut contact = PortContact::default();
+        let tried = std::sync::Mutex::new(0u32);
+        let r: BaudSearch<()> = probe_with(false, &mut contact, &[9600, 4800, 38400], |_| {
+            *tried.lock().unwrap() += 1;
+            async { Attempt::Denied }
+        })
+        .await;
+        assert!(matches!(r, BaudSearch::NotFound { denied: true, .. }));
+        assert_eq!(*tried.lock().unwrap(), 1, "permission does not depend on baud");
+        let (res, kind) = describe_failure(false, true, None);
+        assert_eq!((res.as_str(), kind), ("access_denied", Some("access_denied")));
+    }
+
+    #[test]
+    fn failure_kinds_are_distinguished() {
+        assert_eq!(describe_failure(true, false, None).1, Some("wrong_baud"));
+        assert_eq!(describe_failure(false, false, None).1, Some("no_data"));
+    }
+
+    #[test]
+    fn windows_access_denied_hint_names_serial_ballpoint_and_the_port() {
+        let h = access_denied_hint_for("COM5", true);
+        assert!(h.contains("COM5") && h.contains("Microsoft Serial BallPoint"), "{h}");
+        assert!(h.contains("u-center"));
+        assert!(!h.contains("dialout"));
+        assert!(access_denied_hint_for("/dev/ttyUSB0", false).contains("dialout"));
+    }
+
+    #[test]
+    fn gps_status_object_has_the_contract_keys() {
+        let mut info = GpsInfo::default();
+        info.candidates = ui_candidates(&reporter_ports(), &[], &HashMap::new());
+        let v = serde_json::to_value(&info).unwrap();
+        for k in ["state", "port", "baud", "error_kind", "error_hint", "candidates"] {
+            assert!(v.get(k).is_some(), "missing {k}");
+        }
+        for k in ["port_name", "port_type", "vid", "pid", "product", "probed", "last_result"] {
+            assert!(v["candidates"][0].get(k).is_some(), "candidate missing {k}");
+        }
     }
 }

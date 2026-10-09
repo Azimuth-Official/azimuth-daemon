@@ -95,6 +95,7 @@ pub struct StatusInfo {
     pub driver: DriverInfo,
     pub sdr_test_last: Option<serde_json::Value>,
     pub sdr_diagnostics: SdrDiagnostics,
+    pub gps: crate::gps::GpsInfo,
 }
 
 /// Counters that help support triage SDR problems.
@@ -138,6 +139,9 @@ pub struct StatusState {
     pub gps_lon_error_m: Option<f32>,
     pub gps_last_fix: Option<String>,
     pub gps_accuracy_history: VecDeque<AccuracyPoint>,
+    pub gps_info: crate::gps::GpsInfo,
+    /// Last NMEA sentences read from the detected receiver (live preview).
+    pub gps_nmea_tail: VecDeque<String>,
     pub config_error: Option<String>,
     pub auth_error: Option<String>,
     pub config_state: ConfigState,
@@ -250,6 +254,8 @@ impl StatusState {
             gps_lon_error_m: None,
             gps_last_fix: None,
             gps_accuracy_history: VecDeque::new(),
+            gps_info: crate::gps::GpsInfo::default(),
+            gps_nmea_tail: VecDeque::new(),
             config_error: None,
             auth_error: None,
             config_state: ConfigState::AwaitingSetup,
@@ -265,6 +271,16 @@ impl StatusState {
             driver: DriverInfo::not_applicable(),
             sdr_test_last: None,
             sdr_last_capture_ok_at: None,
+        }
+    }
+
+    /// Keep `gps_info.state` in step with the receiver once one is detected.
+    pub fn refresh_gps_state(&mut self) {
+        if self.gps_detected {
+            self.gps_info.state = if self.gps_fix_quality > 0 { "fix" } else { "searching" }.to_string();
+            self.gps_info.port = self.gps_port.clone();
+            self.gps_info.error_kind = None;
+            self.gps_info.error_hint = None;
         }
     }
 
@@ -339,6 +355,7 @@ impl StatusState {
             on_air_reason: self.on_air().1,
             driver: self.driver.clone(),
             sdr_test_last: self.sdr_test_last.clone(),
+            gps: self.gps_info.clone(),
             sdr_diagnostics: SdrDiagnostics {
                 pll_lock_failures: crate::sdr::pll_lock_failures(),
             },
@@ -1103,6 +1120,46 @@ async fn log_path_handler(State(state): State<Arc<AppState>>) -> Json<serde_json
     }))
 }
 
+/// GET /gps/nmea: the daemon's last NMEA sentences from the detected receiver.
+async fn gps_nmea_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let s = state.status.read().await;
+    Json(serde_json::json!({
+        "port": s.gps_port,
+        "lines": s.gps_nmea_tail.iter().cloned().collect::<Vec<_>>(),
+    }))
+}
+
+/// POST /gps/preview {port, baud: number|"auto", seconds <= 3}: open a port
+/// briefly, report what it sends, close it again. The daemon's own GPS port is
+/// refused (409) rather than fought over.
+async fn gps_preview_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let Some(port) = body.get("port").and_then(|p| p.as_str()).filter(|p| !p.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "port is required"})),
+        );
+    };
+    let baud = body.get("baud").and_then(|b| b.as_u64()).map(|b| b as u32);
+    let seconds = body.get("seconds").and_then(|x| x.as_f64()).unwrap_or(2.0) as f32;
+    {
+        let s = state.status.read().await;
+        if s.gps_detected && s.gps_port.as_deref() == Some(port) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "in_use_by_daemon",
+                    "message": "The daemon is already reading this port; see /gps/nmea.",
+                })),
+            );
+        }
+    }
+    let result = crate::gps::preview_port(port, baud, seconds).await;
+    (StatusCode::OK, Json(serde_json::json!(result)))
+}
+
 async fn serial_ports_handler(State(_state): State<Arc<AppState>>) -> Json<Vec<crate::gps::SerialPortInfo>> {
     let ports = crate::gps::list_serial_ports();
     Json(ports)
@@ -1344,6 +1401,8 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/rtk/status", get(rtk_status_handler))
         .route("/rtk/test", post(rtk_test_handler))
         .route("/gps/status", get(gps_status_handler))
+        .route("/gps/nmea", get(gps_nmea_handler))
+        .route("/gps/preview", post(gps_preview_handler))
         .route("/serial/ports", get(serial_ports_handler))
         .route("/log/level", post(log_level_handler))
         .route("/log/path", get(log_path_handler))
