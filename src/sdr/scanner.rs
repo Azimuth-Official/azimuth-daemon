@@ -655,15 +655,28 @@ impl Scanner {
 
     fn record_fm(r: &[crate::sdr::fm_demod::survey::FmChannel], found: &mut Vec<u64>, images: &mut usize, rejected: &mut usize) {
         for c in r {
+            // One line per evaluated channel so a sweep can be audited against a
+            // reference survey (grep "FM channel evaluated").
+            debug!(
+                freq_mhz = c.freq_hz as f64 / 1e6,
+                excess_db = format!("{:.1}", c.excess_db),
+                quality_db = format!("{:.1}", c.quality_db),
+                pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0),
+                rds_pi = ?c.rds_pi,
+                marginal = c.marginal,
+                corroborated = c.corroborated,
+                image = c.image_of_mirror,
+                spill = c.spill_of_neighbour,
+                decision = if c.confirmed { "station" } else { "no" },
+                "FM channel evaluated"
+            );
             if c.confirmed {
-                info!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), "FM station found");
+                info!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), marginal = c.marginal, "FM station found");
                 found.push(c.freq_hz);
             } else if c.image_of_mirror || c.spill_of_neighbour {
                 *images += 1;
-                debug!(freq_mhz = c.freq_hz as f64 / 1e6, "FM candidate rejected: mirror image or adjacent-channel spill of a stronger channel");
             } else {
                 *rejected += 1;
-                debug!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), "FM channel not a station");
             }
         }
     }
@@ -1663,7 +1676,7 @@ mod dsp_plan_tests {
             } else {
                 Some(plan.channels.iter().map(|&f| crate::sdr::fm_demod::survey::FmChannel {
                     freq_hz: f, power_dbfs: -40.0, excess_db: 0.0, quality_db: 0.0, pilot_db: None, rds_pi: None,
-                    image_of_mirror: false, spill_of_neighbour: false, image_prone: false, confirmed: false,
+                    image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, confirmed: false,
                 }).collect())
             }
         });
@@ -1695,7 +1708,7 @@ mod dsp_plan_tests {
             }
             Some(plan.channels.iter().map(|&f| FmChannel {
                 freq_hz: f, power_dbfs: -40.0, excess_db: 20.0, quality_db: 30.0, pilot_db: None, rds_pi: None,
-                image_of_mirror: false, spill_of_neighbour: false, image_prone: false, confirmed: f == plan.channels[0],
+                image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, confirmed: f == plan.channels[0],
             }).collect())
         });
         // Mid-sweep: strictly between 0 and total at least once, monotonic, always in progress.
