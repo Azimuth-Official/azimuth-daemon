@@ -110,14 +110,35 @@ pub struct ApplyMsg {
     pub sdr: SdrParams,
 }
 
+/// Write `node_id` into config.toml by editing the FILE's config, not the
+/// in-memory one: the in-memory config carries the region-derived scan plan and
+/// any `--region` override, which must not be frozen into the file.
+pub fn persist_node_id(config_path: &std::path::Path, node_id: &str) {
+    match Config::load(config_path) {
+        Ok(mut on_disk) => {
+            on_disk.node.id = node_id.to_string();
+            if let Err(e) = on_disk.save(config_path) {
+                warn!(error = %e, "Failed to save node_id to config");
+            }
+        }
+        Err(e) => warn!(error = %e, "Config not readable; node_id kept in the identity file only"),
+    }
+}
+
 /// Hand a new scan plan to the scanner.
 pub fn apply_plan(
     scanner: &mut crate::sdr::scanner::Scanner,
     plan: &ScanningConfig,
     new_dbm_offset: f32,
-    _old_dbm_offset: f32,
+    old_dbm_offset: f32,
 ) {
-    *scanner = crate::sdr::scanner::Scanner::new(plan, new_dbm_offset);
+    if (new_dbm_offset - old_dbm_offset).abs() > f32::EPSILON {
+        // The scan plan can be swapped in place, but the dBm calibration is
+        // fixed at construction: rebuild (this also schedules discovery).
+        *scanner = crate::sdr::scanner::Scanner::new(plan, new_dbm_offset);
+    } else {
+        scanner.apply_plan(plan);
+    }
 }
 
 pub fn is_placeholder(node_id: &str) -> bool {
@@ -242,12 +263,7 @@ impl Registrar {
     /// Persist a freshly issued id and publish it to the live state.
     pub async fn finish_registration(&self, real_id: &str) {
         info!(node_id = %real_id, "Node registration succeeded");
-        if let Ok(mut cfg) = Config::load(&self.config_path) {
-            cfg.node.id = real_id.to_string();
-            if let Err(e) = cfg.save(&self.config_path) {
-                warn!(error = %e, "Failed to save node_id after registration");
-            }
-        }
+        persist_node_id(&self.config_path, real_id);
         identity::save(&self.config_path, real_id);
         {
             let mut s = self.state.write().await;

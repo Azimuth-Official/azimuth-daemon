@@ -351,6 +351,15 @@ pub struct DtvScanConfig {
     pub sweep_step: u64,
     #[serde(default = "default_dtv_sweep_threshold")]
     pub sweep_threshold: f32,
+    /// Region-derived (never written to config.toml): the DTV standard the
+    /// scanner routes on ("ATSC", "DVB-T2-694", ...), the channel width and the
+    /// first channel number of the raster.
+    #[serde(default = "default_dtv_standard", skip_serializing)]
+    pub standard: String,
+    #[serde(default = "default_dtv_channel_mhz", skip_serializing)]
+    pub channel_mhz: u32,
+    #[serde(default = "default_dtv_first_channel", skip_serializing)]
+    pub first_channel: u32,
 }
 
 impl Default for DtvScanConfig {
@@ -361,8 +370,21 @@ impl Default for DtvScanConfig {
             sweep_end: default_dtv_sweep_end(),
             sweep_step: default_dtv_sweep_step(),
             sweep_threshold: default_dtv_sweep_threshold(),
+            standard: default_dtv_standard(),
+            channel_mhz: default_dtv_channel_mhz(),
+            first_channel: default_dtv_first_channel(),
         }
     }
+}
+
+fn default_dtv_standard() -> String {
+    "ATSC".to_string()
+}
+fn default_dtv_channel_mhz() -> u32 {
+    6
+}
+fn default_dtv_first_channel() -> u32 {
+    14
 }
 
 fn default_dtv_sweep_start() -> u64 {
@@ -588,28 +610,54 @@ impl Config {
     }
 
     /// Resolve `region` (ISO country code or AUTO) into concrete sweep plans and
-    /// populate the [scanning] sub-configs. An explicit region overrides the FM,
-    /// LTE, and DTV sweep ranges; without one, only an empty LTE sweep-band list
-    /// is filled from the worldwide default so upgraded nodes start scanning.
-    /// Resolution failures keep the configured sweep plans — never fatal.
+    /// populate the [scanning] sub-configs. See `apply_region_with` for the
+    /// rules. Resolution failures keep the configured sweep plans — never fatal.
     pub fn apply_region(&mut self) -> RegionResolution {
         self.apply_region_with(crate::regions::resolve_for_location)
     }
 
     /// `apply_region` with the location resolver injected (tests use a fake
     /// table; production uses the bundled boundary dataset).
+    ///
+    /// - explicit code ("FR", "jp"): that region's full FM/LTE/DTV plan;
+    /// - `AUTO` in any case: the region the node's location falls in, applied
+    ///   exactly like an explicit one; (0,0), open water or an unknown place
+    ///   gets the worldwide `_DEFAULT` plan and a WARN;
+    /// - unset: existing nodes keep their configured plan, except that FM and
+    ///   DTV follow the location while they still hold the built-in defaults,
+    ///   and an empty LTE band list is filled.
     pub fn apply_region_with(
         &mut self,
-        _locate: impl Fn(f64, f64) -> Option<&'static str>,
+        locate: impl Fn(f64, f64) -> Option<&'static str>,
     ) -> RegionResolution {
-        let explicit_region =
-            matches!(self.region.as_deref(), Some(r) if !r.is_empty() && r != "AUTO");
-        let region_code = self.region.clone().unwrap_or_else(|| "AUTO".to_string());
+        let configured = self.region.clone().unwrap_or_default();
+        let configured = configured.trim();
+        let is_auto = configured.eq_ignore_ascii_case("AUTO");
+        let explicit = !configured.is_empty() && !is_auto;
+        let unset = configured.is_empty();
+        let (lat, lon) = (self.node.location.latitude, self.node.location.longitude);
         let max_tuner_mhz = self.sdr.max_tuner_mhz;
 
         let unresolved = RegionResolution { effective: "_DEFAULT".to_string(), source: "default" };
         let Some(scanning) = self.scanning.as_mut() else {
             return unresolved;
+        };
+
+        // Which region code to resolve, and how it was chosen.
+        let located = if explicit { None } else { locate(lat, lon) };
+        let (code, mut source): (String, &'static str) = if explicit {
+            (configured.to_uppercase(), "explicit")
+        } else if let Some(code) = located {
+            (code.to_string(), "auto:location")
+        } else {
+            if is_auto {
+                tracing::warn!(
+                    latitude_known = !(lat == 0.0 && lon == 0.0),
+                    "region AUTO: the node location is not inside a known region — using the \
+                     worldwide default plan; set `region` or the node location"
+                );
+            }
+            ("_DEFAULT".to_string(), "default")
         };
 
         let resolver = match RegionResolver::new(max_tuner_mhz) {
@@ -620,16 +668,21 @@ impl Config {
                 return unresolved;
             }
         };
-        let resolved = match resolver.resolve(&region_code) {
+        let resolved = match resolver.resolve(&code) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, region = %region_code,
+                tracing::warn!(error = %e, region = %code,
                     "region resolution failed — keeping configured sweep plans");
                 return unresolved;
             }
         };
+        if resolved.region_code != code {
+            // The database has no entry for this code and fell back.
+            source = "default";
+        }
 
-        if explicit_region || scanning.lte.sweep_bands.is_empty() {
+        let full_plan = explicit || is_auto;
+        if full_plan || scanning.lte.sweep_bands.is_empty() {
             scanning.lte.sweep_bands = resolved
                 .lte_sweep_bands
                 .iter()
@@ -640,24 +693,31 @@ impl Config {
                 })
                 .collect();
         }
-        if explicit_region {
+        let fm_is_default = (scanning.fm.sweep_start, scanning.fm.sweep_end, scanning.fm.sweep_step)
+            == (default_fm_sweep_start(), default_fm_sweep_end(), default_fm_sweep_step());
+        let dtv_is_default = (scanning.dtv.sweep_start, scanning.dtv.sweep_end, scanning.dtv.sweep_step)
+            == (default_dtv_sweep_start(), default_dtv_sweep_end(), default_dtv_sweep_step());
+        if full_plan || (unset && fm_is_default) {
             scanning.fm.sweep_start = resolved.fm_sweep_start;
             scanning.fm.sweep_end = resolved.fm_sweep_end;
             scanning.fm.sweep_step = resolved.fm_sweep_step;
+        }
+        if full_plan || (unset && dtv_is_default) {
             scanning.dtv.sweep_start = resolved.dtv_sweep_start;
             scanning.dtv.sweep_end = resolved.dtv_sweep_end;
             scanning.dtv.sweep_step = resolved.dtv_sweep_step;
+            scanning.dtv.standard = resolved.dtv_standard.clone();
+            scanning.dtv.channel_mhz = resolved.dtv_channel_mhz;
+            scanning.dtv.first_channel = resolved.dtv_first_channel;
         }
         tracing::info!(
             region = %resolved.region_code,
+            source,
             lte_bands = scanning.lte.sweep_bands.len(),
             skipped_bands = resolved.skipped_bands.len(),
             "regional frequency plan applied"
         );
-        RegionResolution {
-            effective: resolved.region_code.to_string(),
-            source: if explicit_region { "explicit" } else { "default" },
-        }
+        RegionResolution { effective: resolved.region_code.to_string(), source }
     }
 
     #[allow(dead_code)]

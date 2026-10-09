@@ -299,9 +299,7 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(node_id) => {
                 config.node.id = node_id;
-                if let Err(e) = config.save(&cli.config) {
-                    warn!(error = %e, "Failed to save node_id to config");
-                }
+                node_runtime::persist_node_id(&cli.config, &config.node.id);
                 identity::save(&cli.config, &config.node.id);
                 info!(node_id = %config.node.id, "Node registered");
             }
@@ -321,9 +319,7 @@ async fn main() -> anyhow::Result<()> {
                         "Registration unreachable — adopting persisted node identity; \
                          if this machine changed accounts, re-run 'azimuth-daemon --setup'");
                     config.node.id = saved.node_id;
-                    if let Err(e) = config.save(&cli.config) {
-                        warn!(error = %e, "Failed to save adopted node_id to config");
-                    }
+                    node_runtime::persist_node_id(&cli.config, &config.node.id);
                 } else {
                     warn!(error = %e, "Node registration failed — will use placeholder and retry in background");
                     config.node.id = format!("placeholder-{}", uuid::Uuid::new_v4());
@@ -531,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
         // Scanner mode — multi-frequency, multi-signal-type
         let mut scanner = Scanner::new(scanning_config, config.sdr.dbm_offset);
         let scan_interval = Duration::from_secs(scanner.interval_seconds() as u64);
+        app_state.status.write().await.sweep_handle = Some(scanner.sweep_handle());
 
         // Nothing is scanned, discovered or submitted until the node is set up:
         // pre-setup defaults (location 0,0, no key) would only produce
@@ -819,6 +816,8 @@ async fn apply_config_msg(
 ) {
     if let Some(plan) = msg.scanning.as_ref() {
         node_runtime::apply_plan(scanner, plan, msg.sdr.dbm_offset, sdr_params.dbm_offset);
+        // A rebuilt scanner has a new progress handle.
+        app_state.status.write().await.sweep_handle = Some(scanner.sweep_handle());
     }
     if msg.sdr.device_index != sdr_params.device_index
         || msg.sdr.sample_rate != sdr_params.sample_rate

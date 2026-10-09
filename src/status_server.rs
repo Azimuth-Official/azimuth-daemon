@@ -96,6 +96,9 @@ pub struct StatusInfo {
     pub sdr_test_last: Option<serde_json::Value>,
     pub sdr_diagnostics: SdrDiagnostics,
     pub gps: crate::gps::GpsInfo,
+    /// Per-band sweep progress from the scanner (`{fm, lte, dtv}`), or null
+    /// before the scanner exists.
+    pub sweep: serde_json::Value,
 }
 
 /// Counters that help support triage SDR problems.
@@ -159,6 +162,8 @@ pub struct StatusState {
     pub sdr_test_last: Option<serde_json::Value>,
     /// When the observation loop last completed a cycle with an open device.
     pub sdr_last_capture_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Live view of the scanner's sweep progress.
+    pub sweep_handle: Option<Arc<std::sync::Mutex<crate::sdr::scanner::SweepReport>>>,
 }
 
 /// A node is "on air" when it is registered, has an open SDR and the server
@@ -271,6 +276,7 @@ impl StatusState {
             driver: DriverInfo::not_applicable(),
             sdr_test_last: None,
             sdr_last_capture_ok_at: None,
+            sweep_handle: None,
         }
     }
 
@@ -356,6 +362,11 @@ impl StatusState {
             driver: self.driver.clone(),
             sdr_test_last: self.sdr_test_last.clone(),
             gps: self.gps_info.clone(),
+            sweep: self
+                .sweep_handle
+                .as_ref()
+                .and_then(|h| h.lock().ok().and_then(|r| serde_json::to_value(&*r).ok()))
+                .unwrap_or(serde_json::Value::Null),
             sdr_diagnostics: SdrDiagnostics {
                 pll_lock_failures: crate::sdr::pll_lock_failures(),
             },
@@ -662,9 +673,22 @@ async fn config_write_handler(
     if verdict.state != ConfigState::Ok {
         return config_rejection(verdict.state, config.problems());
     }
-    let region = config.apply_region();
-
+    // Persist exactly what the user sent: the region-derived scan plan is
+    // recomputed from the location on every apply and must not be frozen into
+    // config.toml (a later move would otherwise look like a hand-customised plan).
     let path_for_save = config_path.clone();
+    let saved = tokio::task::block_in_place(|| config.save(&path_for_save));
+    if let Err(e) = saved {
+        warn!(path = %config_path.display(), error = %e, "Failed to write config");
+        return config_rejection(
+            ConfigState::Invalid,
+            vec![ConfigProblem {
+                field: "config_file".to_string(),
+                message: format!("Could not write {}: {}", config_path.display(), e),
+            }],
+        );
+    }
+    let region = config.apply_region();
     let node_for_kick = config.node.clone();
     let scanning = config.scanning.clone();
     let sdr_params = SdrParams::from_config(&config);
@@ -676,17 +700,6 @@ async fn config_write_handler(
         config.node.location.longitude,
         config.node.location.altitude_m,
     );
-    let saved = tokio::task::block_in_place(move || config.save(&path_for_save));
-    if let Err(e) = saved {
-        warn!(path = %config_path.display(), error = %e, "Failed to write config");
-        return config_rejection(
-            ConfigState::Invalid,
-            vec![ConfigProblem {
-                field: "config_file".to_string(),
-                message: format!("Could not write {}: {}", config_path.display(), e),
-            }],
-        );
-    }
     info!(path = %config_path.display(), "Config written from HTTP request");
 
     if !apply {
@@ -2051,5 +2064,32 @@ mod tests {
         assert_eq!(st.on_air().1.as_deref(), Some("no_accepted_observations"));
         st.last_accepted_at = Some(chrono::Utc::now() - chrono::Duration::minutes(9));
         assert_eq!(st.on_air(), (true, None));
+    }
+
+    // --- D2: per-band sweep status ---------------------------------------------
+
+    #[test]
+    fn status_sweep_mirrors_the_scanner_report() {
+        let mut st = StatusState::new("n".to_string(), "tier1_rtlsdr".to_string());
+        assert!(serde_json::to_value(st.to_info(true, false)).unwrap()["sweep"].is_null());
+        let handle = Arc::new(std::sync::Mutex::new(crate::sdr::scanner::SweepReport::default()));
+        handle.lock().unwrap().fm.evaluated = 40;
+        handle.lock().unwrap().fm.total = 103;
+        handle.lock().unwrap().fm.in_progress = true;
+        st.sweep_handle = Some(Arc::clone(&handle));
+        let v = serde_json::to_value(st.to_info(true, false)).unwrap();
+        for band in ["fm", "lte", "dtv"] {
+            for k in [
+                "started_at", "completed_at", "evaluated", "total", "found", "tune_failed",
+                "in_progress", "next_rediscovery_at",
+            ] {
+                assert!(v["sweep"][band].get(k).is_some(), "sweep.{band}.{k}");
+            }
+        }
+        assert_eq!(v["sweep"]["fm"]["evaluated"], 40);
+        // Live: a later scanner update shows without rebuilding the state.
+        handle.lock().unwrap().fm.evaluated = 103;
+        let v = serde_json::to_value(st.to_info(true, false)).unwrap();
+        assert_eq!(v["sweep"]["fm"]["evaluated"], 103);
     }
 }
