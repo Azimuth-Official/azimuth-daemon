@@ -7,6 +7,7 @@ use crate::sdr::recovery::{RecoveryAction, RecoveryManager, reset_usb_bus_device
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use super::dtv::dvb;
@@ -147,6 +148,8 @@ pub struct Scanner {
     recovery_manager: RecoveryManager,
     dtv_plan: DtvPlan,
     sweep: SweepReport,
+    /// Live copy of `sweep` for other tasks (/status), updated during sweeps.
+    sweep_shared: Arc<Mutex<SweepReport>>,
     /// Running count of tunes that returned failure (see `tune_with_recovery`).
     tune_fail_count: u32,
 }
@@ -271,6 +274,7 @@ impl Scanner {
             recovery_manager: RecoveryManager::new(),
             dtv_plan: DtvPlan::from_config(&config.dtv),
             sweep: SweepReport::default(),
+            sweep_shared: Arc::new(Mutex::new(SweepReport::default())),
             tune_fail_count: 0,
         };
         scanner.fm_frequencies.sort_unstable();
@@ -304,11 +308,26 @@ impl Scanner {
         self.max_observations_per_cycle = fresh.max_observations_per_cycle;
         self.dtv_plan = fresh.dtv_plan;
         self.sweep = SweepReport::default();
+        self.publish_sweep();
         info!(
             fm_range_mhz = format!("{}-{}", self.fm_config.sweep_start / 1_000_000, self.fm_config.sweep_end / 1_000_000),
             dtv_plan = ?self.dtv_plan,
             "Scan plan applied; discovery scheduled"
         );
+    }
+
+    /// Shared handle to the live sweep report; updated at the start and end of
+    /// every band sweep (and on `apply_plan`), so `in_progress` is visible while a
+    /// sweep runs.
+    pub fn sweep_handle(&self) -> Arc<Mutex<SweepReport>> {
+        Arc::clone(&self.sweep_shared)
+    }
+
+    fn publish_sweep(&self) {
+        let snapshot = self.sweep_report();
+        if let Ok(mut g) = self.sweep_shared.lock() {
+            *g = snapshot;
+        }
     }
 
     /// Snapshot of per-band sweep progress for /status.
@@ -350,6 +369,7 @@ impl Scanner {
             BandKind::Lte => self.sweep.lte = b,
             BandKind::Dtv => self.sweep.dtv = b,
         }
+        self.publish_sweep();
     }
 
     fn finish_band(&mut self, kind: BandKind, found: u32, tune_failed: u32) {
@@ -363,6 +383,7 @@ impl Scanner {
         band.tune_failed = tune_failed.min(band.total);
         band.in_progress = false;
         band.completed_at = Some(Utc::now());
+        self.publish_sweep();
     }
 
     /// Run first-time auto-discovery sweep. Updates frequency lists in memory.
@@ -1560,6 +1581,17 @@ mod dsp_plan_tests {
         // Back to ATSC.
         scanner.apply_plan(&ScanningConfig::default());
         assert!(!scanner.dtv_plan.is_dvb());
+    }
+
+    #[test]
+    fn sweep_handle_shows_in_progress_live() {
+        let mut scanner = Scanner::new(&ScanningConfig::default(), -30.0);
+        let h = scanner.sweep_handle();
+        scanner.begin_band(BandKind::Fm, 103);
+        assert!(h.lock().unwrap().fm.in_progress);
+        scanner.finish_band(BandKind::Fm, 5, 0);
+        let r = h.lock().unwrap().clone();
+        assert!(!r.fm.in_progress && r.fm.evaluated == 103);
     }
 
     #[test]
