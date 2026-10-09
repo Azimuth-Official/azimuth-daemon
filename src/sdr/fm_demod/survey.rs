@@ -60,11 +60,39 @@ pub struct SurveyConfig {
     /// or a decodable RDS PI.
     pub marginal_excess_db: f64,
     pub marginal_min_pilot_db: f64,
+    /// A known station at or above this excess may be held on power alone when
+    /// no discriminator evidence is available (dead air, corrupted captures).
+    pub hold_min_excess_db: f64,
+    /// ... for at most this many CONSECUTIVE sweeps; any evidence resets the count.
+    pub max_hold_sweeps: u32,
+    /// Consecutive sweeps each station has been held so far (`update_hold_streaks`).
+    pub held_streak: Vec<(u64, u32)>,
+}
+
+impl SurveyConfig {
+    fn streak(&self, f: u64) -> u32 {
+        self.held_streak.iter().find(|(c, _)| *c == f).map(|(_, n)| *n).unwrap_or(0)
+    }
+}
+
+/// Update hold streaks after a sweep: held -> +1; confirmed on evidence -> reset;
+/// carrier gone (excess below the hold threshold) -> reset; carrier still strong but
+/// not confirmed (the cap was reached) -> keep the streak, so the station stays
+/// dropped until evidence or an absence resets it. Channels not evaluated this
+/// sweep keep their streak.
+pub fn update_hold_streaks(streaks: &mut std::collections::HashMap<u64, u32>, results: &[FmChannel]) {
+    for c in results {
+        if c.confirmed && c.held {
+            *streaks.entry(c.freq_hz).or_insert(0) += 1;
+        } else if c.confirmed || c.excess_db < HOLD_MIN_EXCESS_DB {
+            streaks.remove(&c.freq_hz);
+        }
+    }
 }
 
 impl Default for SurveyConfig {
     fn default() -> Self {
-        SurveyConfig { min_excess_db: 3.0, min_quality_db: 10.0, channel_step_hz: 200_000.0, known: Vec::new(), hysteresis_db: 2.0, marginal_excess_db: 6.0, marginal_min_pilot_db: 10.0 }
+        SurveyConfig { min_excess_db: 3.0, min_quality_db: 10.0, channel_step_hz: 200_000.0, known: Vec::new(), hysteresis_db: 2.0, marginal_excess_db: 6.0, marginal_min_pilot_db: 10.0, hold_min_excess_db: HOLD_MIN_EXCESS_DB, max_hold_sweeps: 2, held_streak: Vec::new() }
     }
 }
 
@@ -163,8 +191,14 @@ pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmCh
             let rejected = spill_votes * 2 > col.len();
             let prone = col.iter().filter(|c| c.image_prone).count() * 2 > col.len();
             let marginal = relax == 0.0 && excess < cfg.marginal_excess_db;
-            let corroborated = col.iter().any(|c| c.pilot_db.is_some_and(|p| p >= cfg.marginal_min_pilot_db) || c.rds_pi.is_some());
-            let held_eligible = relax > 0.0 && excess >= HOLD_MIN_EXCESS_DB && !rejected;
+            // Corroboration must hold in at least two captures (or the only one).
+            let corroborating = col.iter().filter(|c| c.pilot_db.is_some_and(|p| p >= cfg.marginal_min_pilot_db) || c.rds_pi.is_some()).count();
+            let corroborated = corroborating >= col.len().min(2);
+            let held_eligible = relax > 0.0
+                && excess >= cfg.hold_min_excess_db
+                && !rejected
+                && (!prone || excess >= IMAGE_PRONE_MIN_EXCESS_DB)
+                && cfg.streak(f) < cfg.max_hold_sweeps;
             let confirmed_by_evidence = excess >= cfg.min_excess_db - relax
                 && quality >= cfg.min_quality_db - relax
                 && !rejected
@@ -423,7 +457,14 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             // the discriminator reading failed in this sweep (silence between
             // programmes, a corrupted capture). Keep it on power alone; a later sweep
             // where the power is gone removes the doubt.
-            if !ch.confirmed && relax > 0.0 && excess_db >= HOLD_MIN_EXCESS_DB && !image && !spill {
+            if !ch.confirmed
+                && relax > 0.0
+                && excess_db >= cfg.hold_min_excess_db
+                && !image
+                && !spill
+                && image_floor_ok
+                && cfg.streak(f) < cfg.max_hold_sweeps
+            {
                 ch.confirmed = true;
                 ch.held = true;
             }
@@ -881,5 +922,90 @@ mod tests {
             let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &cfg, &mut more);
             assert!(!r[2].confirmed, "seed {seed}: {:?}", r[2]);
         }
+    }
+
+    fn eval_known(seed: u64, modulated: bool, streaks: &std::collections::HashMap<u64, u32>) -> FmChannel {
+        let (iq, chans, centre) = capture_ch2(seed, 25.0, true, modulated);
+        let cfg = SurveyConfig {
+            known: vec![chans[2]],
+            held_streak: streaks.iter().map(|(k, v)| (*k, *v)).collect(),
+            ..SurveyConfig::default()
+        };
+        let mut more = || Some(capture_ch2(seed + 7, 25.0, true, modulated).0);
+        evaluate_adaptive(&iq, 2_048_000, centre, &chans, &cfg, &mut more).remove(2)
+    }
+
+    #[test]
+    fn hold_is_capped_at_two_consecutive_sweeps_and_evidence_resets_it() {
+        let mut streaks = std::collections::HashMap::new();
+        // An unmodulated carrier (a spur) that was once confirmed: held twice, then dropped.
+        let mut decisions = Vec::new();
+        for sweep in 0..4u64 {
+            let c = eval_known(2000 + sweep * 11, false, &streaks);
+            update_hold_streaks(&mut streaks, std::slice::from_ref(&c));
+            decisions.push((c.confirmed, c.held));
+        }
+        assert_eq!(decisions, vec![(true, true), (true, true), (false, false), (false, false)], "{decisions:?}");
+        // A real station with ONE dead-air sweep between normal sweeps is never dropped
+        // and its counter is reset by the evidence.
+        let mut streaks = std::collections::HashMap::new();
+        let mut seen = Vec::new();
+        for (i, modulated) in [true, false, true, false, false, true].into_iter().enumerate() {
+            let c = eval_known(3000 + i as u64 * 13, modulated, &streaks);
+            update_hold_streaks(&mut streaks, std::slice::from_ref(&c));
+            seen.push((c.confirmed, c.held));
+        }
+        assert_eq!(seen, vec![(true, false), (true, true), (true, false), (true, true), (true, true), (true, false)], "{seen:?}");
+    }
+
+    #[test]
+    fn a_known_image_channel_is_not_held() {
+        // Strong station on ch0 (offset -700 kHz); its -27 dB image lands on ch7, which
+        // is "known" (e.g. confirmed once by mistake). It must not be kept on power.
+        let (iq, chans, centre) = scene(4000, &[(0, 0.0)], 60.0);
+        let cfg = SurveyConfig { known: vec![chans[7]], ..SurveyConfig::default() };
+        let mut more = || Some(scene(4001, &[(0, 0.0)], 60.0).0);
+        let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &cfg, &mut more);
+        assert!(r[0].confirmed);
+        assert!(!r[7].confirmed && !r[7].held, "{:?}", r[7]);
+    }
+
+    fn crafted(excess: f64, quality: f64, pilot: Option<f64>, f: u64) -> FmChannel {
+        FmChannel {
+            freq_hz: f, power_dbfs: -40.0, excess_db: excess, quality_db: quality, pilot_db: pilot, rds_pi: None,
+            image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false,
+            held: false, confirmed: false,
+        }
+    }
+
+    #[test]
+    fn hold_boundary_is_exactly_ten_db() {
+        let cfg = SurveyConfig { known: vec![1], ..SurveyConfig::default() };
+        let run = |ex: f64| {
+            let runs: Vec<Vec<FmChannel>> = (0..3).map(|_| vec![crafted(ex, 2.0, None, 1)]).collect();
+            combine_captures(&runs, &cfg).remove(0)
+        };
+        assert!(run(10.0).held && run(10.0).confirmed);
+        let below = run(9.99);
+        assert!(!below.held && !below.confirmed);
+        // The streak cap applies to the combined decision too.
+        let capped = SurveyConfig { known: vec![1], held_streak: vec![(1, 2)], ..SurveyConfig::default() };
+        let runs: Vec<Vec<FmChannel>> = (0..3).map(|_| vec![crafted(20.0, 2.0, None, 1)]).collect();
+        assert!(!combine_captures(&runs, &capped).remove(0).confirmed);
+    }
+
+    #[test]
+    fn corroboration_needs_two_captures() {
+        let cfg = SurveyConfig::default();
+        // Marginal new candidate (excess 4), good quality, pilot >= 10 dB in only ONE of three captures.
+        let mk = |pilots: [Option<f64>; 3]| -> FmChannel {
+            let runs: Vec<Vec<FmChannel>> = pilots.iter().map(|p| vec![crafted(4.0, 20.0, *p, 1)]).collect();
+            combine_captures(&runs, &cfg).remove(0)
+        };
+        assert!(!mk([Some(12.0), Some(1.0), Some(2.0)]).confirmed);
+        assert!(mk([Some(12.0), Some(11.0), Some(2.0)]).confirmed);
+        // A single capture is judged on its own.
+        let one = combine_captures(&[vec![crafted(4.0, 20.0, Some(12.0), 1)]], &cfg).remove(0);
+        assert!(one.confirmed);
     }
 }
