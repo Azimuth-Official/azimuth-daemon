@@ -237,9 +237,19 @@ impl SdrDevice {
             );
         }
         CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
+        let before = pll_lock_failures();
         self.device
             .set_center_freq(freq_hz as u32)
-            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))?;
+        if pll_lock_failures() > before {
+            // The tuner reported "PLL not locked" (rtl-sdr-rs still returns
+            // success). One short settle and re-tune; the failure stays counted
+            // in /status.sdr_diagnostics so a frequency that never locks shows.
+            tracing::debug!(freq_hz, "tuner reported PLL not locked; settling and re-tuning once");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = self.device.set_center_freq(freq_hz as u32);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

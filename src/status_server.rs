@@ -2011,4 +2011,45 @@ mod tests {
         });
         assert_eq!(v.state, SdrTestState::UsbError);
     }
+
+    // --- C3: additive /status fields -----------------------------------------
+
+    #[test]
+    fn status_carries_every_additive_contract_field() {
+        let mut st = StatusState::new("n".to_string(), "tier1_rtlsdr".to_string());
+        st.config_path_abs = "/abs/config.toml".to_string();
+        let v = serde_json::to_value(st.to_info(true, false)).unwrap();
+        for k in [
+            "config_state", "config_error", "config_problems", "daemon_pid", "daemon_version",
+            "config_path", "started_at", "node_id", "node_display_name", "registration_state",
+            "region_effective", "region_source", "driver", "sdr_test_last", "gps", "on_air",
+            "on_air_reason", "sdr_diagnostics", "driver_status", "gps_detected", "gps_fix_quality",
+            "gps_hdop",
+        ] {
+            assert!(v.get(k).is_some(), "/status is missing {k}");
+        }
+        assert_eq!(v["daemon_pid"], std::process::id());
+        assert_eq!(v["config_path"], "/abs/config.toml");
+        assert!(v["started_at"].as_str().unwrap().contains('T'));
+        assert!(v["sdr_diagnostics"]["pll_lock_failures"].is_u64());
+        for k in ["state", "interface", "vid", "pid", "bound_driver", "message"] {
+            assert!(v["driver"].get(k).is_some(), "driver.{k}");
+        }
+    }
+
+    #[test]
+    fn on_air_requires_registration_sdr_and_a_recent_accepted_observation() {
+        let mut st = StatusState::new("n".to_string(), "tier1_rtlsdr".to_string());
+        assert_eq!(st.on_air(), (false, Some("config".to_string())));
+        st.config_state = ConfigState::Ok;
+        assert_eq!(st.on_air().1.as_deref(), Some("not_registered"));
+        st.registration_state = "registered".to_string();
+        assert_eq!(st.on_air().1.as_deref(), Some("no_sdr"));
+        st.sdr_connected = true;
+        assert_eq!(st.on_air().1.as_deref(), Some("no_accepted_observations"));
+        st.last_accepted_at = Some(chrono::Utc::now() - chrono::Duration::minutes(11));
+        assert_eq!(st.on_air().1.as_deref(), Some("no_accepted_observations"));
+        st.last_accepted_at = Some(chrono::Utc::now() - chrono::Duration::minutes(9));
+        assert_eq!(st.on_air(), (true, None));
+    }
 }

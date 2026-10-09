@@ -44,6 +44,8 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 sha2 = "0.10"
 base64 = "0.22"
+# Records from rtl-sdr-rs (e.g. "PLL not locked") arrive through the log facade.
+log = "0.4"
 
 # SDR hardware access
 # NOTE: Linux cross-build may need libusb-dev in cross-rs container — see Cross.toml
