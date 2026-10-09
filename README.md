@@ -18,13 +18,13 @@ Full getting-started guide: [azimuth.day/docs/getting-started](https://azimuth.d
 |--------|--------|----------------|
 | FM broadcast | RDS PI code extraction + SNR | 65–108 MHz (incl. OIRT and Japan bands) |
 | LTE | PSS/SSS cell ID detection | regional bands up to the tuner limit |
-| DTV | Pilot tone detection | 470–862 MHz (ATSC / DVB-T) |
+| DTV | ATSC pilot tone; DVB-T / DVB-T2 cyclic-prefix detection | UHF 470 MHz up to the region's upper edge (most of Europe: 694 MHz) |
 | GPS (optional) | NMEA over serial | reference timing and position truth |
 | RTK (optional) | NTRIP client (GEODNET, Onocoy, RTK2GO, custom casters) | centimeter-level corrections |
 
 ## Features
 
-- **Regional frequency scanning** — embedded region database (30+ countries, worldwide fallback) selects FM/LTE/DTV sweep plans automatically or via `region = "XX"` / `--region XX`
+- **Regional frequency scanning** — embedded region database (30+ countries, worldwide fallback) selects FM/LTE/DTV sweep plans from the node's location (`region = "AUTO"`) or from `region = "XX"` / `--region XX`
 - **SDR self-healing** — 4-level recovery escalation: reopen device → USB bus reset → OS-level USB restart → clean process restart under the service manager
 - **Local web dashboard** — real-time status at `http://127.0.0.1:8420` (signals, GPS fix, SDR health, upload stats)
 - **HTTP control API** — status, SDR list/test, config write, scanner start/stop, RTK and GPS status endpoints
@@ -107,9 +107,42 @@ Or copy `config.example.toml` to `config.toml` and edit. The daemon reads `confi
 |---------|-------------|---------|
 | `api.key` | Your Azimuth API key (Account Settings on azimuth.day) | required |
 | `node.location` | Latitude / longitude of the node | required |
-| `region` | ISO country code for the frequency plan, or `AUTO` | `AUTO` |
+| `region` | ISO country code for the frequency plan, or `AUTO` (any case) to use the country the node's location falls in | `AUTO` |
 | `scanning.mode` | `config`, `sweep`, or `both` | `both` |
 | `sdr.max_tuner_mhz` | Tuner frequency ceiling in MHz | `1766` |
+
+### Region and frequency plan
+
+`region = "AUTO"` (or `auto`/`Auto`) looks up the country containing the node's
+latitude/longitude with an offline boundary dataset and applies that country's full
+FM, LTE and DTV plan, exactly as if you had set its code. A location the dataset does
+not place in a country (open water, or still `0,0`) gets the worldwide default plan and
+a warning in the log. An explicit code always wins over the location. The effective
+region and why it was chosen are reported by `GET /status` as `region_effective` and
+`region_source` (`explicit`, `auto:location` or `default`) and logged at startup.
+
+### Windows: RTL-SDR driver
+
+Windows needs the WinUSB driver bound to Interface 0 of the dongle. The desktop
+installer does this for a dongle that is already plugged in; otherwise the app offers
+**Install SDR driver** (one administrator prompt). The same step is available from a
+terminal: `azimuth-daemon --install-driver` (run as administrator; prints one JSON line,
+exit code 0 ok, 2 no device, 3 needs elevation, 4 install failed, 5 other). The daemon
+itself never installs a driver. `GET /status` reports `driver.state` (`ok`,
+`driver_missing`, `wrong_driver`, `not_found`, ...) and `POST /sdr/test` really opens the
+device and answers `ok` (with the tuner name), `driver_missing`, `wrong_driver`, `in_use`
+(with likely holders), `not_found` or `usb_error`.
+
+### Logs and diagnostics
+
+Logs are written next to the config file: on Windows
+`%APPDATA%\day.azimuth.node\logs\azimuth-daemon.<date>.log` (seven daily files are kept;
+set `AZIMUTH_LOG_DIR` to move them). `GET /log/path` returns the folder. `GET /status`
+includes `sweep` (per band: when the last sweep started and finished, channels
+evaluated of total, stations found, tune failures, next rediscovery), `gps` (state, port,
+baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
+`[R82xx] PLL not locked!` message from the tuner driver is counted in
+`sdr_diagnostics.pll_lock_failures` instead of being printed.
 
 ## Dashboard
 
@@ -134,4 +167,6 @@ cargo build --release
 
 ## Current version
 
-**v0.3.5** — August 2026 — NTRIP client reliability fixes: the RTCM correction channel no longer stalls the caster read loop under backpressure, and periodic GGA position updates are now actually sent to the caster (previously generated and discarded). Refreshed Windows daemon binary.
+**v0.4.0** — setup and reliability release. A config saved by the setup wizard now takes effect in the running daemon (no restart): it validates, applies location/region/scan plan and registers the node, and `/status` reports `config_state` (`awaiting_setup`, `ok`, `invalid`) instead of a frozen startup error. Observations are submitted under the live node id. `region = "AUTO"` follows the node's location. Real `/sdr/test`, precise driver states and an elevated `--install-driver` mode. Better GPS detection (natural COM-port order, no auto-probing of phone/modem ports, baud promotion, precise errors, live NMEA preview). Per-item rejection reporting for observation batches. `POST /shutdown` and clear exit codes when another daemon holds port 8420 (43).
+
+The Windows driver installer uses [libwdi](https://github.com/pbatard/libwdi) 1.5.1 through the `wdi-rs` crate, under the LGPL option; see `THIRD_PARTY_NOTICES.md`. It generates a self-signed catalog certificate for the WinUSB package and installs it on the machine when the driver is installed.

@@ -57,8 +57,10 @@ mkdir -p "$(dirname "$CONFIG_PATH")"
 if [ ! -s "$CONFIG_PATH" ]; then
   echo "[entrypoint] Generating $CONFIG_PATH from AZIMUTH_* environment"
   cat > "$CONFIG_PATH" <<EOF
-# Region code (ISO country, e.g. US, DE, JP) or AUTO for the worldwide default.
-# The daemon resolves this into FM/LTE/DTV sweep plans at startup.
+# Region code (ISO country, e.g. US, DE, JP) or AUTO to use the country the node
+# location (node.location below) falls in. The daemon resolves this into
+# FM/LTE/DTV sweep plans at startup; an unplaceable location gets the worldwide
+# default plan.
 region = "$REGION"
 
 [api]
@@ -92,24 +94,24 @@ interval_seconds = 30
 
 [scanning.dtv]
 # Container nodes historically ran a more sensitive DTV sweep than the code
-# default (-25.0) — keep that behavior explicit.
+# default (-25.0) — keep that behavior explicit. Channel raster and band edges
+# (ATSC 6 MHz, DVB-T/T2 7 or 8 MHz) come from the region plan, not from here.
 sweep_threshold = -45.0
 EOF
   if [ -z "$API_KEY" ]; then
     echo "[entrypoint] ################################################################"
     echo "[entrypoint] # WARNING: AZIMUTH_API_KEY is not set."
     echo "[entrypoint] #"
-    echo "[entrypoint] # This node will start and scan, but it CANNOT register and will"
-    echo "[entrypoint] # NOT appear on the azimuth.day dashboard — the daemon assigns a"
-    echo "[entrypoint] # placeholder id and silently suppresses heartbeats. The container"
-    echo "[entrypoint] # (and its HEALTHCHECK) will still look healthy."
+    echo "[entrypoint] # Without a key the node stays idle: it does not scan, register or"
+    echo "[entrypoint] # appear on the azimuth.day dashboard. GET /status reports"
+    echo "[entrypoint] # config_state \"awaiting_setup\" and the container HEALTHCHECK marks"
+    echo "[entrypoint] # the container unhealthy until a key and location are configured."
     echo "[entrypoint] #"
     echo "[entrypoint] # Get an API key from https://azimuth.day (dashboard -> node setup)"
     echo "[entrypoint] # and set AZIMUTH_API_KEY, then restart this container."
     echo "[entrypoint] #"
-    echo "[entrypoint] # The running daemon will keep repeating this warning in its own"
-    echo "[entrypoint] # logs (every ~5 minutes) and via GET /status (config_error) until"
-    echo "[entrypoint] # a valid key is configured."
+    echo "[entrypoint] # Also set AZIMUTH_NODE_LAT / AZIMUTH_NODE_LON: a location left at"
+    echo "[entrypoint] # 0,0 keeps the node in \"awaiting_setup\" too."
     echo "[entrypoint] ################################################################"
   fi
 else

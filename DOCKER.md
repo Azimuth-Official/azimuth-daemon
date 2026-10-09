@@ -97,6 +97,21 @@ refuses to start with a `FATAL: ... is an empty DIRECTORY` message.
 | `AZIMUTH_SDR_GAIN` | `sdr.gain` | `-1` | `-1` = automatic gain control |
 | `AZIMUTH_CONFIG_PATH` | *(config file location)* | `/var/lib/azimuth/config.toml` | Where the config is written/read |
 
+### Region and frequency plan
+
+`AZIMUTH_REGION` (default `AUTO`) sets `region` in the generated config. `AUTO` (any
+case) picks the country that contains `AZIMUTH_NODE_LAT` / `AZIMUTH_NODE_LON` using an
+offline boundary dataset and applies that country's full FM, LTE and DTV plan: for
+example a node in France scans FM 87.5-108 MHz and DVB-T/T2 channels at 8 MHz spacing,
+a node in the US scans ATSC at 6 MHz, and a node in Japan scans FM 76-95 MHz. A location
+that is not inside any known country (open water, or the placeholder `0,0`) gets the
+worldwide default plan and a warning in `docker logs`. An explicit code, e.g.
+`AZIMUTH_REGION=FR`, always wins over the location. The container log shows the resolved
+region at startup, and `GET /status` reports `region_effective` and `region_source`
+(`explicit`, `auto:location` or `default`). DTV detection covers ATSC (pilot tone) and
+DVB-T/DVB-T2 (cyclic-prefix); DVB-T2 is recognised from its FFT size and guard interval,
+not decoded.
+
 ## 4. USB / RTL-SDR passthrough (real hardware)
 
 The container reaches the RTL-SDR through `/dev/bus/usb`; the compose file maps it:

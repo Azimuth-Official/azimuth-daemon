@@ -3,9 +3,12 @@
 # Copy this file to config.toml and edit before running.
 # =============================================================================
 
-# Region code: ISO country code (US, DE, JP, ...) or "AUTO" for the worldwide
-# default. The daemon resolves this into FM/LTE/DTV sweep plans at startup and
-# overrides the [scanning.*] sweep ranges below. Also settable via --region.
+# Region code: ISO country code (US, DE, JP, ...) or "AUTO" (any case) to use the
+# country that contains [node.location]. The daemon resolves this into FM/LTE/DTV
+# sweep plans at startup and overrides the [scanning.*] sweep ranges below; a
+# location that is not inside any known country gets the worldwide default plan
+# (see "region_effective" / "region_source" in GET /status). Also settable via
+# --region.
 region = "AUTO"
 
 [api]
@@ -119,9 +122,11 @@ end = 894_000_000
 step = 5_000_000
 
 [scanning.dtv]
-# ATSC DTV channel center frequencies in Hz.
-# UHF channels 14-36 (post-repack range: 470-608 MHz)
+# DTV channel center frequencies in Hz (ATSC, DVB-T or DVB-T2 - the region plan
+# decides the standard and the channel raster).
 # Leave empty to rely on auto-sweep, or add known local channels.
+# The sweep range below is the ATSC default (UHF 14-36, 470-608 MHz); when `region`
+# is set or "AUTO" resolves a country, that country's range replaces it.
 frequencies = []
 # Auto-sweep parameters
 sweep_start = 470_000_000
