@@ -665,6 +665,7 @@ impl Scanner {
                 rds_pi = ?c.rds_pi,
                 marginal = c.marginal,
                 corroborated = c.corroborated,
+                held = c.held,
                 image = c.image_of_mirror,
                 spill = c.spill_of_neighbour,
                 decision = if c.confirmed { "station" } else { "no" },
@@ -1676,7 +1677,7 @@ mod dsp_plan_tests {
             } else {
                 Some(plan.channels.iter().map(|&f| crate::sdr::fm_demod::survey::FmChannel {
                     freq_hz: f, power_dbfs: -40.0, excess_db: 0.0, quality_db: 0.0, pilot_db: None, rds_pi: None,
-                    image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, confirmed: false,
+                    image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, held: false, confirmed: false,
                 }).collect())
             }
         });
@@ -1708,7 +1709,7 @@ mod dsp_plan_tests {
             }
             Some(plan.channels.iter().map(|&f| FmChannel {
                 freq_hz: f, power_dbfs: -40.0, excess_db: 20.0, quality_db: 30.0, pilot_db: None, rds_pi: None,
-                image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, confirmed: f == plan.channels[0],
+                image_of_mirror: false, spill_of_neighbour: false, image_prone: false, marginal: false, corroborated: false, held: false, confirmed: f == plan.channels[0],
             }).collect())
         });
         // Mid-sweep: strictly between 0 and total at least once, monotonic, always in progress.

@@ -153,6 +153,11 @@ pub fn fm_record(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)]) ->
 
 /// As `fm_record`, optionally without the 19 kHz stereo pilot (a mono station).
 pub fn fm_record_opts(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)], pilot: bool) -> Vec<C32> {
+    fm_record_full(rng, fs_n, n, stations, pilot, true)
+}
+
+/// As `fm_record_opts`; `modulated = false` is dead air (a bare carrier).
+pub fn fm_record_full(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)], pilot: bool, modulated: bool) -> Vec<C32> {
     let mut rec = vec![C32::new(0.0, 0.0); n];
     for &(off, amp) in stations {
         let tones: Vec<(f64, f64, f64)> = (0..4).map(|_| (rng.range(200.0, 6000.0), rng.range(0.05, 0.25), rng.range(0.0, std::f64::consts::TAU))).collect();
@@ -166,6 +171,9 @@ pub fn fm_record_opts(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)
                 m += a * (2.0 * std::f64::consts::PI * f * t + p).sin();
             }
             m *= 0.6 + 0.4 * (2.0 * std::f64::consts::PI * slow * t).sin();
+            if !modulated {
+                m = 0.0;
+            }
             phase += 2.0 * std::f64::consts::PI * (off + 75_000.0 * m.clamp(-1.0, 1.0)) / fs_n;
             *v += C32::new((amp * phase.cos()) as f32, (amp * phase.sin()) as f32);
         }

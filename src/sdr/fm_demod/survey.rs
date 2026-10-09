@@ -88,6 +88,9 @@ pub struct FmChannel {
     pub marginal: bool,
     /// For marginal candidates: pilot or RDS corroboration was present.
     pub corroborated: bool,
+    /// Known station kept on power alone: strong carrier (>= `HOLD_MIN_EXCESS_DB`) but
+    /// the discriminator reading failed (dead air / silence / corrupted capture).
+    pub held: bool,
     pub confirmed: bool,
 }
 
@@ -161,11 +164,14 @@ pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmCh
             let prone = col.iter().filter(|c| c.image_prone).count() * 2 > col.len();
             let marginal = relax == 0.0 && excess < cfg.marginal_excess_db;
             let corroborated = col.iter().any(|c| c.pilot_db.is_some_and(|p| p >= cfg.marginal_min_pilot_db) || c.rds_pi.is_some());
-            let confirmed = excess >= cfg.min_excess_db - relax
+            let held_eligible = relax > 0.0 && excess >= HOLD_MIN_EXCESS_DB && !rejected;
+            let confirmed_by_evidence = excess >= cfg.min_excess_db - relax
                 && quality >= cfg.min_quality_db - relax
                 && !rejected
                 && (!prone || excess >= IMAGE_PRONE_MIN_EXCESS_DB)
                 && (!marginal || corroborated);
+            let held = !confirmed_by_evidence && held_eligible;
+            let confirmed = confirmed_by_evidence || held;
             FmChannel {
                 freq_hz: f,
                 power_dbfs: col[0].power_dbfs,
@@ -178,6 +184,7 @@ pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmCh
                 image_prone: prone,
                 marginal,
                 corroborated: marginal && corroborated,
+                held,
                 confirmed,
             }
         })
@@ -202,6 +209,9 @@ pub fn evaluate_adaptive(
     for _ in 0..EXTRA_CAPTURES {
         if let Some(iq) = more() {
             let r = evaluate_capture(&iq, sample_rate, centre_hz, channels, cfg);
+            for c in r.iter().filter(|c| c.excess_db >= cfg.min_excess_db - 1.0) {
+                tracing::debug!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), "FM extra capture");
+            }
             if r.len() == runs[0].len() {
                 runs.push(r);
             }
@@ -322,6 +332,7 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             image_prone: false,
             marginal: false,
             corroborated: false,
+            held: false,
             confirmed: false,
         };
         if off.abs() < 0.95e6 && excess_db >= gate_x {
@@ -408,11 +419,22 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
                 ch.corroborated = pilot_db >= cfg.marginal_min_pilot_db || ch.rds_pi.is_some();
                 ch.confirmed = !ch.marginal || ch.corroborated;
             }
+            // A KNOWN station whose carrier is still strong is not absent just because
+            // the discriminator reading failed in this sweep (silence between
+            // programmes, a corrupted capture). Keep it on power alone; a later sweep
+            // where the power is gone removes the doubt.
+            if !ch.confirmed && relax > 0.0 && excess_db >= HOLD_MIN_EXCESS_DB && !image && !spill {
+                ch.confirmed = true;
+                ch.held = true;
+            }
         }
         out.push(ch);
     }
     out
 }
+
+/// A known station at or above this excess is held even if every quality reading fails.
+pub const HOLD_MIN_EXCESS_DB: f64 = 10.0;
 
 /// Minimum excess for a channel whose mirror channel is >20 dB stronger (see `evaluate_capture`).
 pub const IMAGE_PRONE_MIN_EXCESS_DB: f64 = 8.0;
@@ -804,5 +826,60 @@ mod tests {
         }
         println!("stereo station at 6 dB SNR confirmed with pilot >= 10 dB: {with_pilot}/20");
         assert!(with_pilot >= 18);
+    }
+
+    fn capture_ch2(seed: u64, ch_snr_db: f64, station: bool, modulated: bool) -> (Vec<u8>, Vec<u64>, u64) {
+        let centre = 98_000_000u64;
+        let chans: Vec<u64> = (0..8).map(|i| centre - 700_000 + 200_000 * i as u64).collect();
+        let mut rng = Rng::new(seed);
+        let fs_n = 8_192_000.0;
+        let need = (CAPTURE_LEN as f64 * fs_n / FS_OUT).ceil() as usize + 1024 + 16;
+        let st: Vec<(f64, f64)> = if station { vec![(chans[2] as f64 - centre as f64, 1.0)] } else { Vec::new() };
+        let rec = fm_record_full(&mut rng, fs_n, need, &st, true, modulated);
+        let snr = if station { ch_snr_db - 10.1 } else { 0.0 };
+        (capture_from_record(&mut rng, &rec, fs_n, FrontEnd::standard(snr, 0.0)), chans, centre)
+    }
+
+    #[test]
+    fn strong_known_station_is_not_dropped_by_a_bad_sweep() {
+        let known_cfg = |chans: &[u64]| SurveyConfig { known: vec![chans[2]], ..SurveyConfig::default() };
+        for seed in 0..10u64 {
+            // Every capture of the sweep is unusable for the discriminator (dead air).
+            let (iq, chans, centre) = capture_ch2(600 + seed, 25.0, true, false);
+            let mut more = || Some(capture_ch2(700 + seed, 25.0, true, false).0);
+            let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &known_cfg(&chans), &mut more);
+            assert!(r[2].confirmed && r[2].held, "seed {seed}: known strong station must be held: {:?}", r[2]);
+            assert!(r[2].excess_db >= HOLD_MIN_EXCESS_DB);
+            // The same capture for a station we have never confirmed is NOT reported.
+            let mut more = || Some(capture_ch2(700 + seed, 25.0, true, false).0);
+            let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &SurveyConfig::default(), &mut more);
+            assert!(!r[2].confirmed, "an unmodulated carrier we never confirmed is not a station");
+        }
+    }
+
+    #[test]
+    fn one_corrupted_capture_does_not_drop_a_strong_known_station() {
+        for seed in 0..10u64 {
+            let (bad, chans, centre) = capture_ch2(800 + seed, 25.0, true, false);
+            let mut n = 0;
+            let mut more = || {
+                n += 1;
+                Some(capture_ch2(900 + seed * 3 + n, 25.0, true, true).0)
+            };
+            let cfg = SurveyConfig { known: vec![chans[2]], ..SurveyConfig::default() };
+            let r = evaluate_adaptive(&bad, 2_048_000, centre, &chans, &cfg, &mut more);
+            assert!(r[2].confirmed && !r[2].held, "median of good captures decides: {:?}", r[2]);
+        }
+    }
+
+    #[test]
+    fn a_known_station_whose_power_is_gone_is_removed() {
+        for seed in 0..10u64 {
+            let (iq, chans, centre) = capture_ch2(1000 + seed, 25.0, false, true);
+            let mut more = || Some(capture_ch2(1100 + seed, 25.0, false, true).0);
+            let cfg = SurveyConfig { known: vec![chans[2]], ..SurveyConfig::default() };
+            let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &cfg, &mut more);
+            assert!(!r[2].confirmed, "seed {seed}: {:?}", r[2]);
+        }
     }
 }
