@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use super::dtv::dvb;
-use super::fm_demod::survey::{evaluate_capture, plan_captures, CapturePlan, SurveyConfig};
+use super::fm_demod::survey::{evaluate_adaptive, plan_captures, CapturePlan, SurveyConfig};
 
 /// Result from a single scan operation.
 pub struct ScanResult {
@@ -545,7 +545,13 @@ impl Scanner {
     fn survey_capture(&mut self, sdr_manager: &mut SdrManager, plan: &CapturePlan, sample_rate: u32, cfg: &SurveyConfig) -> Option<Vec<crate::sdr::fm_demod::survey::FmChannel>> {
         self.tune_with_recovery(sdr_manager, 0, plan.centre_hz)?;
         let iq = self.capture_with_auto_reset(sdr_manager, 0, plan.centre_hz)?;
-        let r = evaluate_capture(&iq, sample_rate, plan.centre_hz, &plan.channels, cfg);
+        // Borderline channels get extra captures of the same tune; the decision is
+        // made on the median evidence so ordinary noise/fading does not flip it.
+        let centre = plan.centre_hz;
+        let r = {
+            let mut more = || self.capture_with_auto_reset(sdr_manager, 0, centre);
+            evaluate_adaptive(&iq, sample_rate, centre, &plan.channels, cfg, &mut more)
+        };
         if r.is_empty() { None } else { Some(r) }
     }
 
@@ -556,7 +562,8 @@ impl Scanner {
     fn fm_survey_pass(&mut self, sdr_manager: &mut SdrManager) -> Vec<u64> {
         let sample_rate = sdr_manager.device(0).map(|d| d.sample_rate()).unwrap_or(2_048_000);
         let plans = plan_captures(self.fm_config.sweep_start, self.fm_config.sweep_end, self.fm_config.sweep_step, sample_rate);
-        let cfg = SurveyConfig { channel_step_hz: self.fm_config.sweep_step as f64, ..SurveyConfig::default() };
+        // Hysteresis: stations known from earlier sweeps (or configured) keep lowered gates.
+        let cfg = SurveyConfig { channel_step_hz: self.fm_config.sweep_step as f64, known: self.fm_frequencies.clone(), ..SurveyConfig::default() };
         self.fm_survey_run(plans, |sc, plan| sc.survey_capture(sdr_manager, plan, sample_rate, &cfg))
     }
 
@@ -1581,7 +1588,7 @@ mod dsp_plan_tests {
             }
             Some(plan.channels.iter().map(|&f| FmChannel {
                 freq_hz: f, power_dbfs: -40.0, excess_db: 20.0, quality_db: 30.0, pilot_db: None, rds_pi: None,
-                image_of_mirror: false, spill_of_neighbour: false, confirmed: f == plan.channels[0],
+                image_of_mirror: false, spill_of_neighbour: false, image_prone: false, confirmed: f == plan.channels[0],
             }).collect())
         });
         // Mid-sweep: strictly between 0 and total at least once, monotonic, always in progress.
