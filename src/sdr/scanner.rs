@@ -170,6 +170,14 @@ enum ScanType {
     Dtv,
 }
 
+/// A band sweep is abandoned after this many CONSECUTIVE failed tunes/captures.
+/// `SdrDevice::set_center_freq` already runs the stall ladder (retry, USB reset +
+/// re-init cycles) internally, so a failure here has survived all of that; on a
+/// dead dongle more attempts only add minutes per channel. The unvisited channels
+/// are counted in `tune_failed`, the sweep is marked complete, and the short-leash
+/// rediscovery (`needs_discovery`) retries the band on a later cycle.
+const MAX_CONSECUTIVE_TUNE_FAILURES: u32 = 3;
+
 /// Default IQ capture size for signal processing (128K samples = 256KB).
 const CAPTURE_BYTES: usize = 262_144;
 
@@ -579,25 +587,54 @@ impl Scanner {
         let mut found: Vec<u64> = Vec::new();
         let mut retry: Vec<CapturePlan> = Vec::new();
         let (mut stations_images, mut weak_rejected) = (0usize, 0usize);
-        for plan in &plans {
-            match capture(self, plan) {
-                Some(r) => Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected),
-                None => retry.push(plan.clone()),
-            }
-            self.advance_band(BandKind::Fm, plan.channels.len() as u32, found.len() as u32);
-        }
-        let retried = retry.len();
+        let mut consecutive = 0u32;
         let mut unresolved = 0u32;
-        for plan in retry {
-            warn!(centre_mhz = plan.centre_hz as f64 / 1e6, "FM capture failed; retrying once");
-            match capture(self, &plan) {
-                Some(r) => Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected),
+        let mut aborted = false;
+        for (idx, plan) in plans.iter().enumerate() {
+            match capture(self, plan) {
+                Some(r) => {
+                    consecutive = 0;
+                    Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
+                }
                 None => {
-                    unresolved += plan.channels.len() as u32;
-                    warn!(centre_mhz = plan.centre_hz as f64 / 1e6, channels = plan.channels.len(), "FM capture failed after retry; channels counted as tune_failed");
+                    consecutive += 1;
+                    retry.push(plan.clone());
                 }
             }
-            self.advance_band(BandKind::Fm, 0, found.len() as u32);
+            self.advance_band(BandKind::Fm, plan.channels.len() as u32, found.len() as u32);
+            if consecutive >= MAX_CONSECUTIVE_TUNE_FAILURES {
+                aborted = true;
+                let skipped: u32 = plans[idx + 1..].iter().map(|p| p.channels.len() as u32).sum();
+                unresolved += skipped;
+                warn!(consecutive, skipped_channels = skipped, "FM band abandoned after consecutive tune failures; the next cycle retries");
+                break;
+            }
+        }
+        let retried = if aborted { 0 } else { retry.len() };
+        if aborted {
+            unresolved += retry.iter().map(|p| p.channels.len() as u32).sum::<u32>();
+        } else {
+            consecutive = 0;
+            for (i, plan) in retry.iter().enumerate() {
+                warn!(centre_mhz = plan.centre_hz as f64 / 1e6, "FM capture failed; retrying once");
+                match capture(self, plan) {
+                    Some(r) => {
+                        consecutive = 0;
+                        Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
+                    }
+                    None => {
+                        consecutive += 1;
+                        unresolved += plan.channels.len() as u32;
+                        warn!(centre_mhz = plan.centre_hz as f64 / 1e6, channels = plan.channels.len(), "FM capture failed after retry; channels counted as tune_failed");
+                    }
+                }
+                self.advance_band(BandKind::Fm, 0, found.len() as u32);
+                if consecutive >= MAX_CONSECUTIVE_TUNE_FAILURES {
+                    unresolved += retry[i + 1..].iter().map(|p| p.channels.len() as u32).sum::<u32>();
+                    warn!(consecutive, "FM retry pass abandoned after consecutive tune failures");
+                    break;
+                }
+            }
         }
         found.sort_unstable();
         found.dedup();
@@ -635,23 +672,28 @@ impl Scanner {
     fn dvb_sweep(&mut self, sdr_manager: &mut SdrManager, result: &mut DiscoveryResult) {
         let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan.clone() else { return };
         let centres = dvb_channel_centres(self.dtv_config.sweep_start, self.dtv_config.sweep_end, bandwidth_mhz);
+        self.dvb_sweep_run(&centres, bandwidth_mhz, result, |sc, centre| {
+            // One attempt per channel: core's set_center_freq already retries and resets.
+            sc.tune_with_recovery(sdr_manager, 0, centre)?;
+            let sample_rate = sdr_manager.device(0).map(|d| d.sample_rate()).unwrap_or(2_048_000);
+            sc.capture_with_auto_reset(sdr_manager, 0, centre).map(|iq| (iq, sample_rate))
+        });
+    }
+
+    /// The DVB discovery loop with the capture step injected (testable without a
+    /// device). Abandons the band after `MAX_CONSECUTIVE_TUNE_FAILURES` consecutive
+    /// failures, counting every unvisited channel as `tune_failed`.
+    fn dvb_sweep_run<F>(&mut self, centres: &[(u32, u64)], bandwidth_mhz: u32, result: &mut DiscoveryResult, mut capture: F)
+    where
+        F: FnMut(&mut Scanner, u64) -> Option<(Vec<u8>, u32)>,
+    {
         self.begin_band(BandKind::Dtv, centres.len() as u32);
         let mut failed = 0u32;
-        for (_, centre) in centres {
-            let mut sample_rate = 0;
-            let mut capture = None;
-            for _attempt in 0..2 {
-                if self.tune_with_recovery(sdr_manager, 0, centre).is_none() {
-                    continue;
-                }
-                sample_rate = sdr_manager.device(0).map(|d| d.sample_rate()).unwrap_or(2_048_000);
-                capture = self.capture_with_auto_reset(sdr_manager, 0, centre);
-                if capture.is_some() {
-                    break;
-                }
-            }
-            match capture {
-                Some(iq) => {
+        let mut consecutive = 0u32;
+        for (idx, &(_, centre)) in centres.iter().enumerate() {
+            match capture(self, centre) {
+                Some((iq, sample_rate)) => {
+                    consecutive = 0;
                     if let Some(det) = dvb::detect_dvb(&iq, sample_rate, bandwidth_mhz) {
                         info!(freq_mhz = centre as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, rho = format!("{:.2}", det.rho), contrast = format!("{:.0}", det.contrast), "DVB channel found");
                         result.dtv_channels.push(centre);
@@ -659,10 +701,17 @@ impl Scanner {
                 }
                 None => {
                     failed += 1;
-                    debug!(freq_mhz = centre as f64 / 1e6, "DVB channel skipped: tune/capture failed after retry");
+                    consecutive += 1;
+                    debug!(freq_mhz = centre as f64 / 1e6, "DVB channel skipped: tune/capture failed");
                 }
             }
             self.advance_band(BandKind::Dtv, 1, result.dtv_channels.len() as u32);
+            if consecutive >= MAX_CONSECUTIVE_TUNE_FAILURES {
+                let skipped = (centres.len() - idx - 1) as u32;
+                failed += skipped;
+                warn!(consecutive, skipped_channels = skipped, "DVB band abandoned after consecutive tune failures; the next cycle retries");
+                break;
+            }
         }
         let found = result.dtv_channels.len() as u32;
         self.finish_band(BandKind::Dtv, found, failed);
@@ -1563,6 +1612,64 @@ mod dsp_plan_tests {
         // Back to ATSC.
         scanner.apply_plan(&ScanningConfig::default());
         assert!(!scanner.dtv_plan.is_dvb());
+    }
+
+    #[test]
+    fn dead_dongle_bounds_attempts_per_band() {
+        use crate::sdr::fm_demod::survey::plan_captures;
+        // FM: a device whose every tune fails. Without the bound this is 13 first-pass
+        // attempts + 13 retries; with it, 3 consecutive failures end the band.
+        let mut scanner = Scanner::new(&ScanningConfig::default(), -30.0);
+        let h = scanner.sweep_handle();
+        let plans = plan_captures(87_500_000, 108_000_000, 200_000, 2_048_000);
+        let mut calls = 0;
+        let found = scanner.fm_survey_run(plans, |_sc, _plan| {
+            calls += 1;
+            None
+        });
+        assert!(found.is_empty());
+        assert_eq!(calls, MAX_CONSECUTIVE_TUNE_FAILURES, "attempts on a dead dongle");
+        let r = h.lock().unwrap().fm.clone();
+        assert!(!r.in_progress && r.completed_at.is_some());
+        assert_eq!((r.evaluated, r.total, r.tune_failed), (103, 103, 103));
+
+        // DVB: one attempt per channel, then abandon after 3 consecutive failures.
+        let mut scanner = Scanner::new(&dvb_cfg(470_000_000, 694_000_000, 8_000_000), -30.0);
+        let h = scanner.sweep_handle();
+        let centres = dvb_channel_centres(470_000_000, 694_000_000, 8);
+        let mut result = DiscoveryResult { fm_stations: vec![], lte_cells: vec![], dtv_channels: vec![] };
+        let mut calls = 0;
+        scanner.dvb_sweep_run(&centres, 8, &mut result, |_sc, _centre| {
+            calls += 1;
+            None
+        });
+        assert_eq!(calls, MAX_CONSECUTIVE_TUNE_FAILURES);
+        let r = h.lock().unwrap().dtv.clone();
+        assert!(!r.in_progress);
+        assert_eq!((r.evaluated, r.total, r.tune_failed, r.found), (28, 28, 28, 0));
+    }
+
+    #[test]
+    fn intermittent_failures_do_not_abandon_the_band() {
+        use crate::sdr::fm_demod::survey::plan_captures;
+        let mut scanner = Scanner::new(&ScanningConfig::default(), -30.0);
+        let plans = plan_captures(87_500_000, 108_000_000, 200_000, 2_048_000);
+        let mut calls = 0;
+        // Every 3rd call fails (never 3 in a row), including the retries.
+        scanner.fm_survey_run(plans, |_sc, plan| {
+            calls += 1;
+            if calls % 3 == 0 {
+                None
+            } else {
+                Some(plan.channels.iter().map(|&f| crate::sdr::fm_demod::survey::FmChannel {
+                    freq_hz: f, power_dbfs: -40.0, excess_db: 0.0, quality_db: 0.0, pilot_db: None, rds_pi: None,
+                    image_of_mirror: false, spill_of_neighbour: false, image_prone: false, confirmed: false,
+                }).collect())
+            }
+        });
+        let r = scanner.sweep_report().fm;
+        assert_eq!(r.evaluated, 103);
+        assert!(calls > 13, "all plans visited, plus retries");
     }
 
     #[test]
