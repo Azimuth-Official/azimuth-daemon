@@ -161,6 +161,23 @@ cd azimuth-daemon
 cargo build --release
 ```
 
+### Windows executable from Linux
+
+`scripts/build-windows-xwin.sh` cross-builds `azimuth-daemon.exe` with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin) (needs `cargo install cargo-xwin`,
+`rustup target add x86_64-pc-windows-msvc` and `python3`):
+
+```sh
+export XWIN_ACCEPT_LICENSE=1   # only after reading the Microsoft SDK/CRT license cargo-xwin downloads
+scripts/build-windows-xwin.sh
+```
+
+It applies the same path remapping and static CRT as `scripts/build-windows.ps1`
+(`$HOME` becomes `/_`, the checkout becomes `/src`) and `/DNDEBUG` for the bundled C
+libraries, and adds the libwdi link settings that `wdi-rs` only emits on a Windows host.
+The script prints the executable path (`target/x86_64-pc-windows-msvc/release/`) and its
+SHA-256; the script never sets `XWIN_ACCEPT_LICENSE` for you.
+
 ## Links
 
 - [Website](https://azimuth.day)
