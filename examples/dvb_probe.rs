@@ -20,11 +20,9 @@ mod driver_state;
 #[path = "../src/sdr/stall.rs"]
 mod stall;
 #[path = "../src/sdr/dongle.rs"]
-#[allow(dead_code)]
 mod dongle;
 // The detector itself (self-contained, no daemon state).
 #[path = "../src/sdr/dtv/dvb.rs"]
-#[allow(dead_code)]
 mod dvb;
 use dongle::{Gain, InitParams};
 
