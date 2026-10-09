@@ -9,6 +9,8 @@
 //!
 //!   cargo run --release --example dvb_probe -- --help
 
+#![allow(dead_code)] // the included detector module has helpers the probe does not call
+
 use std::time::Instant;
 
 use rtl_sdr_rs::error::RtlsdrError;
