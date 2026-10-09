@@ -34,6 +34,8 @@ struct Opts {
     pause_ms: u64,
     passes: u32,
     reset_buffer: bool,
+    reset_after: bool,
+    retry_tune: u32,
     keep_going: bool,
 }
 
@@ -45,6 +47,9 @@ fn usage() -> ! {
          \x20 [--pause-ms N]        sleep after each step (default 0)\n\
          \x20 [--passes N]          sweeps to run (default 3)\n\
          \x20 [--no-reset-buffer]   skip reset_buffer() before each read\n\
+         \x20 [--reset-after-capture]  FIX CANDIDATE 1: reset_buffer() right after each read\n\
+         \x20                         (stops the endpoint FIFO before the next control write)\n\
+         \x20 [--retry-tune N]      FIX CANDIDATE 2: retry a failed tune up to N times\n\
          \x20 [--continue]          keep going after a failure"
     );
     std::process::exit(2)
@@ -61,6 +66,8 @@ fn parse() -> Opts {
         pause_ms: 0,
         passes: 3,
         reset_buffer: true,
+        reset_after: false,
+        retry_tune: 0,
         keep_going: false,
     };
     let mut args = std::env::args().skip(1);
@@ -76,6 +83,8 @@ fn parse() -> Opts {
             "--pause-ms" => o.pause_ms = num(),
             "--passes" => o.passes = num() as u32,
             "--no-reset-buffer" => o.reset_buffer = false,
+            "--reset-after-capture" => o.reset_after = true,
+            "--retry-tune" => o.retry_tune = num() as u32,
             "--continue" => o.keep_going = true,
             _ => usage(),
         }
@@ -108,7 +117,15 @@ fn main() {
         while f <= o.end {
             steps += 1;
             let t = Instant::now();
-            let tune = sdr.set_center_freq(f);
+            let mut tune = sdr.set_center_freq(f);
+            for _ in 0..o.retry_tune {
+                if tune.is_ok() {
+                    break;
+                }
+                println!("RETRY_TUNE f={f}");
+                std::thread::sleep(Duration::from_millis(50));
+                tune = sdr.set_center_freq(f);
+            }
             if o.settle_ms > 0 {
                 std::thread::sleep(Duration::from_millis(o.settle_ms));
             }
@@ -118,6 +135,9 @@ fn main() {
                     let _ = sdr.reset_buffer();
                 }
                 capture = sdr.read_sync(&mut buf);
+                if o.reset_after {
+                    let _ = sdr.reset_buffer();
+                }
             }
             let ok = tune.is_ok() && capture.is_ok();
             println!(
