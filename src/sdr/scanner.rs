@@ -587,6 +587,7 @@ impl Scanner {
         F: FnMut(&mut Scanner, &CapturePlan) -> Option<Vec<crate::sdr::fm_demod::survey::FmChannel>>,
     {
         let total: u32 = plans.iter().map(|p| p.channels.len() as u32).sum();
+        let hold_min = SurveyConfig::default().hold_min_excess_db;
         self.begin_band(BandKind::Fm, total);
         let mut found: Vec<u64> = Vec::new();
         let mut retry: Vec<CapturePlan> = Vec::new();
@@ -598,7 +599,7 @@ impl Scanner {
             match capture(self, plan) {
                 Some(r) => {
                     consecutive = 0;
-                    update_hold_streaks(&mut self.fm_hold, &r);
+                    update_hold_streaks(&mut self.fm_hold, &r, hold_min);
                     Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
                 }
                 None => {
@@ -625,7 +626,7 @@ impl Scanner {
                 match capture(self, plan) {
                     Some(r) => {
                         consecutive = 0;
-                        update_hold_streaks(&mut self.fm_hold, &r);
+                        update_hold_streaks(&mut self.fm_hold, &r, hold_min);
                         Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected);
                     }
                     None => {

@@ -80,11 +80,16 @@ impl SurveyConfig {
 /// not confirmed (the cap was reached) -> keep the streak, so the station stays
 /// dropped until evidence or an absence resets it. Channels not evaluated this
 /// sweep keep their streak.
-pub fn update_hold_streaks(streaks: &mut std::collections::HashMap<u64, u32>, results: &[FmChannel]) {
+///
+/// "Consecutive" therefore means consecutive sweeps WITHOUT evidence or absence: a
+/// sweep in which a strong channel is rejected as image/spill (not confirmed, carrier
+/// still >= `hold_min_excess_db`) leaves the streak unchanged rather than resetting it.
+/// `hold_min_excess_db` must be the same value the survey used (`SurveyConfig`).
+pub fn update_hold_streaks(streaks: &mut std::collections::HashMap<u64, u32>, results: &[FmChannel], hold_min_excess_db: f64) {
     for c in results {
         if c.confirmed && c.held {
             *streaks.entry(c.freq_hz).or_insert(0) += 1;
-        } else if c.confirmed || c.excess_db < HOLD_MIN_EXCESS_DB {
+        } else if c.confirmed || c.excess_db < hold_min_excess_db {
             streaks.remove(&c.freq_hz);
         }
     }
@@ -942,7 +947,7 @@ mod tests {
         let mut decisions = Vec::new();
         for sweep in 0..4u64 {
             let c = eval_known(2000 + sweep * 11, false, &streaks);
-            update_hold_streaks(&mut streaks, std::slice::from_ref(&c));
+            update_hold_streaks(&mut streaks, std::slice::from_ref(&c), SurveyConfig::default().hold_min_excess_db);
             decisions.push((c.confirmed, c.held));
         }
         assert_eq!(decisions, vec![(true, true), (true, true), (false, false), (false, false)], "{decisions:?}");
@@ -952,7 +957,7 @@ mod tests {
         let mut seen = Vec::new();
         for (i, modulated) in [true, false, true, false, false, true].into_iter().enumerate() {
             let c = eval_known(3000 + i as u64 * 13, modulated, &streaks);
-            update_hold_streaks(&mut streaks, std::slice::from_ref(&c));
+            update_hold_streaks(&mut streaks, std::slice::from_ref(&c), SurveyConfig::default().hold_min_excess_db);
             seen.push((c.confirmed, c.held));
         }
         assert_eq!(seen, vec![(true, false), (true, true), (true, false), (true, true), (true, true), (true, false)], "{seen:?}");
@@ -968,6 +973,15 @@ mod tests {
         let r = evaluate_adaptive(&iq, 2_048_000, centre, &chans, &cfg, &mut more);
         assert!(r[0].confirmed);
         assert!(!r[7].confirmed && !r[7].held, "{:?}", r[7]);
+        // Single-capture path (no extra captures involved): the image flag must block the hold.
+        let single = evaluate_capture(&iq, 2_048_000, centre, &chans, &cfg);
+        assert!(single[7].image_of_mirror && single[7].excess_db >= HOLD_MIN_EXCESS_DB, "fixture must be hold-eligible on power: {:?}", single[7]);
+        assert!(!single[7].confirmed && !single[7].held, "{:?}", single[7]);
+        // Combined path: the same verdict from three image-flagged captures.
+        let flagged = |_: usize| vec![FmChannel { image_of_mirror: true, image_prone: true, ..crafted(23.0, 39.0, None, chans[7]) }];
+        let runs: Vec<Vec<FmChannel>> = (0..3).map(flagged).collect();
+        let c = combine_captures(&runs, &cfg).remove(0);
+        assert!(!c.confirmed && !c.held, "{c:?}");
     }
 
     fn crafted(excess: f64, quality: f64, pilot: Option<f64>, f: u64) -> FmChannel {
