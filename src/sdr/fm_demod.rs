@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod survey;
+
 /// Result of FM demodulation
 #[derive(Debug, Clone)]
 pub struct FmDemodResult {
