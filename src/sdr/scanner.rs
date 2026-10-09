@@ -75,20 +75,28 @@ impl DtvPlan {
         matches!(self, DtvPlan::Dvb { .. })
     }
 
-    /// TEMPORARY routing until `DtvScanConfig` carries the standard name
-    /// (requested from DAEMON-CORE): 7 or 8 MHz raster steps are DVB channel
-    /// widths, everything else (6 MHz ATSC/ISDB-T defaults) keeps the pilot path.
+    /// Route on the region's DTV standard: any "DVB-T*" name selects the DVB
+    /// detector; "" and "ATSC" (and ISDB-T/DTMB, as before) keep the legacy
+    /// pilot path. `channel_mhz` / `first_channel` of 0 are derived from the
+    /// sweep step / the 470 MHz and 526 MHz rasters.
     pub fn from_config(cfg: &DtvScanConfig) -> Self {
-        let bw = (cfg.sweep_step / 1_000_000) as u32;
-        if cfg.sweep_step.is_multiple_of(1_000_000) && (bw == 7 || bw == 8) {
-            let first_channel = match bw {
-                8 => 21 + (cfg.sweep_start.saturating_sub(470_000_000) / 8_000_000) as u32,
-                _ => 28 + (cfg.sweep_start.saturating_sub(526_000_000) / 7_000_000) as u32,
-            };
-            DtvPlan::Dvb { bandwidth_mhz: bw, first_channel }
-        } else {
-            DtvPlan::Atsc
+        if !cfg.standard.starts_with("DVB") {
+            return DtvPlan::Atsc;
         }
+        let bw = if cfg.channel_mhz > 0 { cfg.channel_mhz } else { (cfg.sweep_step / 1_000_000) as u32 };
+        if !matches!(bw, 6..=8) {
+            return DtvPlan::Atsc;
+        }
+        let first_channel = if cfg.first_channel > 0 {
+            cfg.first_channel
+        } else {
+            match bw {
+                8 => 21 + (cfg.sweep_start.saturating_sub(470_000_000) / 8_000_000) as u32,
+                7 => 28 + (cfg.sweep_start.saturating_sub(526_000_000) / 7_000_000) as u32,
+                _ => 14 + (cfg.sweep_start.saturating_sub(470_000_000) / 6_000_000) as u32,
+            }
+        };
+        DtvPlan::Dvb { bandwidth_mhz: bw, first_channel }
     }
 }
 
@@ -1526,6 +1534,10 @@ mod dsp_plan_tests {
 
     fn dvb_cfg(start: u64, end: u64, step: u64) -> ScanningConfig {
         let mut c = ScanningConfig::default();
+        if step != 6_000_000 {
+            c.dtv.standard = "DVB-T2-694".to_string();
+            c.dtv.channel_mhz = (step / 1_000_000) as u32;
+        }
         c.dtv.sweep_start = start;
         c.dtv.sweep_end = end;
         c.dtv.sweep_step = step;
@@ -1554,6 +1566,15 @@ mod dsp_plan_tests {
     fn dtv_routing_keeps_atsc_defaults_on_the_pilot_path() {
         assert_eq!(DtvPlan::from_config(&ScanningConfig::default().dtv), DtvPlan::Atsc);
         assert_eq!(DtvPlan::from_config(&dvb_cfg(470_000_000, 608_000_000, 6_000_000).dtv), DtvPlan::Atsc);
+        let mut atsc = ScanningConfig::default();
+        atsc.dtv.standard = "ATSC".to_string();
+        atsc.dtv.sweep_step = 8_000_000; // a stray step never routes an ATSC plan to DVB
+        assert_eq!(DtvPlan::from_config(&atsc.dtv), DtvPlan::Atsc);
+        let mut tw = ScanningConfig::default();
+        tw.dtv.standard = "DVB-T-6".to_string();
+        tw.dtv.channel_mhz = 6;
+        tw.dtv.first_channel = 14;
+        assert_eq!(DtvPlan::from_config(&tw.dtv), DtvPlan::Dvb { bandwidth_mhz: 6, first_channel: 14 });
         assert_eq!(DtvPlan::from_config(&dvb_cfg(470_000_000, 694_000_000, 8_000_000).dtv), DtvPlan::Dvb { bandwidth_mhz: 8, first_channel: 21 });
         assert_eq!(DtvPlan::from_config(&dvb_cfg(526_000_000, 694_000_000, 7_000_000).dtv), DtvPlan::Dvb { bandwidth_mhz: 7, first_channel: 28 });
     }
