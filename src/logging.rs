@@ -51,6 +51,15 @@ impl LogHandle {
         &self.dir
     }
 
+    /// A handle that is not wired to a global subscriber, for unit tests.
+    #[cfg(test)]
+    pub fn for_tests(dir: PathBuf) -> Arc<Self> {
+        let (_layer, reload): (reload::Layer<EnvFilter, Registry>, _) =
+            reload::Layer::new(EnvFilter::new(BASE_FILTER));
+        let (_writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        Arc::new(Self { reload, dir, _guard: guard })
+    }
+
     /// Apply a raw EnvFilter directive string. Returns the applied value.
     pub fn set_filter(&self, directive: &str) -> Result<String, String> {
         let filter = EnvFilter::try_new(directive).map_err(|e| e.to_string())?;

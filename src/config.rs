@@ -19,6 +19,40 @@ pub struct Config {
     pub gps: Option<GpsConfig>,
 }
 
+/// One validation problem: the config field it concerns and a message that
+/// names the fix. Rendered by the desktop app, so no CLI advice lives here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConfigProblem {
+    pub field: String,
+    pub message: String,
+}
+
+/// Why `Config::load_checked` could not produce a config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadError {
+    /// The file (or its directory) does not exist: a first run, not a fault.
+    Missing(String),
+    /// Present but unreadable or unparsable.
+    Failed(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(m) | Self::Failed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Which region plan `apply_region` ended up applying and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionResolution {
+    /// Region code actually applied ("FR", "_DEFAULT", ...).
+    pub effective: String,
+    /// "explicit" | "auto:location" | "default"
+    pub source: &'static str,
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct ApiConfig {
     pub url: String,
@@ -398,7 +432,7 @@ pub struct GpsConfig {
     /// entirely and never silently falls back to another port.
     #[serde(default)]
     pub port: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "baud")]
     pub baud_rate: Option<u32>,
     #[serde(default = "default_sample_interval")]
     pub sample_interval_secs: u64,
@@ -558,14 +592,15 @@ impl Config {
     /// LTE, and DTV sweep ranges; without one, only an empty LTE sweep-band list
     /// is filled from the worldwide default so upgraded nodes start scanning.
     /// Resolution failures keep the configured sweep plans — never fatal.
-    pub fn apply_region(&mut self) {
+    pub fn apply_region(&mut self) -> RegionResolution {
         let explicit_region =
             matches!(self.region.as_deref(), Some(r) if !r.is_empty() && r != "AUTO");
         let region_code = self.region.clone().unwrap_or_else(|| "AUTO".to_string());
         let max_tuner_mhz = self.sdr.max_tuner_mhz;
 
+        let unresolved = RegionResolution { effective: "_DEFAULT".to_string(), source: "default" };
         let Some(scanning) = self.scanning.as_mut() else {
-            return;
+            return unresolved;
         };
 
         let resolver = match RegionResolver::new(max_tuner_mhz) {
@@ -573,7 +608,7 @@ impl Config {
             Err(e) => {
                 tracing::warn!(error = %e,
                     "embedded region database failed to load — keeping configured sweep plans");
-                return;
+                return unresolved;
             }
         };
         let resolved = match resolver.resolve(&region_code) {
@@ -581,7 +616,7 @@ impl Config {
             Err(e) => {
                 tracing::warn!(error = %e, region = %region_code,
                     "region resolution failed — keeping configured sweep plans");
-                return;
+                return unresolved;
             }
         };
 
@@ -610,6 +645,10 @@ impl Config {
             skipped_bands = resolved.skipped_bands.len(),
             "regional frequency plan applied"
         );
+        RegionResolution {
+            effective: resolved.region_code.to_string(),
+            source: if explicit_region { "explicit" } else { "default" },
+        }
     }
 
     #[allow(dead_code)]
@@ -618,6 +657,52 @@ impl Config {
             || self.api.key == "YOUR_API_KEY_HERE"
             || self.node.id.is_empty()
             || self.node.id == "YOUR_NODE_ID_HERE"
+    }
+
+    /// `validate()` as structured problems. The CLI-only "run 'azimuth-daemon
+    /// --setup'" advice is stripped so a GUI can show the text as is.
+    pub fn problems(&self) -> Vec<ConfigProblem> {
+        match self.validate() {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors
+                .into_iter()
+                .map(|e| {
+                    let e = e.replace(" — run 'azimuth-daemon --setup' to configure", "");
+                    match e.split_once(": ") {
+                        Some((field, message)) => ConfigProblem {
+                            field: field.to_string(),
+                            message: message.to_string(),
+                        },
+                        None => ConfigProblem { field: "config".to_string(), message: e },
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Like `load`, but keeps "file not found" distinguishable from a real
+    /// read or parse failure (os error 2 and 3 both map to NotFound).
+    pub fn load_checked(path: &Path) -> Result<Self, LoadError> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(LoadError::Missing(format!(
+                    "Failed to read config at {}: {}",
+                    path.display(),
+                    e
+                )))
+            }
+            Err(e) => {
+                return Err(LoadError::Failed(format!(
+                    "Failed to read config at {}: {}",
+                    path.display(),
+                    e
+                )))
+            }
+        };
+        toml::from_str(&content).map_err(|e| {
+            LoadError::Failed(format!("Failed to parse config at {}: {}", path.display(), e))
+        })
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -636,7 +721,15 @@ impl Config {
             })?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content)?;
+        // Write beside the target and rename, so a crash or a concurrent reader
+        // never sees a half-written config.toml.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
         Ok(())
     }
 }

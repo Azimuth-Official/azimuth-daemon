@@ -142,6 +142,24 @@ impl ApiClient {
         Ok(data.node_id)
     }
 
+    /// The node's display (animal) name from `GET /api/nodes/mine`, if the
+    /// server provides one. Best effort: any failure is `None`.
+    pub async fn fetch_display_name(&self, node_id: &str) -> Option<String> {
+        let url = format!("{}/api/nodes/mine", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", self.bearer())
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        display_name_from_nodes(&v, node_id)
+    }
+
     pub async fn heartbeat(
         &self,
         node_id: &str,
@@ -218,6 +236,20 @@ impl ApiClient {
         debug!(accepted = data.accepted, "Observations submitted");
         Ok(SubmitOutcome { accepted: data.accepted, rejected: data.rejected })
     }
+}
+
+/// Find `node_id` in a nodes/mine payload (bare array or `{nodes:[...]}`) and
+/// return its `display_name`, falling back to `animal_name`.
+pub fn display_name_from_nodes(v: &serde_json::Value, node_id: &str) -> Option<String> {
+    let list = v.as_array().or_else(|| v.get("nodes").and_then(|n| n.as_array()))?;
+    let node = list
+        .iter()
+        .find(|n| n.get("id").and_then(|i| i.as_str()) == Some(node_id))?;
+    ["display_name", "animal_name"]
+        .iter()
+        .filter_map(|k| node.get(*k).and_then(|x| x.as_str()))
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Per-item rejections carried by an all-invalid 400 response body.

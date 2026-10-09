@@ -4,6 +4,7 @@ mod dashboard;
 mod gps;
 mod identity;
 mod logging;
+mod node_runtime;
 mod observation;
 mod regions;
 mod sdr;
@@ -22,17 +23,16 @@ use tracing::{error, info, warn};
 
 use api_client::ApiClient;
 use config::Config;
-use observation::{category_for_signal_type, Observation, SubmitObservationsRequest};
+use observation::{category_for_signal_type, Observation};
 use sdr::SdrManager;
 use sdr::scanner::Scanner;
+use node_runtime::{ApplyMsg, ConfigState, Registrar, SdrParams};
 use status_server::{AppState, RecentSignal, StatusState, run_status_server};
 
-/// Reused verbatim so the heartbeat loop can tell "I set this" from "startup
-/// validation set this" when deciding whether to clear `config_error` once a
-/// placeholder node id resolves to a real registration.
-const NODE_NOT_REGISTERED_MSG: &str = "Node not registered — heartbeats suppressed, this node will \
-     not appear on the dashboard. Set a valid api.key (from the azimuth.day dashboard) and restart, \
-     or wait for the background registration retry.";
+/// Logged (never surfaced as a config error) while a configured node still has
+/// a placeholder id: registration retries run in the background.
+const NODE_NOT_REGISTERED_MSG: &str = "Node not registered yet — heartbeats suppressed until \
+     registration succeeds; it is retried automatically in the background.";
 
 fn update_status_from_observations(state: &mut StatusState, observations: &[Observation]) {
     let count = observations.len() as u64;
@@ -124,16 +124,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Config load failure must NOT kill the daemon: under NSSM that means a
     // silent restart loop, under the desktop sidecar a dead app. Fall back to
-    // defaults and surface the error through /status instead.
-    let (mut config, config_load_error) = match Config::load(&cli.config) {
+    // defaults and surface the state through /status instead. A MISSING file is
+    // a first run (awaiting_setup), not an error.
+    let (mut config, load_error) = match Config::load_checked(&cli.config) {
         Ok(c) => {
             info!("Config loaded from {}", cli.config.display());
             (c, None)
         }
+        Err(e @ config::LoadError::Missing(_)) => {
+            info!(path = %cli.config.display(), "No config file yet — waiting for setup");
+            (Config::default(), Some(e))
+        }
         Err(e) => {
             error!(error = %e, path = %cli.config.display(),
                 "Config load failed — starting with defaults; run 'azimuth-daemon --setup'");
-            (Config::default(), Some(format!("Config load failed: {e}")))
+            (Config::default(), Some(e))
         }
     };
 
@@ -142,23 +147,75 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref region) = cli.region {
         config.region = Some(region.clone());
     }
-    config.apply_region();
+    let region_resolution = config.apply_region();
+
+    // Judge the config once now; POST /config/write re-judges on every save.
+    let verdict = match &load_error {
+        Some(e) => node_runtime::evaluate(Err(e), &config),
+        None => node_runtime::evaluate_config(&config),
+    };
+    if !matches!(load_error, Some(config::LoadError::Missing(_))) {
+        if let Err(errors) = config.validate() {
+            error!("Config validation failed ({} errors):", errors.len());
+            for e in &errors {
+                error!("  * {}", e);
+            }
+        }
+    }
+    if verdict.state == ConfigState::AwaitingSetup {
+        warn!("Node is not set up yet (API key and location) — run 'azimuth-daemon --setup' or use the desktop app");
+    }
+    let has_valid_api_key = !config.api.key.is_empty() && config.api.key != "YOUR_API_KEY_HERE";
 
     // Live API key, shared between ApiClient and the status server so
     // POST /config/write can hot-swap a corrected key without a restart.
     let api_key = Arc::new(std::sync::RwLock::new(config.api.key.clone()));
+    let client = Arc::new(ApiClient::new(&config.api.url, Arc::clone(&api_key)));
+    let fingerprint = identity::machine_fingerprint();
 
     // Status server state — create early so we can report config errors via HTTP
+    let status = Arc::new(RwLock::new(StatusState::new(
+        "pending".to_string(),
+        config.node.hardware_type.clone(),
+    )));
+    {
+        let mut st = status.write().await;
+        st.config_state = verdict.state;
+        st.config_error = verdict.cli_error.clone();
+        st.config_problems = verdict.problems.clone();
+        st.config_path_abs = std::path::absolute(&cli.config)
+            .unwrap_or_else(|_| cli.config.clone())
+            .display()
+            .to_string();
+        st.region_effective = Some(region_resolution.effective.clone());
+        st.region_source = region_resolution.source.to_string();
+        st.live_location = (
+            config.node.location.latitude,
+            config.node.location.longitude,
+            config.node.location.altitude_m,
+        );
+    }
+    let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel::<ApplyMsg>();
+    let (gps_cfg_tx, gps_cfg_rx) = tokio::sync::watch::channel(config.gps.clone().unwrap_or_default());
+    let stop_signal = Arc::new(tokio::sync::Notify::new());
+    let registrar = Arc::new(Registrar::new(
+        Arc::clone(&client),
+        Arc::clone(&status),
+        cli.config.clone(),
+        fingerprint.clone(),
+    ));
     let app_state = Arc::new(AppState {
-        status: Arc::new(RwLock::new(StatusState::new(
-            "pending".to_string(),
-            config.node.hardware_type.clone(),
-        ))),
+        status: Arc::clone(&status),
         scanning_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         scanner_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config_path: cli.config.clone(),
         api_key: Arc::clone(&api_key),
         log: Arc::clone(&log_handle),
+        apply_lock: tokio::sync::Mutex::new(()),
+        apply_tx,
+        gps_cfg_tx,
+        registrar: Arc::clone(&registrar),
+        stop_signal: Arc::clone(&stop_signal),
     });
 
     // Spawn status server early so sidecar can always query it
@@ -168,46 +225,16 @@ async fn main() -> anyhow::Result<()> {
         run_status_server(&status_bind, app_state_clone).await;
     });
 
-    // Collect config problems and surface them all via /status.
-    let mut config_errors: Vec<String> = Vec::new();
-    if let Some(e) = config_load_error {
-        config_errors.push(e);
-    }
-
-    // Config validation — log errors but don't exit hard
-    if let Err(errors) = config.validate() {
-        error!("Config validation failed ({} errors):", errors.len());
-        for e in &errors {
-            error!("  * {}", e);
-        }
-        config_errors.push(format!("Validation failed: {}", errors.join("; ")));
-    }
-
-    // Check API key separately — this is critical for operation
-    let has_valid_api_key = !config.api.key.is_empty() && config.api.key != "YOUR_API_KEY_HERE";
-    if !has_valid_api_key {
-        let msg = "api.key is not configured — run 'azimuth-daemon --setup' to configure";
-        error!("{}", msg);
-        config_errors.push(msg.to_string());
-    }
-
-    if !config_errors.is_empty() {
-        let mut state = app_state.status.write().await;
-        state.config_error = Some(config_errors.join(" | "));
-    }
-
-    let client = Arc::new(ApiClient::new(&config.api.url, Arc::clone(&api_key)));
-
     // Machine-scoped identity + fingerprinted registration keep reinstalls
     // from creating duplicate nodes. Registration goes first: the server
     // dedupes on (user, fingerprint), which is correctly account-scoped. The
     // local identity file is the offline fallback only — it is not bound to an
     // account, so it is trusted only when the API cannot be reached.
-    let fingerprint = identity::machine_fingerprint();
+    let setup_complete = verdict.state == ConfigState::Ok;
     if !config.node.id.is_empty() {
         // Config already has an id — make sure the identity file exists too.
         identity::save(&cli.config, &config.node.id);
-    } else if has_valid_api_key {
+    } else if setup_complete && has_valid_api_key {
         info!("No node_id — attempting registration via API");
         // A persisted identity is offered to the server as a reclaim hint. The
         // server honours it only when that node belongs to the authenticated
@@ -238,14 +265,9 @@ async fn main() -> anyhow::Result<()> {
                 info!(node_id = %config.node.id, "Node registered");
             }
             Err(e) => {
-                // Distinct, actionable signal for "the key itself was rejected"
-                // vs. "registration failed for some other reason" (network
-                // blip, backend down, etc.) — a typo'd/invalid key needs the
-                // user to fix the key, not wait for a retry that can never
-                // succeed. Reuses the same auth_error field/message the
-                // heartbeat loop already sets on a 401, so the desktop
-                // Dashboard's existing "API key invalid — Open Settings" UI
-                // covers this case too, immediately at startup.
+                // A rejected key is surfaced through the same auth_error the
+                // heartbeat loop uses, so the desktop's "API key invalid" UI
+                // covers it immediately at startup.
                 if api_client::is_unauthorized(&e) {
                     error!(error = %e, "Node registration rejected (401) — API key is invalid");
                     let mut state = app_state.status.write().await;
@@ -268,82 +290,39 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        // No API key yet (fresh install before setup) — placeholder keeps the
-        // daemon alive and visible; heartbeats are suppressed for placeholders.
+        // Not set up yet — the placeholder keeps the daemon alive and visible;
+        // heartbeats are suppressed for placeholders and registration starts
+        // as soon as POST /config/write delivers a complete config.
         config.node.id = format!("placeholder-{}", uuid::Uuid::new_v4());
     }
 
     let node_id = config.node.id.clone();
 
-    // Update node_id in app_state
+    // Publish the node id and registration state to the live status.
     {
         let mut state = app_state.status.write().await;
         state.node_id = node_id.clone();
+        state.registration_state = if !node_runtime::is_placeholder(&node_id) {
+            "registered".to_string()
+        } else {
+            "unregistered".to_string()
+        };
     }
 
-    // Background registration retry — a placeholder id means the first
-    // registration attempt failed (offline install, API blip). Retry until it
-    // succeeds so the node eventually joins without a manual restart.
-    if node_id.starts_with("placeholder-") && has_valid_api_key {
-        let retry_client = Arc::clone(&client);
-        let retry_config_path = cli.config.clone();
-        let retry_node = config.node.clone();
-        let retry_fingerprint = fingerprint.clone();
-        let app_state_retry = Arc::clone(&app_state);
+    // Placeholder id + complete setup means the first attempt failed (offline
+    // install, API blip): keep trying in the background so the node joins
+    // without a manual restart. Unauthorized keys stop the chain.
+    if node_runtime::is_placeholder(&node_id) && setup_complete && has_valid_api_key {
+        registrar.kick(config.node.clone());
+    }
+    if !node_runtime::is_placeholder(&node_id) {
+        let client_dn = Arc::clone(&client);
+        let state_dn = Arc::clone(&app_state.status);
+        let id_dn = node_id.clone();
         tokio::spawn(async move {
-            const RETRY_INTERVAL_SECS: u64 = 300;
-            const MAX_RETRIES: u32 = 288; // ~24h
-            for attempt in 1..=MAX_RETRIES {
-                tokio::time::sleep(Duration::from_secs(RETRY_INTERVAL_SECS)).await;
-                info!(attempt, "Retrying node registration");
-                match retry_client
-                    .register_node(
-                        &retry_node.hardware_type,
-                        &retry_node.label,
-                        retry_node.location.latitude,
-                        retry_node.location.longitude,
-                        retry_node.location.altitude_m,
-                        Some(&retry_fingerprint),
-                        // Re-read each attempt: an identity file may have been
-                        // restored while the retry loop was running.
-                        identity::load(&retry_config_path)
-                            .map(|i| i.node_id)
-                            .as_deref(),
-                    )
-                    .await
-                {
-                    Ok(real_id) => {
-                        info!(node_id = %real_id, "Deferred registration succeeded");
-                        if let Ok(mut cfg) = Config::load(&retry_config_path) {
-                            cfg.node.id = real_id.clone();
-                            if let Err(e) = cfg.save(&retry_config_path) {
-                                warn!(error = %e, "Failed to save node_id after deferred registration");
-                            }
-                        }
-                        identity::save(&retry_config_path, &real_id);
-                        let mut state = app_state_retry.status.write().await;
-                        state.node_id = real_id;
-                        return;
-                    }
-                    Err(e) => {
-                        if api_client::is_unauthorized(&e) {
-                            // A 401 here means the key is bad, not that the
-                            // network is flaky — retrying every 5 minutes for
-                            // 24h can never fix this. Surface it distinctly
-                            // (same field/message the heartbeat loop uses) so
-                            // it doesn't masquerade as "still trying".
-                            error!(error = %e, attempt, "Deferred registration rejected (401) — API key is invalid, retries will not help");
-                            let mut state = app_state_retry.status.write().await;
-                            if state.auth_error.is_none() {
-                                state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
-                            }
-                        } else {
-                            warn!(error = %e, attempt, "Deferred registration failed; will retry");
-                        }
-                    }
-                }
+            if let Some(name) = client_dn.fetch_display_name(&id_dn).await {
+                state_dn.write().await.node_display_name = Some(name);
             }
-            error!("Deferred registration exhausted after 24h; restart the daemon to retry");
         });
     }
 
@@ -410,16 +389,10 @@ async fn main() -> anyhow::Result<()> {
                 if placeholder_tick_count == 1
                     || placeholder_tick_count % placeholder_warn_every_ticks == 0
                 {
-                    warn!(node_id = %current_node_id, "{}", NODE_NOT_REGISTERED_MSG);
-                    let mut state = app_state_hb.status.write().await;
-                    // Don't set the generic "not registered" config_error when
-                    // a more specific auth_error (401 — key rejected) is
-                    // already present: the frontend (useDaemonStatus.js)
-                    // checks config_error BEFORE auth_error, so setting both
-                    // would silently mask the more actionable "API key
-                    // invalid" message behind a vaguer "setup needed" one.
-                    if state.config_error.is_none() && state.auth_error.is_none() {
-                        state.config_error = Some(NODE_NOT_REGISTERED_MSG.to_string());
+                    let configured = app_state_hb.status.read().await.config_state
+                        == ConfigState::Ok;
+                    if configured {
+                        warn!(node_id = %current_node_id, "{}", NODE_NOT_REGISTERED_MSG);
                     }
                 }
                 tracing::debug!("Skipping heartbeat — node not yet registered");
@@ -443,14 +416,6 @@ async fn main() -> anyhow::Result<()> {
                     if state.auth_error.is_some() {
                         info!("Heartbeat succeeded — clearing auth error");
                         state.auth_error = None;
-                    }
-                    // Only clear config_error if it's the placeholder-reminder
-                    // message we set ourselves — a config_error from startup
-                    // validation (missing key, unset location, etc.) means the
-                    // config still needs attention even if a heartbeat somehow
-                    // got through.
-                    if state.config_error.as_deref() == Some(NODE_NOT_REGISTERED_MSG) {
-                        state.config_error = None;
                     }
                 }
                 Err(e) => {
@@ -505,15 +470,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn NTRIP client task
     let app_state_ntrip = Arc::clone(&app_state);
-    let node_lat = config.node.location.latitude;
-    let node_lon = config.node.location.longitude;
-    let node_alt = config.node.location.altitude_m;
     let rtcm_tx_ntrip = rtcm_tx.clone();
     tokio::spawn(async move {
         loop {
-            let enabled = {
+            let (enabled, (node_lat, node_lon, node_alt)) = {
                 let s = app_state_ntrip.status.read().await;
-                s.rtk_enabled && s.rtk_config.is_some()
+                (s.rtk_enabled && s.rtk_config.is_some(), s.live_location)
             };
             if enabled {
                 if let Err(e) = ntrip::run_ntrip_client(
@@ -536,10 +498,23 @@ async fn main() -> anyhow::Result<()> {
     // a [scanning] config exists AND its `enabled` flag is true (the default —
     // including when [scanning] is absent entirely); `enabled = false` is the
     // only way to opt back into the legacy single-frequency loop.
+    let mut sdr_params = SdrParams::from_config(&config);
     if let Some(scanning_config) = config.scanning.as_ref().filter(|s| s.enabled) {
         // Scanner mode — multi-frequency, multi-signal-type
         let mut scanner = Scanner::new(scanning_config, config.sdr.dbm_offset);
         let scan_interval = Duration::from_secs(scanner.interval_seconds() as u64);
+
+        // Nothing is scanned, discovered or submitted until the node is set up:
+        // pre-setup defaults (location 0,0, no key) would only produce
+        // observations nobody can accept. A config write releases the wait.
+        wait_until_configured(
+            &app_state,
+            &mut apply_rx,
+            &mut scanner,
+            &mut sdr_manager,
+            &mut sdr_params,
+        )
+        .await;
 
         // Auto-discovery sweep on first run if mode is "sweep" or "both".
         // Marked scanner_active so the UI doesn't read "idle" through the
@@ -572,9 +547,24 @@ async fn main() -> anyhow::Result<()> {
         // observations while heartbeats keep the node looking healthy.
         let mut cycles_without_sdr: u64 = 0;
         loop {
-            tokio::time::sleep(scan_interval).await;
+            // Wake early when a config write arrives instead of sleeping out
+            // the whole interval.
+            tokio::select! {
+                _ = tokio::time::sleep(scan_interval) => {}
+                msg = apply_rx.recv() => {
+                    if let Some(msg) = msg {
+                        apply_config_msg(&app_state, &mut scanner, &mut sdr_manager, &mut sdr_params, msg).await;
+                    }
+                }
+            }
+            while let Ok(msg) = apply_rx.try_recv() {
+                apply_config_msg(&app_state, &mut scanner, &mut sdr_manager, &mut sdr_params, msg).await;
+            }
 
             if !scanning_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if app_state.status.read().await.config_state != ConfigState::Ok {
                 continue;
             }
 
@@ -586,9 +576,9 @@ async fn main() -> anyhow::Result<()> {
                         "No SDR devices open — attempting re-detection"
                     );
                     sdr_manager = SdrManager::new(
-                        config.sdr.device_index,
-                        config.sdr.sample_rate,
-                        config.sdr.gain,
+                        sdr_params.device_index,
+                        sdr_params.sample_rate,
+                        sdr_params.gain,
                     );
                     let mut state = app_state.status.write().await;
                     state.sdr_connected = sdr_manager.is_connected();
@@ -644,44 +634,9 @@ async fn main() -> anyhow::Result<()> {
                 update_status_from_observations(&mut state, &observations);
             }
 
-            if observations.is_empty() {
-                continue;
-            }
-
-            // Auth error active: don't burn requests on a rejected key. The
-            // heartbeat loop probes for recovery and clears the flag.
-            if app_state.status.read().await.auth_error.is_some() {
-                tracing::debug!("Skipping observation submit — API key rejected (401)");
-                continue;
-            }
-
-            let count = observations.len();
-            let request = SubmitObservationsRequest {
-                node_id: node_id.clone(),
-                observations,
-            };
-
-            match client.submit_observations(&request).await {
-                Ok(accepted) => {
-                    let mut state = app_state.status.write().await;
-                    state.observations_submitted += accepted as u64;
-                    info!(submitted = count, accepted, total = state.observations_submitted, "Batch submitted");
-                    if state.auth_error.is_some() {
-                        state.auth_error = None;
-                    }
-                }
-                Err(e) => {
-                    if api_client::is_unauthorized(&e) {
-                        let mut state = app_state.status.write().await;
-                        if state.auth_error.is_none() {
-                            error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
-                            state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
-                        }
-                    } else {
-                        warn!(error = %e, "Observation submit failed — will retry next interval");
-                    }
-                }
-            }
+            // Submits under the LIVE node id (registration may finish after
+            // this loop started).
+            node_runtime::submit_batch(&app_state.status, &client, observations).await;
         }
     } else {
         // Legacy mode — single frequency, power measurement only (Stage A behavior)
@@ -690,6 +645,12 @@ async fn main() -> anyhow::Result<()> {
 
         loop {
             tokio::time::sleep(submit_interval).await;
+            // Config writes carry nothing the legacy loop can adopt live.
+            while apply_rx.try_recv().is_ok() {}
+
+            if app_state.status.read().await.config_state != ConfigState::Ok {
+                continue;
+            }
 
             let observations = tokio::task::block_in_place(|| {
                 let device = match sdr_manager.device_mut(0) {
@@ -739,43 +700,64 @@ async fn main() -> anyhow::Result<()> {
                 update_status_from_observations(&mut state, &observations);
             }
 
-            if observations.is_empty() {
-                continue;
-            }
+            node_runtime::submit_batch(&app_state.status, &client, observations).await;
+        }
+    }
+}
 
-            // Auth error active: don't burn requests on a rejected key. The
-            // heartbeat loop probes for recovery and clears the flag.
-            if app_state.status.read().await.auth_error.is_some() {
-                tracing::debug!("Skipping observation submit — API key rejected (401)");
-                continue;
-            }
-
-            let request = SubmitObservationsRequest {
-                node_id: node_id.clone(),
-                observations,
-            };
-
-            match client.submit_observations(&request).await {
-                Ok(accepted) => {
-                    let mut state = app_state.status.write().await;
-                    state.observations_submitted += accepted as u64;
-                    info!(accepted, total = state.observations_submitted, "Batch submitted");
-                    if state.auth_error.is_some() {
-                        state.auth_error = None;
-                    }
-                }
-                Err(e) => {
-                    if api_client::is_unauthorized(&e) {
-                        let mut state = app_state.status.write().await;
-                        if state.auth_error.is_none() {
-                            error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
-                            state.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
-                        }
-                    } else {
-                        warn!(error = %e, "Observation submit failed — will retry next interval");
-                    }
+/// Block the observation loop until a complete config is in place, adopting
+/// any config writes that arrive meanwhile.
+async fn wait_until_configured(
+    app_state: &Arc<AppState>,
+    apply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApplyMsg>,
+    scanner: &mut Scanner,
+    sdr_manager: &mut SdrManager,
+    sdr_params: &mut SdrParams,
+) {
+    let mut logged = false;
+    loop {
+        while let Ok(msg) = apply_rx.try_recv() {
+            apply_config_msg(app_state, scanner, sdr_manager, sdr_params, msg).await;
+        }
+        if app_state.status.read().await.config_state == ConfigState::Ok {
+            return;
+        }
+        if !logged {
+            info!("Waiting for setup — scanning starts once the configuration is saved");
+            logged = true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            msg = apply_rx.recv() => {
+                if let Some(msg) = msg {
+                    apply_config_msg(app_state, scanner, sdr_manager, sdr_params, msg).await;
                 }
             }
         }
     }
+}
+
+/// Adopt an applied config in the observation loop: the new scan plan and, if
+/// the SDR settings changed, a freshly opened device.
+async fn apply_config_msg(
+    app_state: &Arc<AppState>,
+    scanner: &mut Scanner,
+    sdr_manager: &mut SdrManager,
+    sdr_params: &mut SdrParams,
+    msg: ApplyMsg,
+) {
+    if let Some(plan) = msg.scanning.as_ref() {
+        node_runtime::apply_plan(scanner, plan, msg.sdr.dbm_offset, sdr_params.dbm_offset);
+    }
+    if msg.sdr.device_index != sdr_params.device_index
+        || msg.sdr.sample_rate != sdr_params.sample_rate
+        || msg.sdr.gain != sdr_params.gain
+    {
+        info!("SDR settings changed — reopening the device");
+        *sdr_manager = SdrManager::new(msg.sdr.device_index, msg.sdr.sample_rate, msg.sdr.gain);
+        let mut state = app_state.status.write().await;
+        state.sdr_connected = sdr_manager.is_connected();
+        state.device_count = sdr_manager.device_count();
+    }
+    *sdr_params = msg.sdr;
 }

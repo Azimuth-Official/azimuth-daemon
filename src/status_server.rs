@@ -15,7 +15,8 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::config::{Config, NtripConfig};
+use crate::config::{Config, ConfigProblem, NtripConfig};
+use crate::node_runtime::{self, ApplyMsg, ConfigState, Registrar, SdrParams};
 use crate::rtk::{self, PersistedRtkConfig};
 use crate::sdr::SdrManager;
 use crate::gps::AccuracyPoint;
@@ -78,6 +79,20 @@ pub struct StatusInfo {
     /// heartbeat succeeds or a new key arrives via POST /config/write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_error: Option<String>,
+    // --- additive (C3) ---
+    /// "awaiting_setup" | "ok" | "invalid". `config_error` is non-null only for "invalid".
+    pub config_state: ConfigState,
+    pub config_problems: Vec<ConfigProblem>,
+    pub daemon_pid: u32,
+    pub daemon_version: String,
+    pub config_path: String,
+    pub started_at: String,
+    pub node_display_name: Option<String>,
+    pub registration_state: String,
+    pub region_effective: Option<String>,
+    pub region_source: String,
+    pub on_air: bool,
+    pub on_air_reason: Option<String>,
 }
 
 pub struct StatusState {
@@ -116,7 +131,22 @@ pub struct StatusState {
     pub gps_accuracy_history: VecDeque<AccuracyPoint>,
     pub config_error: Option<String>,
     pub auth_error: Option<String>,
+    pub config_state: ConfigState,
+    pub config_problems: Vec<ConfigProblem>,
+    pub config_path_abs: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub node_display_name: Option<String>,
+    pub registration_state: String,
+    pub region_effective: Option<String>,
+    pub region_source: String,
+    pub last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Location the node currently runs with (updated by POST /config/write).
+    pub live_location: (f64, f64, f64),
 }
+
+/// A node is "on air" when it is registered, has an open SDR and the server
+/// accepted an observation from it recently.
+pub const ON_AIR_WINDOW_SECS: i64 = 600;
 
 /// Minimum spacing between two signals of the same type for both to count as
 /// distinct frequencies, mirroring the server's `sdr_min_spacing_*_hz` config.
@@ -209,7 +239,36 @@ impl StatusState {
             gps_accuracy_history: VecDeque::new(),
             config_error: None,
             auth_error: None,
+            config_state: ConfigState::AwaitingSetup,
+            config_problems: Vec::new(),
+            config_path_abs: String::new(),
+            started_at: chrono::Utc::now(),
+            node_display_name: None,
+            registration_state: "unregistered".to_string(),
+            region_effective: None,
+            region_source: "default".to_string(),
+            last_accepted_at: None,
+            live_location: (0.0, 0.0, 0.0),
         }
+    }
+
+    /// (on_air, reason). Reason codes are checked in priority order.
+    fn on_air(&self) -> (bool, Option<String>) {
+        let reason = if self.config_state != ConfigState::Ok {
+            Some("config")
+        } else if self.registration_state != "registered" {
+            Some("not_registered")
+        } else if !self.sdr_connected {
+            Some("no_sdr")
+        } else if !self
+            .last_accepted_at
+            .is_some_and(|t| (chrono::Utc::now() - t).num_seconds() < ON_AIR_WINDOW_SECS)
+        {
+            Some("no_accepted_observations")
+        } else {
+            None
+        };
+        (reason.is_none(), reason.map(str::to_string))
     }
 
     fn to_info(&self,
@@ -244,6 +303,18 @@ impl StatusState {
             gps_hdop: self.gps_hdop,
             config_error: self.config_error.clone(),
             auth_error: self.auth_error.clone(),
+            config_state: self.config_state,
+            config_problems: self.config_problems.clone(),
+            daemon_pid: std::process::id(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_path: self.config_path_abs.clone(),
+            started_at: self.started_at.to_rfc3339(),
+            node_display_name: self.node_display_name.clone(),
+            registration_state: self.registration_state.clone(),
+            region_effective: self.region_effective.clone(),
+            region_source: self.region_source.clone(),
+            on_air: self.on_air().0,
+            on_air_reason: self.on_air().1,
         }
     }
 }
@@ -260,6 +331,16 @@ pub struct AppState {
     /// Runtime log-level control, so the desktop Debug mode toggle takes effect
     /// without restarting the sidecar.
     pub log: Arc<crate::logging::LogHandle>,
+    /// Serialises concurrent POST /config/write applications.
+    pub apply_lock: tokio::sync::Mutex<()>,
+    /// Hands an applied config to the observation loop (scan plan, SDR params).
+    pub apply_tx: tokio::sync::mpsc::UnboundedSender<ApplyMsg>,
+    /// Hands GPS settings to the GPS task.
+    pub gps_cfg_tx: tokio::sync::watch::Sender<crate::config::GpsConfig>,
+    /// Deferred node registration, kicked by a config write.
+    pub registrar: Arc<Registrar>,
+    /// Notified when an authorised local caller asks the daemon to stop.
+    pub stop_signal: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,11 +427,46 @@ async fn sdr_test_handler(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct ConfigWriteResponse {
+    config_state: ConfigState,
+    config_problems: Vec<ConfigProblem>,
+    registration_state: String,
+    node_id: String,
+    restart_required: bool,
+}
+
+fn config_rejection(
+    state: ConfigState,
+    problems: Vec<ConfigProblem>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "config_state": state,
+            "config_problems": problems,
+            "error": "configuration not saved",
+        })),
+    )
+}
+
+/// POST /config/write: validate, persist atomically, then apply to the running
+/// daemon (API key, location, region/scan plan, GPS) and start registration.
 async fn config_write_handler(
     State(state): State<Arc<AppState>>,
-    Json(mut config): Json<Config>,
+    Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let config_path = state.config_path.clone();
+    let apply = body.get("apply").and_then(|v| v.as_bool()).unwrap_or(true);
+    let mut config: Config = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => {
+            return config_rejection(
+                ConfigState::Invalid,
+                vec![ConfigProblem { field: "body".to_string(), message: e.to_string() }],
+            )
+        }
+    };
 
     // Identity preservation chokepoint: the setup wizard (and any other
     // writer) sends node.id = "" — re-running setup must NOT discard an
@@ -362,7 +478,7 @@ async fn config_write_handler(
         let existing_id = Config::load(&config_path)
             .ok()
             .map(|c| c.node.id)
-            .filter(|id| !id.is_empty() && !id.starts_with("placeholder-"));
+            .filter(|id| !node_runtime::is_placeholder(id));
         let adopted = existing_id.or_else(|| {
             crate::identity::load(&config_path).map(|i| i.node_id)
         });
@@ -372,32 +488,99 @@ async fn config_write_handler(
         }
     }
 
-    let config_path_for_save = config_path.clone();
-    let new_api_key = config.api.key.clone();
-    let result = tokio::task::block_in_place(move || config.save(&config_path_for_save));
-    match result {
-        Ok(()) => {
-            info!(path = %config_path.display(), "Config written from HTTP request");
-            // Hot-swap the live API key and clear any auth error so the next
-            // heartbeat retries immediately with the new key — no restart.
-            if let Ok(mut key) = state.api_key.write() {
-                *key = new_api_key;
-            }
-            state.status.write().await.auth_error = None;
-            Ok((StatusCode::OK, Json(MessageResponse {
-                message: "Config written".to_string(),
-            })))
-        }
-        Err(e) => {
-            warn!(path = %config_path.display(), error = %e, "Failed to write config");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(MessageResponse {
-                    message: format!("Failed to write config: {}", e),
-                }),
-            ))
-        }
+    // Validate BEFORE touching disk: an unusable config is never saved.
+    let verdict = node_runtime::evaluate_config(&config);
+    if verdict.state != ConfigState::Ok {
+        return config_rejection(verdict.state, config.problems());
     }
+    let region = config.apply_region();
+
+    let path_for_save = config_path.clone();
+    let node_for_kick = config.node.clone();
+    let scanning = config.scanning.clone();
+    let sdr_params = SdrParams::from_config(&config);
+    let gps_cfg = config.gps.clone().unwrap_or_default();
+    let new_api_key = config.api.key.clone();
+    let hint_id = config.node.id.clone();
+    let location = (
+        config.node.location.latitude,
+        config.node.location.longitude,
+        config.node.location.altitude_m,
+    );
+    let saved = tokio::task::block_in_place(move || config.save(&path_for_save));
+    if let Err(e) = saved {
+        warn!(path = %config_path.display(), error = %e, "Failed to write config");
+        return config_rejection(
+            ConfigState::Invalid,
+            vec![ConfigProblem {
+                field: "config_file".to_string(),
+                message: format!("Could not write {}: {}", config_path.display(), e),
+            }],
+        );
+    }
+    info!(path = %config_path.display(), "Config written from HTTP request");
+
+    if !apply {
+        let s = state.status.read().await;
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!(ConfigWriteResponse {
+                config_state: s.config_state,
+                config_problems: s.config_problems.clone(),
+                registration_state: s.registration_state.clone(),
+                node_id: s.node_id.clone(),
+                restart_required: true,
+            })),
+        );
+    }
+
+    let _guard = state.apply_lock.lock().await;
+    if let Ok(mut key) = state.api_key.write() {
+        *key = new_api_key;
+    }
+    let (registration_state, node_id, needs_registration) = {
+        let mut s = state.status.write().await;
+        s.config_state = ConfigState::Ok;
+        s.config_error = None;
+        s.config_problems = Vec::new();
+        s.auth_error = None;
+        s.region_effective = Some(region.effective.clone());
+        s.region_source = region.source.to_string();
+        s.live_location = location;
+        // The saved id is only a reclaim HINT: the registrar offers it to the
+        // server, which honours it only for this account's nodes.
+        let needs = node_runtime::is_placeholder(&s.node_id);
+        if needs {
+            s.registration_state = "registering".to_string();
+        }
+        (
+            s.registration_state.clone(),
+            s.node_id.clone(),
+            node_runtime::is_placeholder(&s.node_id),
+        )
+    };
+    info!(region = %region.effective, source = region.source, "Configuration applied");
+    let _ = state.apply_tx.send(ApplyMsg { scanning, sdr: sdr_params });
+    state.gps_cfg_tx.send_replace(gps_cfg);
+    if needs_registration {
+        // Make the reclaim hint available to the registrar even if the
+        // identity file was never written (id came from config.toml).
+        if !node_runtime::is_placeholder(&hint_id) && crate::identity::load(&config_path).is_none() {
+            crate::identity::save(&config_path, &hint_id);
+        }
+        state.registrar.kick(node_for_kick);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(ConfigWriteResponse {
+            config_state: ConfigState::Ok,
+            config_problems: Vec::new(),
+            registration_state,
+            node_id,
+            restart_required: false,
+        })),
+    )
 }
 
 async fn scanner_start_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1093,5 +1276,180 @@ mod tests {
             let far = [signal(t, 600_000_000), signal(t, 606_000_000)];
             assert_eq!(estimate_sdr_multiplier(&far, 4), 2.0, "{t} 6 MHz apart counts twice");
         }
+    }
+
+    // --- R1: hot-apply of a saved config -------------------------------------
+
+    /// Recorded requests of the mock Azimuth API.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    async fn spawn_mock_api() -> (String, Seen) {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri, body: axum::body::Bytes| {
+            let rec = Arc::clone(&rec);
+            async move {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let path = uri.path().to_string();
+                rec.lock().unwrap().push((path.clone(), v));
+                if path == "/api/nodes/register" {
+                    axum::Json(serde_json::json!({"node_id": "real-node-1"}))
+                } else if path == "/api/nodes/mine" {
+                    axum::Json(serde_json::json!([{"id":"real-node-1","display_name":"Brave Otter"}]))
+                } else {
+                    axum::Json(serde_json::json!({"accepted": 1, "rejected": []}))
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    struct Harness {
+        state: Arc<AppState>,
+        apply_rx: tokio::sync::mpsc::UnboundedReceiver<ApplyMsg>,
+        dir: PathBuf,
+        seen: Seen,
+        client: Arc<crate::api_client::ApiClient>,
+    }
+
+    async fn harness(tag: &str) -> Harness {
+        let (base, seen) = spawn_mock_api().await;
+        let dir = std::env::temp_dir().join(format!("az-r1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_path = dir.join("config.toml");
+        let key = Arc::new(std::sync::RwLock::new(String::new()));
+        let client = Arc::new(crate::api_client::ApiClient::new(&base, Arc::clone(&key)));
+        let status = Arc::new(RwLock::new(StatusState::new(
+            "placeholder-test".to_string(),
+            "tier1_rtlsdr".to_string(),
+        )));
+        let registrar = Arc::new(
+            Registrar::new(Arc::clone(&client), Arc::clone(&status), config_path.clone(), "fp".to_string())
+                .with_schedule(vec![std::time::Duration::ZERO], 3),
+        );
+        let (apply_tx, apply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (gps_cfg_tx, _gps_rx) = tokio::sync::watch::channel(crate::config::GpsConfig::default());
+        let state = Arc::new(AppState {
+            status,
+            scanning_enabled: Arc::new(AtomicBool::new(true)),
+            scanner_active: Arc::new(AtomicBool::new(false)),
+            config_path,
+            api_key: key,
+            log: crate::logging::LogHandle::for_tests(dir.join("logs")),
+            apply_lock: tokio::sync::Mutex::new(()),
+            apply_tx,
+            gps_cfg_tx,
+            registrar,
+            stop_signal: Arc::new(tokio::sync::Notify::new()),
+        });
+        Harness { state, apply_rx, dir, seen, client }
+    }
+
+    fn wizard_body(lat: f64, lon: f64, key: &str) -> serde_json::Value {
+        let mut c = Config::default();
+        c.api.key = key.to_string();
+        c.node.label = "Test".to_string();
+        c.node.location.latitude = lat;
+        c.node.location.longitude = lon;
+        serde_json::to_value(&c).unwrap()
+    }
+
+    async fn post_config(h: &Harness, body: serde_json::Value) -> StatusCode {
+        config_write_handler(State(Arc::clone(&h.state)), Json(body))
+            .await
+            .into_response()
+            .status()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_write_replaces_a_stale_config_error() {
+        let h = harness("clear").await;
+        {
+            let mut s = h.state.status.write().await;
+            s.config_state = ConfigState::Invalid;
+            s.config_error = Some("Config load failed: stale".to_string());
+        }
+        let code = post_config(&h, wizard_body(39.8283, -98.5795, "k1")).await;
+        assert_eq!(code, StatusCode::OK);
+        let s = h.state.status.read().await;
+        assert_eq!(s.config_error, None, "stale startup error must be replaced");
+        assert_eq!(s.config_state, ConfigState::Ok);
+        assert_eq!(s.live_location.0, 39.8283);
+        assert_eq!(h.state.api_key.read().unwrap().as_str(), "k1");
+        let saved = Config::load(&h.state.config_path).unwrap();
+        assert_eq!(saved.node.location.latitude, 39.8283);
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_write_with_zero_location_is_rejected_and_not_saved() {
+        let h = harness("zero").await;
+        let code = post_config(&h, wizard_body(0.0, 0.0, "k1")).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!h.state.config_path.exists(), "an unusable config must not be written");
+        assert_ne!(h.state.status.read().await.config_state, ConfigState::Ok);
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn config_write_registers_the_node_without_a_restart() {
+        let mut h = harness("reg").await;
+        assert_eq!(post_config(&h, wizard_body(48.8566, 2.3522, "k1")).await, StatusCode::OK);
+        // The scan plan was handed to the observation loop.
+        assert!(h.apply_rx.try_recv().is_ok());
+        let mut registered = false;
+        for _ in 0..100 {
+            if h.state.status.read().await.registration_state == "registered" {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(registered, "registration must complete after the write");
+        let s = h.state.status.read().await;
+        assert_eq!(s.node_id, "real-node-1");
+        assert!(!node_runtime::is_placeholder(&s.node_id));
+        assert_eq!(s.node_display_name.as_deref(), Some("Brave Otter"));
+        let saved = Config::load(&h.state.config_path).unwrap();
+        assert_eq!(saved.node.id, "real-node-1", "the issued id is persisted");
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submissions_use_the_live_node_id_after_deferred_registration() {
+        let h = harness("x2").await;
+        let obs = || {
+            vec![crate::observation::Observation {
+                signal_type: "fm_rds".to_string(),
+                observed_at: chrono::Utc::now(),
+                frequency_hz: Some(98_500_000),
+                timestamp_ns: None,
+                tdoa_offset_ns: None,
+                signal_strength_dbm: None,
+                snr_db: None,
+                source_id: None,
+                raw_data: None,
+            }]
+        };
+        h.state.status.write().await.config_state = ConfigState::Ok;
+        // Placeholder: nothing is sent.
+        node_runtime::submit_batch(&h.state.status, &h.client, obs()).await;
+        assert!(h.seen.lock().unwrap().iter().all(|(p, _)| p != "/api/observations"));
+        // Deferred registration completes; the next batch carries the real id.
+        h.state.registrar.finish_registration("real-node-1").await;
+        node_runtime::submit_batch(&h.state.status, &h.client, obs()).await;
+        let seen = h.seen.lock().unwrap();
+        let sent: Vec<_> = seen.iter().filter(|(p, _)| p == "/api/observations").collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1["node_id"], "real-node-1");
+        drop(seen);
+        assert!(h.state.status.read().await.last_accepted_at.is_some());
+        let _ = std::fs::remove_dir_all(&h.dir);
     }
 }
