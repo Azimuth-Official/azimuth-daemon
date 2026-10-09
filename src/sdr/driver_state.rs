@@ -3,6 +3,8 @@
 //!
 //! Everything here is plain logic with no OS calls, so it is unit-tested on
 //! every platform. The Windows enumeration lives in `driver_install`.
+// Parts are only reached from the Windows build; they are tested everywhere.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use serde::Serialize;
 

@@ -1820,11 +1820,12 @@ mod tests {
         // Deferred registration completes; the next batch carries the real id.
         h.state.registrar.finish_registration("real-node-1").await;
         node_runtime::submit_batch(&h.state.status, &h.client, obs()).await;
-        let seen = h.seen.lock().unwrap();
-        let sent: Vec<_> = seen.iter().filter(|(p, _)| p == "/api/observations").collect();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1["node_id"], "real-node-1");
-        drop(seen);
+        {
+            let seen = h.seen.lock().unwrap();
+            let sent: Vec<_> = seen.iter().filter(|(p, _)| p == "/api/observations").collect();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].1["node_id"], "real-node-1");
+        }
         assert!(h.state.status.read().await.last_accepted_at.is_some());
         let _ = std::fs::remove_dir_all(&h.dir);
     }

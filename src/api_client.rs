@@ -201,6 +201,9 @@ impl ApiClient {
         }
     }
 
+    // The daemon binary submits through `submit_observations_detailed`; this
+    // wrapper remains for the Android library build (android_bridge).
+    #[allow(dead_code)]
     pub async fn submit_observations(
         &self,
         request: &SubmitObservationsRequest,

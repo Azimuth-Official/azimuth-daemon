@@ -311,84 +311,12 @@ pub fn rank_candidates(
     out
 }
 
-/// Thin I/O wrapper around `rank_candidates`.
-fn detect_gps_candidates(policy: &GpsProbePolicy, cache: &mut ProbeCache) -> Vec<GpsCandidate> {
-    let ports = list_serial_ports();
-    cache.retain_present(&ports);
-    rank_candidates(&ports, policy, cache, Instant::now())
-}
-
 /// Check if a line looks like valid NMEA
 fn nmea_line_valid(line: &str) -> bool {
     let trimmed = line.trim();
     // NMEA sentences start with $ and contain alphanumeric talker/formatter
     // Examples: $GNGGA..., $GPGGA..., $GLGGA...
     trimmed.starts_with('$') && trimmed.len() > 6 && trimmed.chars().skip(1).take(5).all(|c| c.is_ascii_alphanumeric())
-}
-
-/// Try to open a serial port at various baud rates with NMEA validation
-/// Returns a buffered serial stream and the detected baud rate if validation succeeds
-async fn try_open_serial(
-    port: &str,
-    bauds: &[u32],
-) -> Option<(BufReader<tokio_serial::SerialStream>, u32)> {
-    for &baud in bauds {
-        match tokio_serial::new(port, baud).open_native_async() {
-            Ok(stream) => {
-                debug!(port = %port, baud, "Serial port opened, validating NMEA");
-
-                let mut buf_reader = BufReader::new(stream);
-                let mut validation_attempts = 0;
-                let max_validation_attempts = 2;
-
-                while validation_attempts < max_validation_attempts {
-                    validation_attempts += 1;
-                    let mut line = String::new();
-
-                    let read_result = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(2),
-                        buf_reader.read_line(&mut line)
-                    ).await;
-
-                    match read_result {
-                        Ok(Ok(0)) => {
-                            // EOF — port is open but not producing data
-                            debug!(port = %port, baud, "Serial port reached EOF");
-                            break;
-                        }
-                        Ok(Ok(_)) => {
-                            if nmea_line_valid(&line) {
-                                info!(port = %port, baud, "NMEA validated on serial port");
-                                return Some((buf_reader, baud));
-                            }
-                        }
-                        Ok(Err(_)) => {
-                            debug!(port = %port, baud, "Serial read error during validation");
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout — no data received
-                            debug!(port = %port, baud, attempt = validation_attempts, "NMEA validation timeout");
-                        }
-                    }
-                }
-
-                debug!(port = %port, baud, "NMEA validation failed on this baud rate");
-                // Drop this stream and try next baud
-            }
-            Err(e) => {
-                if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
-                    warn_permission_denied(port);
-                    // Permission does not depend on baud rate — no point
-                    // retrying the remaining rates on this port.
-                    return None;
-                }
-                debug!(port = %port, baud, error = %e, "Serial port open failed");
-                continue;
-            }
-        }
-    }
-    None
 }
 
 /// Log the dialout-group fix instructions once per port at error level;
@@ -1736,8 +1664,10 @@ mod tests {
 
     #[test]
     fn gps_status_object_has_the_contract_keys() {
-        let mut info = GpsInfo::default();
-        info.candidates = ui_candidates(&reporter_ports(), &[], &HashMap::new());
+        let info = GpsInfo {
+            candidates: ui_candidates(&reporter_ports(), &[], &HashMap::new()),
+            ..GpsInfo::default()
+        };
         let v = serde_json::to_value(&info).unwrap();
         for k in ["state", "port", "baud", "error_kind", "error_hint", "candidates"] {
             assert!(v.get(k).is_some(), "missing {k}");

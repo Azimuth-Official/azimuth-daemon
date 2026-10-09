@@ -1,5 +1,7 @@
 //! Best-effort detection of programs that may be holding the RTL-SDR open,
 //! so an `in_use` test result can name the likely culprit.
+// Parts are only reached from the Windows build; they are tested everywhere.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// Process-name fragment (lowercase) and the label shown to the user.
 const PATTERNS: &[(&str, &str)] = &[

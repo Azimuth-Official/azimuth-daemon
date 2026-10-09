@@ -183,10 +183,6 @@ impl Registrar {
         self
     }
 
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
     /// Start registering unless a chain is already running. Returns whether a
     /// new chain was started.
     pub fn kick(self: &Arc<Self>, node: NodeConfig) -> bool {
