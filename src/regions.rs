@@ -53,6 +53,10 @@ pub struct ResolvedRegion {
     pub dtv_sweep_start: u64,
     pub dtv_sweep_end: u64,
     pub dtv_sweep_step: u64,
+    /// STUB(c7): real values come from DAEMON-DSP's resolver.
+    pub dtv_standard: String,
+    pub dtv_channel_mhz: u32,
+    pub dtv_first_channel: u32,
     pub skipped_bands: Vec<String>,
 }
 
@@ -176,6 +180,9 @@ impl RegionResolver {
             dtv_sweep_start: dtv_standard.low_mhz * 1_000_000,
             dtv_sweep_end: dtv_end,
             dtv_sweep_step: dtv_standard.channel_mhz * 1_000_000,
+            dtv_standard: region.dtv_standard.clone(),
+            dtv_channel_mhz: dtv_standard.channel_mhz as u32,
+            dtv_first_channel: 14,
             skipped_bands,
         })
     }
