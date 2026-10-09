@@ -42,6 +42,8 @@ pub struct BandSweep {
     pub total: u32,
     pub found: u32,
     pub tune_failed: u32,
+    /// FM only: candidates dropped as a mirror image or adjacent-channel spill.
+    pub spill_rejected: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
 }
@@ -602,6 +604,7 @@ impl Scanner {
             found = found.len(),
             "FM survey complete"
         );
+        self.sweep.fm.spill_rejected = stations_images as u32;
         self.finish_band(BandKind::Fm, found.len() as u32, unresolved);
         found
     }
@@ -1615,7 +1618,7 @@ mod dsp_plan_tests {
         scanner.finish_band(BandKind::Fm, 17, 0);
         let v = serde_json::to_value(scanner.sweep_report()).unwrap();
         for band in ["fm", "lte", "dtv"] {
-            for key in ["started_at", "completed_at", "evaluated", "total", "found", "tune_failed", "in_progress", "next_rediscovery_at"] {
+            for key in ["started_at", "completed_at", "evaluated", "total", "found", "tune_failed", "spill_rejected", "in_progress", "next_rediscovery_at"] {
                 assert!(v[band].get(key).is_some(), "{band}.{key}");
             }
         }

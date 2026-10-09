@@ -19,6 +19,20 @@
 //!    attempt (extra evidence, never required).
 //!
 //! Pure functions over raw u8 IQ: no device access, so it is fully testable.
+//!
+//! Spill and image rejection (known limits):
+//! * mirror image: a candidate much weaker than the channel at -f whose audio
+//!   correlates with it is dropped (RTL IQ-imbalance image);
+//! * adjacent spill: a candidate whose discriminator audio correlates (>= 0.5 on a
+//!   200 kHz raster, >= 0.3 on 100 kHz) with a much stronger channel one raster step
+//!   away (two on 100 kHz) is dropped. **Known casualty: an adjacent simulcast or
+//!   repeater carrying the same programme looks identical to spill and is lost.**
+//!   An independent weak station next to a strong one is kept (tested at 20 and
+//!   30 dB below, 200 kHz apart);
+//! * 100 kHz raster only: energy piled against one edge of the window (centred
+//!   outside it) is dropped. A real station directly ONE 100 kHz step from a much
+//!   stronger one is physically swamped and cannot be told from its neighbour's
+//!   skirt; it is not reported.
 
 use crate::sdr::rds::extract_rds;
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -249,10 +263,11 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
                     m += 1;
                 }
             }
-            // One-sided energy: a station is centred in its window, so its power is
+            // 100 kHz raster only (a 200 kHz window does not contain the neighbour's
+            // centre). One-sided energy: a station is centred in its window, so its power is
             // balanced either side of the centre; energy piled up against ONE window
             // edge belongs to a neighbour centred outside (the 100 kHz raster case).
-            if ch.quality_db >= cfg.min_quality_db && !image && !spill {
+            if dense && ch.quality_db >= cfg.min_quality_db && !image && !spill {
                 let gap = ((5_000.0 / bin_hz).round() as isize).max(1);
                 let half = (b / 2) as isize;
                 let side = |from: isize, to: isize| -> f64 { (from..to).map(|j| power((k0 + j).rem_euclid(m as isize) as usize)).sum() };
@@ -478,5 +493,41 @@ mod tests {
             phantom += r.iter().enumerate().filter(|(i, c)| *i != 5 && c.confirmed).count();
         }
         assert_eq!(phantom, 0);
+    }
+
+    #[test]
+    fn weak_independent_station_beside_a_strong_one_is_found_on_both_rasters() {
+        // 200 kHz raster: weak station on the ADJACENT channel, 20 and 30 dB down.
+        for weak_db in [-20.0f64, -30.0] {
+            let mut found = 0;
+            for seed in 0..10u64 {
+                let (iq, chans, centre) = scene(20_000 + seed, &[(3, 0.0), (4, weak_db)], 60.0);
+                let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &SurveyConfig::default());
+                assert!(r[3].confirmed, "strong station, seed {seed}");
+                found += r[4].confirmed as usize;
+                // and on the other side
+                let (iq, chans, centre) = scene(21_000 + seed, &[(3, 0.0), (2, weak_db)], 60.0);
+                let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &SurveyConfig::default());
+                found += r[2].confirmed as usize;
+            }
+            println!("200 kHz raster, adjacent station {weak_db} dB: found {found}/20");
+            assert_eq!(found, 20, "200 kHz raster, weak {weak_db} dB");
+        }
+        // 100 kHz raster: weak station 200 kHz from the strong one (one empty channel between).
+        let cfg = SurveyConfig { channel_step_hz: 100_000.0, ..SurveyConfig::default() };
+        for weak_db in [-20.0f64, -30.0] {
+            let mut found = 0;
+            for seed in 0..10u64 {
+                let (iq, chans, centre) = scene100(22_000 + seed, &[(5, 0.0), (7, weak_db)], 60.0);
+                let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &cfg);
+                assert!(r[5].confirmed, "strong station, seed {seed}");
+                found += r[7].confirmed as usize;
+                let (iq, chans, centre) = scene100(23_000 + seed, &[(8, 0.0), (6, weak_db)], 60.0);
+                let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &cfg);
+                found += r[6].confirmed as usize;
+            }
+            println!("100 kHz raster, station 200 kHz from a strong one, {weak_db} dB: found {found}/20");
+            assert_eq!(found, 20, "100 kHz raster, weak {weak_db} dB");
+        }
     }
 }
