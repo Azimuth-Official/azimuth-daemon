@@ -593,6 +593,15 @@ impl Config {
     /// is filled from the worldwide default so upgraded nodes start scanning.
     /// Resolution failures keep the configured sweep plans — never fatal.
     pub fn apply_region(&mut self) -> RegionResolution {
+        self.apply_region_with(crate::regions::resolve_for_location)
+    }
+
+    /// `apply_region` with the location resolver injected (tests use a fake
+    /// table; production uses the bundled boundary dataset).
+    pub fn apply_region_with(
+        &mut self,
+        _locate: impl Fn(f64, f64) -> Option<&'static str>,
+    ) -> RegionResolution {
         let explicit_region =
             matches!(self.region.as_deref(), Some(r) if !r.is_empty() && r != "AUTO");
         let region_code = self.region.clone().unwrap_or_else(|| "AUTO".to_string());
@@ -944,5 +953,134 @@ gain = -1
         cfg.api.key = "az_live_anothersecret".to_string();
         let s = format!("{cfg:?}");
         assert!(!s.contains("az_live_anothersecret"), "key leaked via Config: {s}");
+    }
+
+    // --- G1: region = AUTO follows the node's location -----------------------
+
+    /// Stand-in for the boundary dataset: the six acceptance cities plus the
+    /// open ocean (None). The real lookup is DAEMON-DSP's `resolve_for_location`.
+    fn fake_locate(lat: f64, lon: f64) -> Option<&'static str> {
+        let near = |a: f64, b: f64| (lat - a).abs() < 1.0 && (lon - b).abs() < 1.0;
+        if near(48.8566, 2.3522) {
+            Some("FR")
+        } else if near(51.5074, -0.1278) {
+            Some("GB")
+        } else if near(52.52, 13.405) {
+            Some("DE")
+        } else if near(39.8283, -98.5795) {
+            Some("US")
+        } else if near(43.6532, -79.3832) {
+            Some("CA")
+        } else if near(35.6762, 139.6503) {
+            Some("JP")
+        } else {
+            None
+        }
+    }
+
+    fn at(lat: f64, lon: f64, region: Option<&str>) -> Config {
+        let mut c = valid_base_config();
+        c.node.location.latitude = lat;
+        c.node.location.longitude = lon;
+        c.region = region.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn auto_applies_the_full_plan_of_the_location_region() {
+        // Tokyo: FM 76-95 MHz, exactly like an explicit JP.
+        let mut auto = at(35.6762, 139.6503, Some("AUTO"));
+        let res = auto.apply_region_with(fake_locate);
+        assert_eq!(res, RegionResolution { effective: "JP".to_string(), source: "auto:location" });
+        let s = auto.scanning.as_ref().unwrap();
+        assert_eq!((s.fm.sweep_start, s.fm.sweep_end), (76_000_000, 95_000_000));
+
+        let mut explicit = at(35.6762, 139.6503, Some("JP"));
+        let res = explicit.apply_region_with(fake_locate);
+        assert_eq!(res, RegionResolution { effective: "JP".to_string(), source: "explicit" });
+        let (a, e) = (auto.scanning.as_ref().unwrap(), explicit.scanning.as_ref().unwrap());
+        assert_eq!(
+            (a.fm.sweep_start, a.fm.sweep_end, a.dtv.sweep_start, a.dtv.sweep_end, a.dtv.sweep_step),
+            (e.fm.sweep_start, e.fm.sweep_end, e.dtv.sweep_start, e.dtv.sweep_end, e.dtv.sweep_step),
+            "AUTO must equal the explicit region's plan"
+        );
+        assert_eq!(a.lte.sweep_bands.len(), e.lte.sweep_bands.len());
+    }
+
+    #[test]
+    fn auto_resolves_the_acceptance_cities() {
+        for (lat, lon, code) in [
+            (48.8566, 2.3522, "FR"),
+            (51.5074, -0.1278, "GB"),
+            (52.5200, 13.4050, "DE"),
+            (39.8283, -98.5795, "US"),
+            (43.6532, -79.3832, "CA"),
+            (35.6762, 139.6503, "JP"),
+        ] {
+            let mut c = at(lat, lon, Some("AUTO"));
+            let r = c.apply_region_with(fake_locate);
+            assert_eq!((r.effective.as_str(), r.source), (code, "auto:location"), "({lat},{lon})");
+        }
+    }
+
+    #[test]
+    fn auto_in_the_open_ocean_falls_back_to_default() {
+        let mut c = at(30.0, -40.0, Some("AUTO"));
+        let r = c.apply_region_with(fake_locate);
+        assert_eq!(r, RegionResolution { effective: "_DEFAULT".to_string(), source: "default" });
+    }
+
+    #[test]
+    fn auto_at_0_0_is_default() {
+        let mut c = at(0.0, 0.0, Some("AUTO"));
+        assert_eq!(c.apply_region_with(fake_locate).source, "default");
+    }
+
+    #[test]
+    fn auto_is_case_insensitive() {
+        for spelling in ["AUTO", "auto", "Auto", " aUtO "] {
+            let mut c = at(48.8566, 2.3522, Some(spelling));
+            let r = c.apply_region_with(fake_locate);
+            assert_eq!((r.effective.as_str(), r.source), ("FR", "auto:location"), "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_region_overrides_the_location() {
+        let mut c = at(48.8566, 2.3522, Some("jp"));
+        let r = c.apply_region_with(fake_locate);
+        assert_eq!((r.effective.as_str(), r.source), ("JP", "explicit"));
+        assert_eq!(c.scanning.as_ref().unwrap().fm.sweep_start, 76_000_000);
+    }
+
+    #[test]
+    fn an_unknown_explicit_code_reports_the_default_plan() {
+        let mut c = at(48.8566, 2.3522, Some("ZZ"));
+        let r = c.apply_region_with(fake_locate);
+        assert_eq!(r, RegionResolution { effective: "_DEFAULT".to_string(), source: "default" });
+    }
+
+    #[test]
+    fn unset_region_follows_the_location_only_while_ranges_are_still_defaults() {
+        let mut c = at(35.6762, 139.6503, None);
+        let r = c.apply_region_with(fake_locate);
+        assert_eq!((r.effective.as_str(), r.source), ("JP", "auto:location"));
+        assert_eq!(c.scanning.as_ref().unwrap().fm.sweep_start, 76_000_000);
+
+        // A hand-customised FM range is never overwritten.
+        let mut custom = at(35.6762, 139.6503, None);
+        custom.scanning.as_mut().unwrap().fm.sweep_start = 90_000_000;
+        custom.apply_region_with(fake_locate);
+        assert_eq!(custom.scanning.as_ref().unwrap().fm.sweep_start, 90_000_000);
+    }
+
+    #[test]
+    fn derived_dtv_plan_fields_are_never_written_to_disk() {
+        let mut c = at(48.8566, 2.3522, Some("AUTO"));
+        c.apply_region_with(fake_locate);
+        let toml = toml::to_string_pretty(&c).unwrap();
+        assert!(!toml.contains("first_channel") && !toml.contains("channel_mhz"), "{toml}");
+        // ...and a config written by an older daemon still loads.
+        let _: Config = toml::from_str(&toml).unwrap();
     }
 }
