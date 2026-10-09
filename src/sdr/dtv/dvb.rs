@@ -32,7 +32,7 @@
 //!
 //! The cyclic-prefix absolute carrier offset is only observable modulo the
 //! carrier spacing 1/Tu (the 2 MHz capture sees a flat part of the spectrum), so
-//! `cfo_hz` is the fractional carrier offset in (-1/(2 Tu), +1/(2 Tu)].
+//! `cfo_hz` is the fractional carrier offset in [-1/(2 Tu), +1/(2 Tu)).
 
 use rustfft::{num_complex::Complex, FftPlanner};
 
@@ -162,12 +162,14 @@ pub fn elementary_period_us(bandwidth_mhz: u32) -> Option<f64> {
     }
 }
 
-/// Signal type per contract C1 and whether DVB-T2 is also possible.
+/// Signal type per contract C1 and `t2_possible`: true for every `dtv_dvbt2`
+/// result (definitely T2) and for a `dtv_dvbt` reading that could also be T2
+/// (2K/8K with guard interval 1/4..1/32).
 pub fn classify(mode: FftMode, gi: GuardInterval) -> (&'static str, bool) {
     let t2_only_mode = matches!(mode, FftMode::K1 | FftMode::K4 | FftMode::K16 | FftMode::K32);
     let t2_only_gi = matches!(gi, GuardInterval::G1_128 | GuardInterval::G19_256 | GuardInterval::G19_128);
     if t2_only_mode || t2_only_gi {
-        ("dtv_dvbt2", false)
+        ("dtv_dvbt2", true)
     } else {
         ("dtv_dvbt", true)
     }
@@ -388,12 +390,12 @@ mod tests {
     fn labeling_follows_contract_c1() {
         assert_eq!(classify(FftMode::K8, G::G1_8), ("dtv_dvbt", true));
         assert_eq!(classify(FftMode::K2, G::G1_4), ("dtv_dvbt", true));
-        assert_eq!(classify(FftMode::K8, G::G19_128), ("dtv_dvbt2", false));
-        assert_eq!(classify(FftMode::K8, G::G1_128), ("dtv_dvbt2", false));
-        assert_eq!(classify(FftMode::K32, G::G1_8), ("dtv_dvbt2", false));
-        assert_eq!(classify(FftMode::K1, G::G1_16), ("dtv_dvbt2", false));
-        assert_eq!(classify(FftMode::K4, G::G1_32), ("dtv_dvbt2", false));
-        assert_eq!(classify(FftMode::K16, G::G1_16), ("dtv_dvbt2", false));
+        assert_eq!(classify(FftMode::K8, G::G19_128), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K8, G::G1_128), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K32, G::G1_8), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K1, G::G1_16), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K4, G::G1_32), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K16, G::G1_16), ("dtv_dvbt2", true));
     }
 
     #[test]

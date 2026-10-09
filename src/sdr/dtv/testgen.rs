@@ -152,10 +152,11 @@ pub fn fm_record(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)]) ->
     for &(off, amp) in stations {
         let tones: Vec<(f64, f64, f64)> = (0..4).map(|_| (rng.range(200.0, 6000.0), rng.range(0.05, 0.25), rng.range(0.0, std::f64::consts::TAU))).collect();
         let slow = rng.range(0.5, 3.0);
+        let pilot_phase = rng.range(0.0, std::f64::consts::TAU); // stations' pilots are not phase-locked to each other
         let mut phase = rng.range(0.0, std::f64::consts::TAU);
         for (i, v) in rec.iter_mut().enumerate() {
             let t = i as f64 / fs_n;
-            let mut m = 0.1 * (2.0 * std::f64::consts::PI * 19_000.0 * t).sin();
+            let mut m = 0.1 * (2.0 * std::f64::consts::PI * 19_000.0 * t + pilot_phase).sin();
             for (f, a, p) in &tones {
                 m += a * (2.0 * std::f64::consts::PI * f * t + p).sin();
             }

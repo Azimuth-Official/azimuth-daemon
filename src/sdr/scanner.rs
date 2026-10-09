@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::config::{DtvScanConfig, FmScanConfig, LteScanConfig, ScanningConfig};
 use crate::observation::Observation;
 use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
@@ -16,6 +14,7 @@ use super::fm_demod::survey::{evaluate_capture, plan_captures, CapturePlan, Surv
 /// Result from a single scan operation.
 pub struct ScanResult {
     pub signal_type: String,
+    #[allow(dead_code)] // set by every scan path; consumers use the freq passed alongside
     pub frequency_hz: u64,
     pub signal_strength_dbm: f32,
     pub snr_db: Option<f32>,
@@ -174,8 +173,11 @@ const CAPTURE_BYTES: usize = 262_144;
 
 /// Relaxed gates for the one-shot FM sweep retry when the primary pass (using
 /// `fm_config.sweep_threshold` / `sweep_min_snr_db`) finds zero stations.
-/// See `fm_sweep_pass` / `should_run_fm_fallback`.
+/// Retained only for the historical regression tests; discovery now uses the
+/// channel-relative survey (`fm_survey_pass`) and has no relaxed second pass.
+#[cfg(test)]
 const FM_FALLBACK_THRESHOLD_DBFS: f32 = -35.0;
+#[cfg(test)]
 const FM_FALLBACK_MIN_SNR_DB: f32 = 5.0;
 
 /// Minimum station count a primary FM sweep must clear before its gates are
@@ -189,6 +191,7 @@ const FM_FALLBACK_MIN_SNR_DB: f32 = 5.0;
 /// pass costs a single sweep and can only add stations. 1 would leave the bug
 /// half-fixed (2 found => still no retry, still nearly blind); 10 would
 /// re-sweep on almost every node for no gain in a healthy environment.
+#[cfg(test)]
 const FM_FALLBACK_MIN_STATIONS: usize = 3;
 
 /// Whether the FM discovery sweep should re-run with relaxed gates.
@@ -196,6 +199,7 @@ const FM_FALLBACK_MIN_STATIONS: usize = 3;
 /// Takes the threshold as a parameter rather than reading the constant, so the
 /// constant stays independently assertable and a future `fm.fallback_min_stations`
 /// config field can feed this without touching the predicate.
+#[cfg(test)]
 fn should_run_fm_fallback(primary_result: &[u64], min_stations: usize) -> bool {
     primary_result.len() < min_stations
 }
@@ -206,6 +210,7 @@ fn should_run_fm_fallback(primary_result: &[u64], min_stations: usize) -> bool {
 /// re-finds everything the strict pass found — but it is not *guaranteed* to:
 /// a fade, an AGC excursion or a capture error on one step can drop a frequency
 /// the strict pass caught. Assigning instead of merging would silently lose it.
+#[cfg(test)]
 fn merge_frequencies(mut a: Vec<u64>, b: Vec<u64>) -> Vec<u64> {
     a.extend(b);
     a.sort_unstable();
@@ -295,6 +300,7 @@ impl Scanner {
     /// schedule) from a freshly applied configuration. Clears the discovered
     /// state so the next `needs_discovery()` is true and discovery runs
     /// immediately with the new plan. No hardware access.
+    #[allow(dead_code)] // called by DAEMON-CORE on config apply
     pub fn apply_plan(&mut self, plan: &ScanningConfig) {
         let fresh = Scanner::new(plan, self.dbm_offset);
         self.mode = fresh.mode;
@@ -327,6 +333,7 @@ impl Scanner {
     /// Shared handle to the live sweep report; updated at the start and end of
     /// every band sweep (and on `apply_plan`), so `in_progress` is visible while a
     /// sweep runs.
+    #[allow(dead_code)] // consumed by DAEMON-CORE for /status
     pub fn sweep_handle(&self) -> Arc<Mutex<SweepReport>> {
         Arc::clone(&self.sweep_shared)
     }
@@ -380,6 +387,22 @@ impl Scanner {
         self.publish_sweep();
     }
 
+    /// Record progress while a sweep is running: `n` more channels evaluated,
+    /// `found` the running total. Published immediately so /status shows live progress.
+    fn advance_band(&mut self, kind: BandKind, n: u32, found: u32) {
+        let band = match kind {
+            BandKind::Fm => &mut self.sweep.fm,
+            BandKind::Lte => &mut self.sweep.lte,
+            BandKind::Dtv => &mut self.sweep.dtv,
+        };
+        band.evaluated = (band.evaluated + n).min(band.total);
+        band.found = found;
+        self.publish_sweep();
+    }
+
+    /// Complete a band sweep. The sweep loop has run to the end here, so every
+    /// channel has been evaluated (`evaluated == total`); channels that could
+    /// not be measured are in `tune_failed`.
     fn finish_band(&mut self, kind: BandKind, found: u32, tune_failed: u32) {
         let band = match kind {
             BandKind::Fm => &mut self.sweep.fm,
@@ -531,29 +554,41 @@ impl Scanner {
     fn fm_survey_pass(&mut self, sdr_manager: &mut SdrManager) -> Vec<u64> {
         let sample_rate = sdr_manager.device(0).map(|d| d.sample_rate()).unwrap_or(2_048_000);
         let plans = plan_captures(self.fm_config.sweep_start, self.fm_config.sweep_end, self.fm_config.sweep_step, sample_rate);
+        let cfg = SurveyConfig { channel_step_hz: self.fm_config.sweep_step as f64, ..SurveyConfig::default() };
+        self.fm_survey_run(plans, |sc, plan| sc.survey_capture(sdr_manager, plan, sample_rate, &cfg))
+    }
+
+    /// The sweep loop behind `fm_survey_pass`, with the capture step injected so
+    /// it can be exercised without hardware. `evaluated` advances (and is
+    /// published) after every capture plan, so progress is live.
+    fn fm_survey_run<F>(&mut self, plans: Vec<CapturePlan>, mut capture: F) -> Vec<u64>
+    where
+        F: FnMut(&mut Scanner, &CapturePlan) -> Option<Vec<crate::sdr::fm_demod::survey::FmChannel>>,
+    {
         let total: u32 = plans.iter().map(|p| p.channels.len() as u32).sum();
         self.begin_band(BandKind::Fm, total);
-        let cfg = SurveyConfig::default();
         let mut found: Vec<u64> = Vec::new();
         let mut retry: Vec<CapturePlan> = Vec::new();
         let (mut stations_images, mut weak_rejected) = (0usize, 0usize);
         for plan in &plans {
-            match self.survey_capture(sdr_manager, plan, sample_rate, &cfg) {
+            match capture(self, plan) {
                 Some(r) => Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected),
                 None => retry.push(plan.clone()),
             }
+            self.advance_band(BandKind::Fm, plan.channels.len() as u32, found.len() as u32);
         }
         let retried = retry.len();
         let mut unresolved = 0u32;
         for plan in retry {
             warn!(centre_mhz = plan.centre_hz as f64 / 1e6, "FM capture failed; retrying once");
-            match self.survey_capture(sdr_manager, &plan, sample_rate, &cfg) {
+            match capture(self, &plan) {
                 Some(r) => Self::record_fm(&r, &mut found, &mut stations_images, &mut weak_rejected),
                 None => {
                     unresolved += plan.channels.len() as u32;
                     warn!(centre_mhz = plan.centre_hz as f64 / 1e6, channels = plan.channels.len(), "FM capture failed after retry; channels counted as tune_failed");
                 }
             }
+            self.advance_band(BandKind::Fm, 0, found.len() as u32);
         }
         found.sort_unstable();
         found.dedup();
@@ -562,7 +597,7 @@ impl Scanner {
             captures = plans.len(),
             retried,
             tune_failed = unresolved,
-            image_rejected = stations_images,
+            image_or_spill_rejected = stations_images,
             below_gates = weak_rejected,
             found = found.len(),
             "FM survey complete"
@@ -576,9 +611,9 @@ impl Scanner {
             if c.confirmed {
                 info!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), pilot_db = ?c.pilot_db.map(|p| (p * 10.0).round() / 10.0), "FM station found");
                 found.push(c.freq_hz);
-            } else if c.image_of_mirror {
+            } else if c.image_of_mirror || c.spill_of_neighbour {
                 *images += 1;
-                debug!(freq_mhz = c.freq_hz as f64 / 1e6, "FM candidate rejected: mirror image of a stronger channel");
+                debug!(freq_mhz = c.freq_hz as f64 / 1e6, "FM candidate rejected: mirror image or adjacent-channel spill of a stronger channel");
             } else {
                 *rejected += 1;
                 debug!(freq_mhz = c.freq_hz as f64 / 1e6, excess_db = format!("{:.1}", c.excess_db), quality_db = format!("{:.1}", c.quality_db), "FM channel not a station");
@@ -617,6 +652,7 @@ impl Scanner {
                     debug!(freq_mhz = centre as f64 / 1e6, "DVB channel skipped: tune/capture failed after retry");
                 }
             }
+            self.advance_band(BandKind::Dtv, 1, result.dtv_channels.len() as u32);
         }
         let found = result.dtv_channels.len() as u32;
         self.finish_band(BandKind::Dtv, found, failed);
@@ -637,6 +673,8 @@ impl Scanner {
         raw.insert("cfo_hz".to_string(), serde_json::json!(det.cfo_hz));
         raw.insert("channel".to_string(), serde_json::json!(channel));
         raw.insert("bandwidth_mhz".to_string(), serde_json::json!(bandwidth_mhz));
+        // `t2_possible` is true for every DVB-T2 result (definitely T2) and for a
+        // `dtv_dvbt` reading that could also be T2 (2K/8K with GI 1/4..1/32).
         raw.insert("t2_possible".to_string(), serde_json::json!(det.t2_possible));
         // In-band SNR estimate from the CP correlation: rho ~= SNR / (1 + SNR).
         let rho = det.rho.clamp(0.01, 0.999);
@@ -649,93 +687,6 @@ impl Scanner {
             source_id: Some(format!("dvb_ch{}", channel)),
             raw_data: Some(serde_json::Value::Object(raw)),
         }]
-    }
-
-    /// One full FM sweep pass across the configured band using the given
-    /// power/SNR gates. Returns the frequencies that passed both gates.
-    /// Emits debug-level diagnostics for every candidate — dBFS, SNR (when
-    /// demod succeeded), and which gate (power/demod/snr) rejected it, if
-    /// any — so a user can self-diagnose from logs why a given frequency
-    /// wasn't detected as a station.
-    fn fm_sweep_pass(
-        &mut self,
-        sdr_manager: &mut SdrManager,
-        threshold_dbfs: f32,
-        min_snr_db: f32,
-    ) -> Vec<u64> {
-        let mut found = Vec::new();
-        let mut candidates = 0usize;
-        let mut tune_failed = 0usize;
-        let mut capture_failed = 0usize;
-        let mut rejected_power = 0usize;
-        let mut rejected_snr = 0usize;
-        let mut demod_failed = 0usize;
-
-        let mut freq = self.fm_config.sweep_start;
-        while freq <= self.fm_config.sweep_end {
-            candidates += 1;
-            if self.tune_with_recovery(sdr_manager, 0, freq).is_some() {
-                if let Some(device) = sdr_manager.device_mut(0) {
-                    match device.capture_raw(CAPTURE_BYTES) {
-                        Ok(iq) => {
-                            let (dbfs, _dbm) = calculate_signal_power(&iq, self.dbm_offset);
-                            if dbfs > threshold_dbfs as f64 {
-                                match super::fm_demod::demodulate_fm(&iq, device.sample_rate()) {
-                                    Some(demod) if demod.snr_db >= min_snr_db => {
-                                        info!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), "FM station found");
-                                        found.push(freq);
-                                    }
-                                    Some(demod) => {
-                                        rejected_snr += 1;
-                                        debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), snr = format!("{:.1}", demod.snr_db), gate = "snr", "FM candidate rejected: SNR below threshold");
-                                    }
-                                    None => {
-                                        demod_failed += 1;
-                                        debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "demod", "FM candidate rejected: demodulation failed (near-DC input or capture too short)");
-                                    }
-                                }
-                            } else {
-                                rejected_power += 1;
-                                debug!(freq_mhz = freq as f64 / 1e6, dbfs = format!("{:.1}", dbfs), gate = "power", "FM candidate rejected: below power threshold");
-                            }
-                        }
-                        Err(e) => {
-                            // Previously silent: a failed capture skipped the
-                            // frequency with no trace at any log level.
-                            capture_failed += 1;
-                            debug!(freq_mhz = freq as f64 / 1e6, gate = "capture", error = %e, "FM candidate skipped: capture failed");
-                        }
-                    }
-                }
-            } else {
-                // Previously silent: tune_with_recovery returning None skipped
-                // the frequency with no trace at any log level, so a sweep that
-                // failed to tune 102 of 103 steps looked identical in the logs
-                // to one where 102 steps were genuinely below threshold.
-                tune_failed += 1;
-                debug!(freq_mhz = freq as f64 / 1e6, gate = "tune", "FM candidate skipped: tune failed (recovery exhausted or device gone)");
-            }
-            freq += self.fm_config.sweep_step;
-        }
-
-        // Single info-level line that makes this sweep diagnosable without
-        // debug logging: "103 candidates / 87 below power / 1 found" and
-        // "103 candidates / 102 tune failures / 1 found" are entirely
-        // different diagnoses and were previously indistinguishable.
-        info!(
-            threshold_dbfs,
-            min_snr_db,
-            candidates,
-            tune_failed,
-            capture_failed,
-            rejected_power,
-            rejected_snr,
-            demod_failed,
-            found = found.len(),
-            "FM sweep pass complete"
-        );
-
-        found
     }
 
     /// Run one full scan cycle. Returns observations to submit.
@@ -1605,6 +1556,45 @@ mod dsp_plan_tests {
     }
 
     #[test]
+    fn fm_survey_progress_is_live_and_exact() {
+        use crate::sdr::fm_demod::survey::{plan_captures, FmChannel};
+        let mut scanner = Scanner::new(&ScanningConfig::default(), -30.0);
+        let h = scanner.sweep_handle();
+        let plans = plan_captures(87_500_000, 108_000_000, 200_000, 2_048_000);
+        let total: u32 = plans.iter().map(|p| p.channels.len() as u32).sum();
+        assert_eq!(total, 103);
+        let mut seen: Vec<(u32, bool)> = Vec::new();
+        let mut calls = 0;
+        let found = scanner.fm_survey_run(plans, |_sc, plan| {
+            {
+                let g = h.lock().unwrap();
+                seen.push((g.fm.evaluated, g.fm.in_progress));
+            }
+            calls += 1;
+            // The 4th capture plan fails on the first pass (call 4) and on its retry
+            // (call 14, after the 13 first-pass calls); the rest yield one station each.
+            if calls == 4 || calls == 14 {
+                return None;
+            }
+            Some(plan.channels.iter().map(|&f| FmChannel {
+                freq_hz: f, power_dbfs: -40.0, excess_db: 20.0, quality_db: 30.0, pilot_db: None, rds_pi: None,
+                image_of_mirror: false, spill_of_neighbour: false, confirmed: f == plan.channels[0],
+            }).collect())
+        });
+        // Mid-sweep: strictly between 0 and total at least once, monotonic, always in progress.
+        assert!(seen.iter().any(|(e, _)| *e > 0 && *e < total), "{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(seen.iter().all(|(_, ip)| *ip));
+        let r = h.lock().unwrap().clone();
+        assert!(!r.fm.in_progress);
+        assert_eq!(r.fm.evaluated, r.fm.total);
+        assert_eq!(r.fm.total, 103);
+        assert_eq!(calls, 14);
+        assert_eq!(r.fm.found as usize, found.len());
+        assert_eq!(r.fm.tune_failed, 8, "one 8-channel capture plan failed after its retry");
+    }
+
+    #[test]
     fn sweep_handle_shows_in_progress_live() {
         let mut scanner = Scanner::new(&ScanningConfig::default(), -30.0);
         let h = scanner.sweep_handle();
@@ -1673,7 +1663,7 @@ mod dsp_plan_tests {
         let r2 = scanner.scan_dvb_capture(&t2, 2_048_000, 682_000_000, -40.0);
         assert_eq!(r2[0].signal_type, "dtv_dvbt2");
         assert_eq!(r2[0].source_id.as_deref(), Some("dvb_ch47"));
-        assert_eq!(r2[0].raw_data.as_ref().unwrap()["t2_possible"], false);
+        assert_eq!(r2[0].raw_data.as_ref().unwrap()["t2_possible"], true);
     }
 
     #[test]

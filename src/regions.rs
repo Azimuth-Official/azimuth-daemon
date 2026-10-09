@@ -45,8 +45,16 @@ pub struct RegionConfig {
     pub fm_low_mhz: f64,
     pub fm_high_mhz: f64,
     pub dtv_standard: String,
+    /// FM channel raster in kHz: 200 in the Americas and South Korea (odd tenths
+    /// from 87.5 MHz), 100 elsewhere (every tenth).
+    #[serde(default = "default_fm_step_khz")]
+    pub fm_step_khz: u32,
     #[serde(default)]
     pub _note: Option<String>,
+}
+
+fn default_fm_step_khz() -> u32 {
+    100
 }
 
 pub struct ResolvedRegion {
@@ -93,7 +101,7 @@ impl RegionResolver {
     /// Resolve a region code to a ResolvedRegion with tuner capability filter applied.
     /// Unknown codes fall back to _DEFAULT.
     pub fn resolve(&self, region_code: &str) -> anyhow::Result<ResolvedRegion> {
-        let code_normalized = if region_code.is_empty() || region_code == "AUTO" {
+        let code_normalized = if region_code.is_empty() || region_code.eq_ignore_ascii_case("AUTO") {
             "_DEFAULT".to_string()
         } else {
             region_code.to_uppercase()
@@ -102,7 +110,7 @@ impl RegionResolver {
         let (region, effective_code) = match self.db.regions.get(&code_normalized) {
             Some(r) => (r.clone(), code_normalized),
             None => {
-                if region_code != "AUTO" && !region_code.is_empty() {
+                if !region_code.eq_ignore_ascii_case("AUTO") && !region_code.is_empty() {
                     tracing::warn!(
                         region = region_code,
                         "unknown region code, falling back to _DEFAULT"
@@ -185,7 +193,7 @@ impl RegionResolver {
             region_code: effective_code,
             fm_sweep_start: (region.fm_low_mhz * 1_000_000.0) as u64,
             fm_sweep_end: (region.fm_high_mhz * 1_000_000.0) as u64,
-            fm_sweep_step: 200_000, // 200 kHz step
+            fm_sweep_step: u64::from(region.fm_step_khz) * 1000,
             lte_sweep_bands: sweep_bands,
             dtv_sweep_start: dtv_standard.low_mhz * 1_000_000,
             dtv_sweep_end: dtv_end,
@@ -306,7 +314,7 @@ fn ring_contains(ring: &Ring, x: i32, y: i32) -> bool {
 /// Returns `None` for non-finite or out-of-range input, the (0, 0) "null
 /// island" placeholder, open ocean, and countries not in the region database.
 ///
-/// Accuracy: boundaries are Natural Earth 1:50m, quantised to 0.01 deg and
+/// Accuracy: boundaries are Natural Earth 1:10m, quantised to 0.01 deg and
 /// simplified with a 0.02 deg tolerance, so a border can be displaced by up to
 /// about 3 km on top of the source's own generalisation. Positions at least
 /// 5 km from a national border resolve to the correct country
@@ -419,6 +427,19 @@ mod tests {
         assert_eq!((au.dtv_sweep_start, au.dtv_sweep_end, au.dtv_channel_mhz, au.dtv_first_channel), (526_000_000, 694_000_000, 7, 28));
         let us = resolver.resolve("US").unwrap();
         assert_eq!((us.dtv_standard.as_str(), us.dtv_sweep_step, us.dtv_first_channel), ("ATSC", 6_000_000, 14));
+    }
+
+    #[test]
+    fn fm_raster_follows_the_region() {
+        let resolver = RegionResolver::new(1766).unwrap();
+        for c in ["US", "CA", "MX", "BR", "AR", "CL", "KR"] {
+            assert_eq!(resolver.resolve(c).unwrap().fm_sweep_step, 200_000, "{c}");
+        }
+        for c in ["FR", "GB", "DE", "JP", "AU", "IN", "ZA", "_DEFAULT"] {
+            assert_eq!(resolver.resolve(c).unwrap().fm_sweep_step, 100_000, "{c}");
+        }
+        assert_eq!(resolver.resolve("auto").unwrap().region_code, "_DEFAULT");
+        assert_eq!(resolver.resolve("Auto").unwrap().region_code, "_DEFAULT");
     }
 
     #[test]

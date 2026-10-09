@@ -34,11 +34,13 @@ pub struct SurveyConfig {
     pub min_excess_db: f64,
     /// Confirmation gate: discriminator quality (dB, noise reads about 0).
     pub min_quality_db: f64,
+    /// Channel raster spacing (Hz): 200 kHz in the Americas/Korea, 100 kHz elsewhere.
+    pub channel_step_hz: f64,
 }
 
 impl Default for SurveyConfig {
     fn default() -> Self {
-        SurveyConfig { min_excess_db: 6.0, min_quality_db: 10.0 }
+        SurveyConfig { min_excess_db: 6.0, min_quality_db: 10.0, channel_step_hz: 200_000.0 }
     }
 }
 
@@ -54,6 +56,8 @@ pub struct FmChannel {
     pub rds_pi: Option<u16>,
     /// Rejected as the mirror image of a much stronger channel at -f.
     pub image_of_mirror: bool,
+    /// Rejected as the spill of a much stronger neighbouring channel (same audio, same sign).
+    pub spill_of_neighbour: bool,
     pub confirmed: bool,
 }
 
@@ -86,6 +90,16 @@ pub fn plan_captures(start: u64, end: u64, step: u64, sample_rate: u32) -> Vec<C
             CapturePlan { centre_hz: centre, channels: c.to_vec() }
         })
         .collect()
+}
+
+fn abs_corr(a: &[f32], b: &[f32]) -> f64 {
+    let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+    for (u, v) in a.iter().zip(b) {
+        sxy += f64::from(*u) * f64::from(*v);
+        sxx += f64::from(*u) * f64::from(*u);
+        syy += f64::from(*v) * f64::from(*v);
+    }
+    sxy.abs() / (sxx * syy).sqrt().max(1e-30)
 }
 
 fn percentile(v: &mut [f64], q: f64) -> f64 {
@@ -183,6 +197,7 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             pilot_db: None,
             rds_pi: None,
             image_of_mirror: false,
+            spill_of_neighbour: false,
             confirmed: false,
         };
         if off.abs() < 0.95e6 && excess_db >= cfg.min_excess_db {
@@ -201,19 +216,53 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             let mirror_k0 = -k0;
             let mirror_power = inner_of(mirror_k0);
             let image = if mirror_power > inner_power * 10.0 && (off.abs() > 25_000.0) {
-                let dm = discriminator(mirror_k0);
-                let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
-                for (u, v) in d_raw.iter().zip(&dm) {
-                    sxy += f64::from(*u) * f64::from(*v);
-                    sxx += f64::from(*u) * f64::from(*u);
-                    syy += f64::from(*v) * f64::from(*v);
-                }
-                (sxy.abs() / (sxx * syy).sqrt().max(1e-30)) >= 0.5
+                abs_corr(&d_raw, &discriminator(mirror_k0)) >= 0.5
             } else {
                 false
             };
             ch.image_of_mirror = image;
-            if ch.quality_db >= cfg.min_quality_db && !image {
+            // Adjacent-channel spill: a much stronger channel within 400 kHz
+            // leaks into this channel's window with ITS audio (same sign). Independent
+            // programmes do not correlate, so a high correlation means spill, not a
+            // station. Matters most on a 100 kHz raster, where the neighbour's
+            // spectrum overlaps the +-100 kHz extraction window.
+            let step_k = (cfg.channel_step_hz / bin_hz).round() as isize;
+            // 100 kHz raster: the neighbour's spectrum overlaps this window, so be
+            // sensitive and look two steps out. 200 kHz raster: only a 10x stronger
+            // adjacent channel with strongly correlated audio counts as spill.
+            let dense = cfg.channel_step_hz < 150_000.0;
+            let (min_ratio, min_corr, max_m) = if dense { (2.0, 0.3, 2) } else { (10.0, 0.5, 1) };
+            let reach = max_m * step_k;
+            let mut spill = false;
+            if ch.quality_db >= cfg.min_quality_db && !image && step_k > 0 {
+                let mut m = 1;
+                'outer: while m * step_k <= reach {
+                    for nk in [k0 - m * step_k, k0 + m * step_k] {
+                        if inner_of(nk) > inner_power * min_ratio
+                            && (nk as f64 * bin_hz).abs() < 0.95e6
+                            && abs_corr(&d_raw, &discriminator(nk)) >= min_corr
+                        {
+                            spill = true;
+                            break 'outer;
+                        }
+                    }
+                    m += 1;
+                }
+            }
+            // One-sided energy: a station is centred in its window, so its power is
+            // balanced either side of the centre; energy piled up against ONE window
+            // edge belongs to a neighbour centred outside (the 100 kHz raster case).
+            if ch.quality_db >= cfg.min_quality_db && !image && !spill {
+                let gap = ((5_000.0 / bin_hz).round() as isize).max(1);
+                let half = (b / 2) as isize;
+                let side = |from: isize, to: isize| -> f64 { (from..to).map(|j| power((k0 + j).rem_euclid(m as isize) as usize)).sum() };
+                let (lo, hi) = (side(-half, -gap), side(gap, half));
+                if (hi - lo).abs() / (hi + lo).max(1e-30) >= 0.6 {
+                    spill = true;
+                }
+            }
+            ch.spill_of_neighbour = spill;
+            if ch.quality_db >= cfg.min_quality_db && !image && !spill {
                 ch.confirmed = true;
                 let pil = mean_of(band(18_900.0, 19_100.0));
                 let nb = (mean_of(band(17_000.0, 18_500.0)) + mean_of(band(19_500.0, 21_000.0))) / 2.0;
@@ -358,5 +407,76 @@ mod tests {
                 assert_eq!(ok, trials, "stations at {ch_snr} dB channel SNR must be confirmed");
             }
         }
+    }
+
+    /// 16 channels at 100 kHz spacing around 98 MHz (offsets -750..+750 kHz).
+    fn scene100(seed: u64, stations: &[(usize, f64)], snr_total_db: f64) -> (Vec<u8>, Vec<u64>, u64) {
+        let centre = 98_000_000u64;
+        let chans: Vec<u64> = (0..16).map(|i| centre - 750_000 + 100_000 * i as u64).collect();
+        let mut rng = Rng::new(seed);
+        let fs_n = 8_192_000.0;
+        let need = (CAPTURE_LEN as f64 * fs_n / FS_OUT).ceil() as usize + 1024 + 16;
+        let st: Vec<(f64, f64)> = stations.iter().map(|(i, db)| (chans[*i] as f64 - centre as f64, 10f64.powf(db / 20.0))).collect();
+        let rec = fm_record(&mut rng, fs_n, need, &st);
+        let iq = capture_from_record(&mut rng, &rec, fs_n, FrontEnd::standard(snr_total_db, 0.0));
+        (iq, chans, centre)
+    }
+
+    #[test]
+    fn plan_covers_a_100khz_raster_once() {
+        let plans = plan_captures(87_500_000, 108_000_000, 100_000, 2_048_000);
+        let all: Vec<u64> = plans.iter().flat_map(|p| p.channels.clone()).collect();
+        let expect: Vec<u64> = (0..).map(|k| 87_500_000 + k * 100_000).take_while(|f| *f <= 108_000_000).collect();
+        assert_eq!(all, expect);
+        assert_eq!(expect.len(), 206);
+        for p in &plans {
+            assert!(p.channels.len() <= 16);
+            assert!(p.channels.iter().all(|c| c.abs_diff(p.centre_hz) <= 800_000));
+        }
+    }
+
+    #[test]
+    fn eu_like_even_tenth_stations_are_all_found_on_a_100khz_raster() {
+        // Stations on every other 100 kHz channel (200 kHz apart) at EVEN tenths,
+        // i.e. the half of the raster a 200 kHz grid from 87.5 MHz never visits.
+        // Levels span 12 dB, so each odd channel in between sits beside two stations.
+        let cfg = SurveyConfig { channel_step_hz: 100_000.0, ..SurveyConfig::default() };
+        let (mut stations, mut found, mut between, mut between_conf) = (0, 0, 0, 0);
+        let mut rng = Rng::new(31337);
+        for seed in 0..20u64 {
+
+            let occupied: Vec<usize> = (0..16).filter(|i| i % 2 == 1).collect();
+            let st: Vec<(usize, f64)> = occupied.iter().map(|&i| (i, -rng.range(0.0, 12.0))).collect();
+            let (iq, chans, centre) = scene100(8000 + seed, &st, 45.0);
+            let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &cfg);
+            for (i, c) in r.iter().enumerate() {
+                if i % 2 == 1 {
+                    stations += 1;
+                    found += c.confirmed as usize;
+                    if !c.confirmed {
+                        println!("MISSED seed {seed} ch{i}: {c:?}");
+                    }
+                } else {
+                    between += 1;
+                    between_conf += c.confirmed as usize;
+                }
+            }
+        }
+        println!("100 kHz raster: stations {stations} found {found}; channels between stations {between}, read as stations {between_conf}");
+        assert_eq!(found, stations, "every station must be found");
+        assert_eq!(between_conf, 0, "spill between two stations must not be reported as a station");
+    }
+
+    #[test]
+    fn strong_station_does_not_create_a_phantom_neighbour_on_a_100khz_raster() {
+        let cfg = SurveyConfig { channel_step_hz: 100_000.0, ..SurveyConfig::default() };
+        let mut phantom = 0;
+        for seed in 0..20u64 {
+            let (iq, chans, centre) = scene100(8500 + seed, &[(5, 0.0)], 45.0);
+            let r = evaluate_capture(&iq, 2_048_000, centre, &chans, &cfg);
+            assert!(r[5].confirmed, "seed {seed}");
+            phantom += r.iter().enumerate().filter(|(i, c)| *i != 5 && c.confirmed).count();
+        }
+        assert_eq!(phantom, 0);
     }
 }
