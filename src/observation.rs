@@ -33,6 +33,20 @@ pub struct SubmitObservationsResponse {
     pub accepted: u32,
 }
 
+/// One item the server refused inside an otherwise accepted batch.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RejectedObservation {
+    pub index: u32,
+    pub reason: String,
+}
+
+/// Result of a submit: how many were stored plus per-item rejections.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubmitOutcome {
+    pub accepted: u32,
+    pub rejected: Vec<RejectedObservation>,
+}
+
 /// Maps a full signal type (`fm_rds`, `lte_pss`, `dtv_atsc`, `dtv_dvbt`, ...) to its
 /// scoring category. Bare category names pass through unchanged.
 pub fn category_for_signal_type(signal_type: &str) -> &str {

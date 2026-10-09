@@ -2,7 +2,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
-use crate::observation::{SubmitObservationsRequest, SubmitObservationsResponse};
+use crate::observation::{
+    RejectedObservation, SubmitObservationsRequest, SubmitObservationsResponse, SubmitOutcome,
+};
 
 /// Non-2xx API response with the status code preserved so callers can react
 /// to specific codes (401 → surface an auth error) instead of parsing strings.
@@ -184,6 +186,15 @@ impl ApiClient {
         &self,
         request: &SubmitObservationsRequest,
     ) -> anyhow::Result<u32> {
+        self.submit_observations_detailed(request).await.map(|o| o.accepted)
+    }
+
+    /// Like `submit_observations`, but also returns the server's per-item
+    /// rejections (`rejected: [{index, reason}]`). Old servers omit the field.
+    pub async fn submit_observations_detailed(
+        &self,
+        request: &SubmitObservationsRequest,
+    ) -> anyhow::Result<SubmitOutcome> {
         let url = format!("{}/api/observations", self.base_url);
         let resp = self
             .client
@@ -204,8 +215,13 @@ impl ApiClient {
 
         let data: SubmitObservationsResponse = resp.json().await?;
         debug!(accepted = data.accepted, "Observations submitted");
-        Ok(data.accepted)
+        Ok(SubmitOutcome { accepted: data.accepted, rejected: Vec::new() })
     }
+}
+
+/// Per-item rejections carried by an all-invalid 400 response body.
+pub fn rejected_from_error(_err: &anyhow::Error) -> Vec<RejectedObservation> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -302,5 +318,63 @@ mod tests {
             is_unauthorized(&err),
             "submit 401 must be detectable, got: {err:#}"
         );
+    }
+
+    /// Local server answering POST with a fixed status and JSON body.
+    async fn spawn_body(status: u16, body: &'static str) -> String {
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().fallback(move || async move { (code, body) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{}", addr)
+    }
+
+    fn empty_req() -> SubmitObservationsRequest {
+        SubmitObservationsRequest { node_id: "n".to_string(), observations: vec![] }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_acceptance_surfaces_rejected_items() {
+        let base = spawn_body(
+            201,
+            r#"{"accepted":2,"duplicates":0,"skipped":0,"points_earned":1.5,"rejected":[{"index":2,"reason":"invalid signal_type"}]}"#,
+        )
+        .await;
+        let out = client_for(&base).submit_observations_detailed(&empty_req()).await.unwrap();
+        assert_eq!(out.accepted, 2, "accepted keeps its meaning");
+        assert_eq!(
+            out.rejected,
+            vec![RejectedObservation { index: 2, reason: "invalid signal_type".to_string() }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_response_without_rejected_still_parses() {
+        let base = spawn_body(200, r#"{"accepted":3}"#).await;
+        let out = client_for(&base).submit_observations_detailed(&empty_req()).await.unwrap();
+        assert_eq!(out.accepted, 3);
+        assert!(out.rejected.is_empty());
+        assert_eq!(client_for(&base).submit_observations(&empty_req()).await.unwrap(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_invalid_400_exposes_rejected_items() {
+        let base = spawn_body(
+            400,
+            r#"{"error":"Observation 0: invalid signal_type","rejected":[{"index":0,"reason":"invalid signal_type"}]}"#,
+        )
+        .await;
+        let err = client_for(&base)
+            .submit_observations_detailed(&empty_req())
+            .await
+            .expect_err("400 is an error");
+        assert!(!is_unauthorized(&err));
+        let rejected = rejected_from_error(&err);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].index, 0);
+        assert_eq!(rejected[0].reason, "invalid signal_type");
     }
 }
