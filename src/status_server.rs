@@ -1452,4 +1452,41 @@ mod tests {
         assert!(h.state.status.read().await.last_accepted_at.is_some());
         let _ = std::fs::remove_dir_all(&h.dir);
     }
+
+    // R1.7: the Dockerfile HEALTHCHECK is healthy ONLY when config_state == "ok".
+    fn healthcheck_pattern() -> String {
+        let dockerfile = include_str!("../Dockerfile");
+        let line = dockerfile
+            .lines()
+            .find(|l| l.contains("curl -fsS http://127.0.0.1:8420/status"))
+            .expect("Dockerfile HEALTHCHECK command");
+        let start = line.find("grep -q '").expect("grep -q in HEALTHCHECK") + "grep -q '".len();
+        let end = line[start..].find('\'').unwrap() + start;
+        line[start..end].to_string()
+    }
+
+    #[test]
+    fn healthcheck_is_healthy_only_when_config_state_is_ok() {
+        let pattern = healthcheck_pattern();
+        assert_eq!(pattern, "\"config_state\":\"ok\"");
+        for (state, healthy) in [
+            (ConfigState::Ok, true),
+            (ConfigState::AwaitingSetup, false),
+            (ConfigState::Invalid, false),
+        ] {
+            let mut s = StatusState::new("n".to_string(), "tier1_rtlsdr".to_string());
+            s.config_state = state;
+            let compact = serde_json::to_string(&s.to_info(true, false)).unwrap();
+            assert_eq!(compact.contains(&pattern), healthy, "{state:?}: {compact}");
+        }
+    }
+
+    #[test]
+    fn config_error_is_null_unless_state_is_invalid() {
+        let mut s = StatusState::new("n".to_string(), "tier1_rtlsdr".to_string());
+        s.config_state = ConfigState::AwaitingSetup;
+        let compact = serde_json::to_string(&s.to_info(true, false)).unwrap();
+        assert!(compact.contains("\"config_error\":null"), "{compact}");
+        assert!(compact.contains("\"config_state\":\"awaiting_setup\""), "{compact}");
+    }
 }

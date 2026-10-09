@@ -16,7 +16,7 @@ The tag is multi-architecture: Docker selects amd64 or arm64 (Raspberry Pi 4/5) 
 Pin a release instead of tracking `latest` if you want reproducible deployments:
 
 ```sh
-docker pull ghcr.io/azimuth-official/azimuth-node:0.3.5
+docker pull ghcr.io/azimuth-official/azimuth-node:0.4.0
 ```
 
 `docker compose up -d` (section 2) pulls this image on its own, so you can skip straight
@@ -153,11 +153,12 @@ and does not re-register or lose its RTK setup.
 ## 6. Health endpoint
 
 `GET /status` returns JSON with SDR connection state, device count, uptime, signal counts,
-and any `config_error`. The image's `HEALTHCHECK` polls it, and fails (container shows
-`unhealthy` in `docker ps` — this does NOT stop, kill, or restart it) whenever
-`config_error` is non-null: most commonly a missing `AZIMUTH_API_KEY` or an unset
-`(0,0)` location. The daemon runs fine in that state and keeps scanning; it just cannot
-register, so the node will not appear on the dashboard. Check `docker logs` or
+`config_state`, and any `config_error`. The image's `HEALTHCHECK` polls it and is
+healthy ONLY when `config_state` is `"ok"`. The container shows `unhealthy` in
+`docker ps` (this does NOT stop, kill, or restart it) while `config_state` is
+`"awaiting_setup"` (a missing `AZIMUTH_API_KEY` or an unset `(0,0)` location: the
+daemon is up but does not scan or register until setup is complete) or `"invalid"` (a
+real configuration problem, described in `config_error`). Check `docker logs` or
 `curl http://127.0.0.1:8420/status` for the exact reason.
 
 > **Security:** `/status` is unauthenticated. `docker-compose.yml` binds it to

@@ -59,7 +59,7 @@ LABEL org.opencontainers.image.title="Azimuth Node" \
       org.opencontainers.image.vendor="Azimuth" \
       org.opencontainers.image.authors="Azimuth <contact@azimuth.day>" \
       org.opencontainers.image.source="https://github.com/Azimuth-Official/azimuth-daemon" \
-      org.opencontainers.image.version="0.3.5"
+      org.opencontainers.image.version="0.4.0"
 
 USER azimuth
 VOLUME ["/var/lib/azimuth"]
@@ -67,12 +67,13 @@ EXPOSE 8420
 
 # GET /status on the daemon's status server (entrypoint forces bind 0.0.0.0:8420).
 # Also fails (marks the container "unhealthy" in `docker ps` — does NOT stop,
-# kill, or restart it) when /status reports a non-null config_error, e.g. a
-# missing api.key or an unset (0,0) location: the daemon runs and the process
-# is fine, but the node cannot register and will not appear on the dashboard.
+# kill, or restart it) unless /status reports config_state "ok" — "awaiting_setup"
+# (missing api.key or an unset (0,0) location) and "invalid" both fail: the
+# daemon runs and the process is fine, but the node is not scanning or
+# registered and will not appear on the dashboard.
 # This is the loud, self-service signal for that case — grep, not jq, since
 # the runtime image intentionally ships no extra tooling beyond curl.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8420/status | grep -q '"config_error":null' || exit 1
+  CMD curl -fsS http://127.0.0.1:8420/status | grep -q '"config_state":"ok"' || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
