@@ -108,8 +108,13 @@ pub struct SdrDiagnostics {
     pub pll_lock_failures: u64,
     /// Tunes that hit a USB control stall and succeeded after being re-issued.
     pub tune_stalls_recovered: u64,
-    /// USB resets done while opening a device that stalled its first write.
+    /// USB resets done because the open/init sequence stalled.
     pub open_usb_resets: u64,
+    /// Every re-issued tune after a stall, and open attempts that exhausted the ladder.
+    pub tune_stall_retries: u64,
+    pub init_failures: u64,
+    /// Why the dongle could not be brought up (null when it is fine).
+    pub device_error: Option<String>,
 }
 
 pub struct StatusState {
@@ -374,7 +379,10 @@ impl StatusState {
             sdr_diagnostics: SdrDiagnostics {
                 pll_lock_failures: crate::sdr::pll_lock_failures(),
                 tune_stalls_recovered: crate::sdr::TUNE_STALLS_RECOVERED.load(Ordering::Relaxed),
-                open_usb_resets: crate::sdr::OPEN_USB_RESETS.load(Ordering::Relaxed),
+                open_usb_resets: crate::sdr::INIT_STALL_RESETS.load(Ordering::Relaxed),
+                tune_stall_retries: crate::sdr::dongle::TUNE_STALL_RETRIES_TOTAL.load(Ordering::Relaxed),
+                init_failures: crate::sdr::dongle::INIT_FAILURES.load(Ordering::Relaxed),
+                device_error: crate::sdr::dongle::device_error(),
             },
         }
     }

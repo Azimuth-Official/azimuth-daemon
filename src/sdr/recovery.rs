@@ -161,27 +161,7 @@ impl RecoveryManager {
 /// VID:PID rtl-sdr-rs accepts) and perform a USB bus reset. This does not touch
 /// the rtl-sdr-rs handle, so the caller must reopen the device afterwards.
 pub fn reset_usb_bus_device(device_index: usize) -> anyhow::Result<()> {
-    let mut matched = 0usize;
-    for device in rusb::devices()?.iter() {
-        let desc = device.device_descriptor()?;
-        if super::driver_state::is_known_device(desc.vendor_id(), desc.product_id()) {
-            if matched == device_index {
-                info!(
-                    device_index,
-                    bus = device.bus_number(),
-                    addr = device.address(),
-                    "Resetting USB bus for RTL-SDR device"
-                );
-                let handle = device.open()?;
-                handle.reset()?;
-                info!(device_index, "USB bus reset completed");
-                return Ok(());
-            }
-            matched += 1;
-        }
-    }
-
-    anyhow::bail!("No RTL-SDR device at index {}", device_index);
+    super::dongle::usb_reset(device_index)
 }
 
 /// Restart the OS-level USB device. On Windows this disables then re-enables

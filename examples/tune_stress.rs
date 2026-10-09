@@ -11,44 +11,18 @@
 use std::time::{Duration, Instant};
 
 use rtl_sdr_rs::error::RtlsdrError;
-use rtl_sdr_rs::{RtlSdr, TunerGain};
+use rtl_sdr_rs::RtlSdr;
 
-// The same stall handling the daemon uses (src/sdr/stall.rs).
+// The daemon's own USB code (open + init ladder, stall-tolerant tune, reset),
+// included verbatim so a hardware pass here proves the daemon's code path.
+#[path = "../src/sdr/driver_state.rs"]
+mod driver_state;
 #[path = "../src/sdr/stall.rs"]
 mod stall;
-
-fn is_stall(e: &RtlsdrError) -> bool {
-    matches!(e, RtlsdrError::Usb(rusb::Error::Pipe) | RtlsdrError::Usb(rusb::Error::Io))
-}
-
-/// libusb_reset_device on the first RTL2832U found.
-fn usb_reset() {
-    let Ok(list) = rusb::devices() else { return };
-    for d in list.iter() {
-        if let Ok(desc) = d.device_descriptor() {
-            if desc.vendor_id() == 0x0bda && matches!(desc.product_id(), 0x2832 | 0x2838) {
-                match d.open().and_then(|h| h.reset()) {
-                    Ok(()) => println!("USB_RESET ok"),
-                    Err(e) => println!("USB_RESET failed: {e}"),
-                }
-                return;
-            }
-        }
-    }
-}
-
-fn open_dongle(reset_on_open: bool) -> Result<RtlSdr, RtlsdrError> {
-    if !reset_on_open {
-        return RtlSdr::open_with_index(0);
-    }
-    stall::open_with_reset(
-        stall::OPEN_RESET_ATTEMPTS,
-        is_stall,
-        usb_reset,
-        std::thread::sleep,
-        || RtlSdr::open_with_index(0),
-    )
-}
+#[path = "../src/sdr/dongle.rs"]
+mod dongle;
+use dongle::{Gain, InitParams};
+use std::sync::atomic::Ordering;
 
 /// Prints `log` records (rtl-sdr-rs reports USB errors through them).
 struct StderrLog;
@@ -143,99 +117,104 @@ pub fn main() {
     let _ = log::set_logger(&StderrLog);
     log::set_max_level(log::LevelFilter::Info);
     let o = parse();
+    let params = InitParams {
+        index: 0,
+        sample_rate: o.sample_rate,
+        gain: Gain::Auto,
+        freq_correction_ppm: 0,
+    };
+    let tolerant = o.tolerant;
 
-    let mut sdr = match open_dongle(o.reset_on_open) {
-        Ok(s) => s,
+    // Baseline: one plain open + init, no ladder. Tolerant: the daemon's ladder.
+    let open = |tolerant: bool| -> Result<RtlSdr, RtlsdrError> {
+        if tolerant || o.reset_on_open {
+            dongle::open_with_ladder(&params)
+        } else {
+            let mut d = dongle::open_catching(params.index)?;
+            d.set_sample_rate(params.sample_rate)?;
+            d.set_freq_correction(0)?;
+            d.set_tuner_gain(rtl_sdr_rs::TunerGain::Auto)?;
+            d.reset_buffer()?;
+            Ok(d)
+        }
+    };
+    let mut sdr: Option<RtlSdr> = match open(tolerant) {
+        Ok(s) => Some(s),
         Err(e) => {
             println!("OPEN_FAILED {e}");
             std::process::exit(3);
         }
     };
-    println!("tuner={:?}", sdr.get_tuner_id().map(str::to_string));
-    for k in ["AZ_RTL_PLL_SLEEP_MS", "AZ_RTL_I2C_EXACT", "AZ_RTL_CHUNK_FIX"] {
-        println!("{k}={}", std::env::var(k).unwrap_or_else(|_| "(unset)".to_string()));
+    if let Some(d) = sdr.as_ref() {
+        println!("tuner={:?}", d.get_tuner_id().map(str::to_string));
     }
-    sdr.set_sample_rate(o.sample_rate).expect("set_sample_rate");
-    sdr.set_tuner_gain(TunerGain::Auto).expect("set_tuner_gain");
-    let _ = sdr.reset_buffer();
 
     let t0 = Instant::now();
-    let (mut steps, mut failures, mut stall_retries, mut resets) = (0u32, 0u32, 0u32, 0u32);
+    let (mut steps, mut failures, mut reopens) = (0u32, 0u32, 0u32);
     let mut buf = vec![0u8; o.capture_bytes];
+    let counter = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     for pass in 0..o.passes {
         let mut f = o.start;
         while f <= o.end {
             steps += 1;
             let t = Instant::now();
-            let mut tune = if o.tolerant {
-                let first = stall::retry_stalls(
-                    stall::TUNE_STALL_RETRIES,
-                    is_stall,
-                    std::thread::sleep,
-                    |a| {
-                        stall_retries += 1;
-                        println!("STALL_RETRY f={f} attempt={a}");
-                    },
-                    || sdr.set_center_freq(f),
-                );
-                match first {
-                    Err(e) if is_stall(&e) => {
-                        // Persistent stall: reset, reopen, and keep sweeping.
-                        resets += 1;
-                        println!("STALL_PERSISTENT f={f}: resetting and reopening");
-                        drop(sdr);
-                        std::thread::sleep(Duration::from_millis(200));
-                        usb_reset();
-                        std::thread::sleep(Duration::from_millis(500));
-                        sdr = match open_dongle(true) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                println!("REOPEN_FAILED {e}");
-                                std::process::exit(3);
-                            }
+            let stalls_before = counter(&dongle::TUNE_STALL_RETRIES_TOTAL);
+
+            // Device lost earlier (reopen failed)? Keep trying: never abort the sweep.
+            if sdr.is_none() && tolerant {
+                reopens += 1;
+                sdr = dongle::reset_and_reopen(&params).ok();
+            }
+
+            let (tune, capture) = match sdr.as_mut() {
+                None => (Err("no device".to_string()), Err("no device".to_string())),
+                Some(d) => {
+                    let mut tune = if tolerant {
+                        dongle::tune(d, f).map_err(|e| e.to_string())
+                    } else {
+                        d.set_center_freq(f).map_err(|e| e.to_string())
+                    };
+                    if tolerant && tune.is_err() {
+                        // Persistent stall: the daemon's recovery, USB reset first.
+                        println!("STALL_PERSISTENT f={f}: reset and reopen");
+                        reopens += 1;
+                        drop(sdr.take());
+                        sdr = dongle::reset_and_reopen(&params).ok();
+                        tune = match sdr.as_mut() {
+                            Some(d) => dongle::tune(d, f).map_err(|e| e.to_string()),
+                            None => Err("reopen failed".to_string()),
                         };
-                        sdr.set_sample_rate(o.sample_rate).expect("set_sample_rate");
-                        sdr.set_tuner_gain(TunerGain::Auto).expect("set_tuner_gain");
-                        let _ = sdr.reset_buffer();
-                        sdr.set_center_freq(f)
                     }
-                    other => other,
+                    if o.settle_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(o.settle_ms));
+                    }
+                    let mut capture = Ok(0usize);
+                    if tune.is_ok() && o.capture_bytes > 0 {
+                        if let Some(d) = sdr.as_mut() {
+                            if o.reset_buffer {
+                                let _ = d.reset_buffer();
+                            }
+                            capture = d.read_sync(&mut buf).map_err(|e| e.to_string());
+                            if o.reset_after {
+                                let _ = d.reset_buffer();
+                            }
+                        }
+                    }
+                    (tune, capture)
                 }
-            } else {
-                sdr.set_center_freq(f)
             };
-            for _ in 0..o.retry_tune {
-                if tune.is_ok() {
-                    break;
-                }
-                println!("RETRY_TUNE f={f}");
-                std::thread::sleep(Duration::from_millis(50));
-                tune = sdr.set_center_freq(f);
-            }
-            if o.settle_ms > 0 {
-                std::thread::sleep(Duration::from_millis(o.settle_ms));
-            }
-            let mut capture = Ok(0usize);
-            if tune.is_ok() && o.capture_bytes > 0 {
-                if o.reset_buffer {
-                    let _ = sdr.reset_buffer();
-                }
-                capture = sdr.read_sync(&mut buf);
-                if o.reset_after {
-                    let _ = sdr.reset_buffer();
-                }
-            }
             let ok = tune.is_ok() && capture.is_ok();
             println!(
-                "pass={pass} step={steps} f={f} elapsed_ms={} step_ms={} tune={} capture={}",
+                "pass={pass} step={steps} f={f} elapsed_ms={} step_ms={} stall_retries={} tune={} capture={}",
                 t0.elapsed().as_millis(),
                 t.elapsed().as_millis(),
+                counter(&dongle::TUNE_STALL_RETRIES_TOTAL) - stalls_before,
                 tune.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| format!("ERR({e})")),
                 capture.as_ref().map(|n| format!("ok({n})")).unwrap_or_else(|e| format!("ERR({e})")),
             );
             if !ok {
                 failures += 1;
-                if !o.keep_going {
+                if !o.keep_going && !tolerant {
                     println!("FIRST_FAILURE step={steps} f={f} after_ms={}", t0.elapsed().as_millis());
                     println!("SUMMARY steps={steps} failures={failures}");
                     std::process::exit(1);
@@ -247,6 +226,14 @@ pub fn main() {
             f += o.step;
         }
     }
-    println!("SUMMARY steps={steps} failures={failures} stall_retries={stall_retries} resets={resets} elapsed_ms={}", t0.elapsed().as_millis());
+    println!(
+        "SUMMARY steps={steps} failures={failures} tune_stall_retries={} tune_stalls_recovered={} init_stall_resets={} init_failures={} reopens={reopens} device_error={:?} elapsed_ms={}",
+        counter(&dongle::TUNE_STALL_RETRIES_TOTAL),
+        counter(&dongle::TUNE_STALLS_RECOVERED),
+        counter(&dongle::INIT_STALL_RESETS),
+        counter(&dongle::INIT_FAILURES),
+        dongle::device_error(),
+        t0.elapsed().as_millis()
+    );
     std::process::exit(if failures == 0 { 0 } else { 1 });
 }

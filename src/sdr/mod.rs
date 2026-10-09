@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 pub mod driver_install;
 
+pub mod dongle;
 pub mod driver_state;
 pub mod dtv;
 pub mod fm_demod;
@@ -16,68 +17,14 @@ use tracing::{info, warn};
 use crate::identity;
 use driver_state::{DriverInfo, DriverStateKind, OpenFailure};
 
-/// Linux: detach the kernel driver (`dvb_usb_rtl28xxu`) that claims the RTL2832U —
-/// especially over usbip — before rtl-sdr-rs opens it, or `open()` fails with "open
-/// device N". Uses a PLAIN `detach_kernel_driver` via rusb, NOT `set_auto_detach`
-/// (auto mode re-attaches the kernel driver when the handle/interface is released,
-/// handing the device straight back before rtl-sdr-rs opens it). The handle is dropped
-/// without claiming and without reattach, so the detach persists past close. No-op on
-/// non-Linux (Windows uses a WinUSB/libusb driver, no kernel-detach needed).
-#[cfg(target_os = "linux")]
-fn detach_rtl_kernel_drivers() {
-    let devs = match rusb::devices() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    for device in devs.iter() {
-        let desc = match device.device_descriptor() {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        if desc.vendor_id() == 0x0bda && matches!(desc.product_id(), 0x2832 | 0x2838) {
-            if let Ok(handle) = device.open() {
-                match handle.detach_kernel_driver(0) {
-                    Ok(()) => info!("kernel driver detached for RTL2832U (usbip-safe open)"),
-                    Err(rusb::Error::NotFound) => {} // no kernel driver attached — fine
-                    Err(e) => warn!(error = %e, "detach_kernel_driver failed (continuing)"),
-                }
-                // handle dropped here: no claim_interface, no reattach — detach persists
-            }
-        }
-    }
-}
 
-#[cfg(not(target_os = "linux"))]
-fn detach_rtl_kernel_drivers() {}
 
 /// "[R82xx] PLL not locked!" records seen from rtl-sdr-rs (see `logging`).
 pub static PLL_LOCK_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Frequency of the most recent tune, for diagnostics that fire from a log hook.
 pub static CURRENT_TUNE_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Control-transfer stalls that were re-issued successfully / USB resets done
-/// while opening a device (see `stall`). Shown in /status.sdr_diagnostics.
-pub static TUNE_STALLS_RECOVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static OPEN_USB_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// True for the USB transport errors an RTL2832U produces when it stalls a
-/// control transfer (`Pipe`) or loses the transaction (`Io`).
-fn is_usb_stall(e: &anyhow::Error) -> bool {
-    use rtl_sdr_rs::error::RtlsdrError;
-    if let Some(r) = e.downcast_ref::<RtlsdrError>() {
-        return matches!(r, RtlsdrError::Usb(rusb::Error::Pipe) | RtlsdrError::Usb(rusb::Error::Io));
-    }
-    e.downcast_ref::<rusb::Error>()
-        .is_some_and(|u| matches!(u, rusb::Error::Pipe | rusb::Error::Io))
-}
-
-fn is_rtl_stall(e: &rtl_sdr_rs::error::RtlsdrError) -> bool {
-    matches!(
-        e,
-        rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Pipe)
-            | rtl_sdr_rs::error::RtlsdrError::Usb(rusb::Error::Io)
-    )
-}
+pub use dongle::{INIT_STALL_RESETS, TUNE_STALLS_RECOVERED};
 
 pub fn pll_lock_failures() -> u64 {
     PLL_LOCK_FAILS.load(std::sync::atomic::Ordering::Relaxed)
@@ -128,8 +75,7 @@ pub fn probe_open(index: u32) -> Result<String, OpenFailure> {
     if let Some((_, open)) = TEST_HW.lock().unwrap().as_ref() {
         return open.clone();
     }
-    detach_rtl_kernel_drivers();
-    let mut dev = RtlSdr::open_with_index(index as usize)
+    let mut dev = dongle::open_catching(index)
         .map_err(|e| driver_state::parse_open_error(&format!("{e}")))?;
     let tuner = dev.get_tuner_id().map(|t| t.to_string()).unwrap_or_else(|_| "unknown".to_string());
     let _ = dev.close();
@@ -262,30 +208,10 @@ impl SdrDevice {
             );
         }
         CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
-        // An RTL2832U can stall a control transfer now and then (librtlsdr just
-        // logs it and carries on). Re-issue the whole tune, repeater switching
-        // included, instead of failing the channel; only a stall that persists
-        // is handed to the recovery ladder.
-        let stalled = std::cell::Cell::new(0u32);
-        let device = &mut self.device;
-        let result = stall::retry_stalls(
-            stall::TUNE_STALL_RETRIES,
-            is_usb_stall,
-            std::thread::sleep,
-            |attempt| {
-                stalled.set(attempt);
-                tracing::debug!(freq_hz, attempt, "USB control stall while tuning; re-issuing the tune");
-            },
-            || {
-                device
-                    .set_center_freq(freq_hz as u32)
-                    .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
-            },
-        );
-        if result.is_ok() && stalled.get() > 0 {
-            TUNE_STALLS_RECOVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+        // Stall-tolerant tune (see `dongle`): re-issued on a USB control stall,
+        // and only a stall that persists is handed to the recovery ladder.
+        dongle::tune(&mut self.device, freq_hz as u32)
+            .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
     }
 
     #[allow(dead_code)]
@@ -408,41 +334,18 @@ impl SdrManager {
         gain: &GainSetting,
         freq_correction_ppm: i32,
     ) -> anyhow::Result<SdrDevice> {
-        // Linux/usbip: detach the kernel dvb_usb_rtl28xxu driver before opening, or
-        // rtl-sdr-rs's open() fails ("open device N"). No-op on Windows.
-        detach_rtl_kernel_drivers();
-        // Like librtlsdr: a device that stalls its very first control write is
-        // USB-reset and opened again, instead of staying wedged.
-        let mut device = stall::open_with_reset(
-            stall::OPEN_RESET_ATTEMPTS,
-            is_rtl_stall,
-            || {
-                OPEN_USB_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(index, "Device stalled while opening; resetting the USB device");
-                if let Err(e) = recovery::reset_usb_bus_device(index as usize) {
-                    warn!(index, error = %e, "USB reset before reopen failed");
-                }
+        // Open + full init under the stall ladder (reset, wait, redo; 5 tries).
+        let params = dongle::InitParams {
+            index,
+            sample_rate,
+            gain: match tuner_gain_from_setting(gain) {
+                TunerGain::Manual(t) => dongle::Gain::ManualTenthsDb(t),
+                _ => dongle::Gain::Auto,
             },
-            std::thread::sleep,
-            || RtlSdr::open_with_index(index as usize),
-        )
-        .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
-
-        device
-            .set_sample_rate(sample_rate)
-            .map_err(|e| anyhow::Error::new(e).context(format!("set_sample_rate({} Hz)", sample_rate)))?;
-
-        device
-            .set_freq_correction(freq_correction_ppm)
-            .map_err(|e| anyhow::Error::new(e).context(format!("set_freq_correction({} ppm)", freq_correction_ppm)))?;
-
-        device
-            .set_tuner_gain(tuner_gain_from_setting(gain))
-            .map_err(|e| anyhow::Error::new(e).context("set_tuner_gain"))?;
-
-        device
-            .reset_buffer()
-            .map_err(|e| anyhow::Error::new(e).context("reset_buffer"))?;
+            freq_correction_ppm,
+        };
+        let device = dongle::open_with_ladder(&params)
+            .map_err(|e| anyhow::Error::new(e).context(format!("open device {}", index)))?;
 
         // Generate serial: machine-scoped with fingerprint prefix for unique identification
         let serial = generate_sdr_serial(index);

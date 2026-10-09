@@ -13,8 +13,8 @@ use std::time::Duration;
 
 /// Re-issues of a stalled tune before the error is handed to the recovery ladder.
 pub const TUNE_STALL_RETRIES: u32 = 3;
-/// USB resets tried while opening a device that stalls its first control write.
-pub const OPEN_RESET_ATTEMPTS: u32 = 2;
+/// Full open+init attempts before the device is reported as errored.
+pub const INIT_ATTEMPTS: u32 = 5;
 
 /// Wait before re-issue number `attempt` (1-based): 20, 40, 60 ms.
 pub fn stall_backoff(attempt: u32) -> Duration {
@@ -45,24 +45,33 @@ pub fn retry_stalls<T, E>(
     }
 }
 
-/// Open a device the way librtlsdr does: if the open fails with a stall, reset
-/// the USB device and try again (at most `max_resets` times).
-pub fn open_with_reset<T, E>(
-    max_resets: u32,
+/// Wait after a failed init attempt number `attempt` (1-based): 0.5, 1, 2, 4, 8 s.
+pub fn init_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(500u64 << attempt.saturating_sub(1).min(5))
+}
+
+/// The WHOLE open+init sequence under the stall ladder: any stall (at open, at
+/// set_sample_rate, tuner init, gain, ...) closes the device (the caller's
+/// `init` owns and drops it), USB-resets, waits and redoes everything, at most
+/// `attempts` times in total. `on_stall(attempt)` is called for every retried
+/// stall; non-stall errors end the ladder at once.
+pub fn init_ladder<T, E>(
+    attempts: u32,
     is_stall: impl Fn(&E) -> bool,
     mut reset: impl FnMut(),
     mut sleep: impl FnMut(Duration),
-    mut open: impl FnMut() -> Result<T, E>,
+    mut on_stall: impl FnMut(u32),
+    mut init: impl FnMut() -> Result<T, E>,
 ) -> Result<T, E> {
-    let mut resets = 0;
+    let mut attempt = 0;
     loop {
-        match open() {
+        attempt += 1;
+        match init() {
             Ok(v) => return Ok(v),
-            Err(e) if resets < max_resets && is_stall(&e) => {
-                resets += 1;
+            Err(e) if attempt < attempts && is_stall(&e) => {
+                on_stall(attempt);
                 reset();
-                // The device re-enumerates after a reset.
-                sleep(Duration::from_millis(500));
+                sleep(init_backoff(attempt));
             }
             Err(e) => return Err(e),
         }
@@ -135,29 +144,44 @@ mod tests {
     }
 
     #[test]
-    fn open_resets_the_device_after_a_stall_and_reopens() {
-        let (opens, resets) = (Cell::new(0), Cell::new(0));
-        let r = open_with_reset(
-            OPEN_RESET_ATTEMPTS,
+    fn init_ladder_resets_waits_and_redoes_the_whole_init() {
+        let (inits, resets) = (Cell::new(0), Cell::new(0));
+        let slept = RefCell::new(Vec::new());
+        let r = init_ladder(
+            INIT_ATTEMPTS,
             is_stall,
             || resets.set(resets.get() + 1),
-            |d| assert_eq!(d, Duration::from_millis(500)),
+            |d| slept.borrow_mut().push(d),
+            |_| {},
             || {
-                opens.set(opens.get() + 1);
-                if opens.get() == 1 { Err(E::Stall) } else { Ok("open") }
+                inits.set(inits.get() + 1);
+                if inits.get() <= 2 { Err(E::Stall) } else { Ok("ready") }
             },
         );
-        assert_eq!(r, Ok("open"));
-        assert_eq!((opens.get(), resets.get()), (2, 1));
+        assert_eq!(r, Ok("ready"));
+        assert_eq!((inits.get(), resets.get()), (3, 2));
+        assert_eq!(*slept.borrow(), vec![Duration::from_millis(500), Duration::from_millis(1000)]);
     }
 
     #[test]
-    fn open_gives_up_after_the_reset_budget_and_never_resets_for_other_errors() {
-        let resets = Cell::new(0);
-        let r: Result<(), E> = open_with_reset(2, is_stall, || resets.set(resets.get() + 1), |_| {}, || Err(E::Stall));
-        assert_eq!((r, resets.get()), (Err(E::Stall), 2));
-        resets.set(0);
-        let r: Result<(), E> = open_with_reset(2, is_stall, || resets.set(resets.get() + 1), |_| {}, || Err(E::Other));
-        assert_eq!((r, resets.get()), (Err(E::Other), 0));
+    fn init_backoff_is_half_a_second_doubling_to_eight() {
+        let secs: Vec<f32> = (1..=5).map(|a| init_backoff(a).as_secs_f32()).collect();
+        assert_eq!(secs, vec![0.5, 1.0, 2.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn init_ladder_gives_up_after_five_attempts_and_ignores_other_errors() {
+        let (inits, resets) = (Cell::new(0), Cell::new(0));
+        let r: Result<(), E> = init_ladder(5, is_stall, || resets.set(resets.get() + 1), |_| {}, |_| {}, || {
+            inits.set(inits.get() + 1);
+            Err(E::Stall)
+        });
+        assert_eq!((r, inits.get(), resets.get()), (Err(E::Stall), 5, 4));
+        let (inits, resets) = (Cell::new(0), Cell::new(0));
+        let r: Result<(), E> = init_ladder(5, is_stall, || resets.set(resets.get() + 1), |_| {}, |_| {}, || {
+            inits.set(inits.get() + 1);
+            Err(E::Other)
+        });
+        assert_eq!((r, inits.get(), resets.get()), (Err(E::Other), 1, 0));
     }
 }
