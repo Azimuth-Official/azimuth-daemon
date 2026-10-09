@@ -148,6 +148,11 @@ pub fn cw_record(rng: &mut Rng, fs_n: f64, n: usize, tones: &[(f64, f64)]) -> Ve
 /// modulated (75 kHz peak deviation) by a random multi-tone "programme" plus a
 /// 19 kHz pilot. Offsets are relative to the tuner centre.
 pub fn fm_record(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)]) -> Vec<C32> {
+    fm_record_opts(rng, fs_n, n, stations, true)
+}
+
+/// As `fm_record`, optionally without the 19 kHz stereo pilot (a mono station).
+pub fn fm_record_opts(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)], pilot: bool) -> Vec<C32> {
     let mut rec = vec![C32::new(0.0, 0.0); n];
     for &(off, amp) in stations {
         let tones: Vec<(f64, f64, f64)> = (0..4).map(|_| (rng.range(200.0, 6000.0), rng.range(0.05, 0.25), rng.range(0.0, std::f64::consts::TAU))).collect();
@@ -156,7 +161,7 @@ pub fn fm_record(rng: &mut Rng, fs_n: f64, n: usize, stations: &[(f64, f64)]) ->
         let mut phase = rng.range(0.0, std::f64::consts::TAU);
         for (i, v) in rec.iter_mut().enumerate() {
             let t = i as f64 / fs_n;
-            let mut m = 0.1 * (2.0 * std::f64::consts::PI * 19_000.0 * t + pilot_phase).sin();
+            let mut m = if pilot { 0.1 * (2.0 * std::f64::consts::PI * 19_000.0 * t + pilot_phase).sin() } else { 0.0 };
             for (f, a, p) in &tones {
                 m += a * (2.0 * std::f64::consts::PI * f * t + p).sin();
             }

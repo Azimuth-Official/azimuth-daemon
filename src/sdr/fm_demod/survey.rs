@@ -54,11 +54,17 @@ pub struct SurveyConfig {
     /// both gates lowered by `hysteresis_db`, a new one needs the full gate.
     pub known: Vec<u64>,
     pub hysteresis_db: f64,
+    /// A NEW candidate below this excess is MARGINAL: its power barely clears the
+    /// noise, so the discriminator test alone is not trusted (clicks in noise can
+    /// pass it). It must also be corroborated: stereo pilot >= `marginal_min_pilot_db`
+    /// or a decodable RDS PI.
+    pub marginal_excess_db: f64,
+    pub marginal_min_pilot_db: f64,
 }
 
 impl Default for SurveyConfig {
     fn default() -> Self {
-        SurveyConfig { min_excess_db: 3.0, min_quality_db: 10.0, channel_step_hz: 200_000.0, known: Vec::new(), hysteresis_db: 2.0 }
+        SurveyConfig { min_excess_db: 3.0, min_quality_db: 10.0, channel_step_hz: 200_000.0, known: Vec::new(), hysteresis_db: 2.0, marginal_excess_db: 6.0, marginal_min_pilot_db: 10.0 }
     }
 }
 
@@ -78,6 +84,10 @@ pub struct FmChannel {
     pub spill_of_neighbour: bool,
     /// Mirror channel >20 dB stronger: needs `IMAGE_PRONE_MIN_EXCESS_DB` to be a station.
     pub image_prone: bool,
+    /// New candidate with excess below `marginal_excess_db`: needs corroboration.
+    pub marginal: bool,
+    /// For marginal candidates: pilot or RDS corroboration was present.
+    pub corroborated: bool,
     pub confirmed: bool,
 }
 
@@ -149,10 +159,13 @@ pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmCh
             let spill_votes = col.iter().filter(|c| c.image_of_mirror || c.spill_of_neighbour).count();
             let rejected = spill_votes * 2 > col.len();
             let prone = col.iter().filter(|c| c.image_prone).count() * 2 > col.len();
+            let marginal = relax == 0.0 && excess < cfg.marginal_excess_db;
+            let corroborated = col.iter().any(|c| c.pilot_db.is_some_and(|p| p >= cfg.marginal_min_pilot_db) || c.rds_pi.is_some());
             let confirmed = excess >= cfg.min_excess_db - relax
                 && quality >= cfg.min_quality_db - relax
                 && !rejected
-                && (!prone || excess >= IMAGE_PRONE_MIN_EXCESS_DB);
+                && (!prone || excess >= IMAGE_PRONE_MIN_EXCESS_DB)
+                && (!marginal || corroborated);
             FmChannel {
                 freq_hz: f,
                 power_dbfs: col[0].power_dbfs,
@@ -163,6 +176,8 @@ pub fn combine_captures(runs: &[Vec<FmChannel>], cfg: &SurveyConfig) -> Vec<FmCh
                 image_of_mirror: rejected && col.iter().filter(|c| c.image_of_mirror).count() * 2 > col.len(),
                 spill_of_neighbour: rejected && col.iter().filter(|c| c.spill_of_neighbour).count() * 2 > col.len(),
                 image_prone: prone,
+                marginal,
+                corroborated: marginal && corroborated,
                 confirmed,
             }
         })
@@ -305,6 +320,8 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             image_of_mirror: false,
             spill_of_neighbour: false,
             image_prone: false,
+            marginal: false,
+            corroborated: false,
             confirmed: false,
         };
         if off.abs() < 0.95e6 && excess_db >= gate_x {
@@ -379,12 +396,17 @@ pub fn evaluate_capture(iq_bytes: &[u8], sample_rate: u32, centre_hz: u64, chann
             }
             ch.spill_of_neighbour = spill;
             if ch.quality_db >= gate_q && !image && !spill && image_floor_ok {
-                ch.confirmed = true;
                 let pil = mean_of(band(18_900.0, 19_100.0));
                 let nb = (mean_of(band(17_000.0, 18_500.0)) + mean_of(band(19_500.0, 21_000.0))) / 2.0;
-                ch.pilot_db = Some(10.0 * (pil / nb.max(1e-30)).log10());
+                let pilot_db = 10.0 * (pil / nb.max(1e-30)).log10();
+                ch.pilot_db = Some(pilot_db);
                 // RDS PI is best effort: extract_rds takes audio at its own rate.
                 ch.rds_pi = extract_rds(&d_raw, fs_b as u32).map(|r| r.pi_code);
+                // Known stations keep their (hysteresis) gates; a NEW station whose
+                // power only just clears the noise must be corroborated.
+                ch.marginal = relax == 0.0 && excess_db < cfg.marginal_excess_db;
+                ch.corroborated = pilot_db >= cfg.marginal_min_pilot_db || ch.rds_pi.is_some();
+                ch.confirmed = !ch.marginal || ch.corroborated;
             }
         }
         out.push(ch);
@@ -678,7 +700,7 @@ mod tests {
     #[test]
     fn marginal_station_sets_are_stable_across_sweeps() {
         let total = 30.0;
-        let base = marginal_base([1.0, 2.5, 4.0], total);
+        let base = marginal_base([4.0, 6.0, 9.0], total);
         let mut known: Vec<u64> = Vec::new();
         let mut sets: Vec<Vec<usize>> = Vec::new();
         let chans: Vec<u64> = (0..8).map(|i| 98_000_000 - 700_000 + 200_000 * i as u64).collect();
@@ -712,7 +734,7 @@ mod tests {
     fn marginal_stability_without_memory_across_fresh_runs() {
         // "Fresh process" case: no hysteresis memory, only the extra-capture median.
         let total = 30.0;
-        let base = marginal_base([1.0, 2.5, 4.0], total);
+        let base = marginal_base([4.0, 6.0, 9.0], total);
         let mut sets = Vec::new();
         for sweep in 10..16u64 {
             let set = faded_sweep(sweep, &base, total, &SurveyConfig::default(), true);
@@ -740,5 +762,47 @@ mod tests {
             assert!(!s.contains(&2));
         }
         assert!(min_j >= 0.8, "min Jaccard {min_j}");
+    }
+
+    /// One station on ch2 of the 8-channel scene, mono or stereo, at an in-channel SNR.
+    fn lone_station(seed: u64, ch_snr_db: f64, pilot: bool) -> FmChannel {
+        let centre = 98_000_000u64;
+        let chans: Vec<u64> = (0..8).map(|i| centre - 700_000 + 200_000 * i as u64).collect();
+        let mut rng = Rng::new(seed);
+        let fs_n = 8_192_000.0;
+        let need = (CAPTURE_LEN as f64 * fs_n / FS_OUT).ceil() as usize + 1024 + 16;
+        let rec = fm_record_opts(&mut rng, fs_n, need, &[(chans[2] as f64 - centre as f64, 1.0)], pilot);
+        let iq = capture_from_record(&mut rng, &rec, fs_n, FrontEnd::standard(ch_snr_db - 10.1, 0.0));
+        let mut more = || None;
+        evaluate_adaptive(&iq, 2_048_000, centre, &chans, &SurveyConfig::default(), &mut more).remove(2)
+    }
+
+    #[test]
+    fn marginal_candidates_need_corroboration() {
+        // Barely above the noise and no pilot/RDS: the discriminator test alone must
+        // not put it in the station list (each station becomes an observation).
+        let mut reported = 0;
+        let mut marginal_seen = 0;
+        for seed in 0..20u64 {
+            let c = lone_station(300 + seed, -1.0, false);
+            reported += c.confirmed as usize;
+            marginal_seen += c.marginal as usize;
+        }
+        println!("mono station at -1 dB SNR (excess ~4.3 dB): reported {reported}/20 (marginal flagged {marginal_seen})");
+        assert_eq!(reported, 0);
+        assert_eq!(marginal_seen, 20, "must be flagged marginal");
+        // A clearly received mono station is reported without a pilot.
+        for seed in 0..20u64 {
+            let c = lone_station(400 + seed, 12.0, false);
+            assert!(c.confirmed && !c.marginal, "seed {seed}: {c:?}");
+        }
+        // A marginal station WITH a measurable pilot is corroborated.
+        let mut with_pilot = 0;
+        for seed in 0..20u64 {
+            let c = lone_station(500 + seed, 6.0, true);
+            with_pilot += (c.confirmed && c.pilot_db.unwrap_or(0.0) >= 10.0) as usize;
+        }
+        println!("stereo station at 6 dB SNR confirmed with pilot >= 10 dB: {with_pilot}/20");
+        assert!(with_pilot >= 18);
     }
 }
