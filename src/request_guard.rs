@@ -63,7 +63,7 @@ impl GuardPolicy {
     /// Is this `Host` header value this server?
     pub fn host_allowed(&self, host_header: &str) -> bool {
         let lower = host_header.trim().to_ascii_lowercase();
-        if self.extra_hosts.iter().any(|h| *h == lower) {
+        if self.extra_hosts.contains(&lower) {
             return true;
         }
         match split_host_port(&lower) {
