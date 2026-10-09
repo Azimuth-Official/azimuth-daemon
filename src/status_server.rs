@@ -1004,6 +1004,184 @@ fn test_sdr_device(index: u32) -> anyhow::Result<bool> {
     Ok(opened)
 }
 
+/// Exit code: the port is held by something that is not an Azimuth daemon.
+pub const EXIT_PORT_FOREIGN: i32 = 42;
+/// Exit code: the port is held by ANOTHER Azimuth daemon we could not (or must
+/// not) replace. Distinct from success so a stale sibling is never silently
+/// mistaken for "this daemon is running".
+pub const EXIT_PORT_SIBLING: i32 = 43;
+
+/// What a process holding our status port reports about itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiblingStatus {
+    pub has_node_id: bool,
+    pub daemon_pid: Option<u32>,
+    pub config_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingAction {
+    /// Our own earlier instance (same config): ask it to stop and take over.
+    TakeOver,
+    /// Another Azimuth daemon: leave it alone and exit 43.
+    ExitSibling,
+    /// Not an Azimuth daemon: exit 42.
+    ExitForeign,
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+pub fn decide_sibling(our_config_path: &str, sibling: Option<&SiblingStatus>) -> SiblingAction {
+    match sibling {
+        Some(s) if s.has_node_id => {
+            let same_config = s
+                .config_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty() && same_path(p, our_config_path));
+            // Only a daemon new enough to report its pid (and so to honour a
+            // stop request) can be taken over.
+            if same_config && s.daemon_pid.is_some() {
+                SiblingAction::TakeOver
+            } else {
+                SiblingAction::ExitSibling
+            }
+        }
+        _ => SiblingAction::ExitForeign,
+    }
+}
+
+async fn probe_sibling(bind_addr: &str) -> Option<SiblingStatus> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let v: serde_json::Value = client
+        .get(format!("http://{bind_addr}/status"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(SiblingStatus {
+        has_node_id: v.get("node_id").is_some(),
+        daemon_pid: v.get("daemon_pid").and_then(|p| p.as_u64()).map(|p| p as u32),
+        config_path: v.get("config_path").and_then(|p| p.as_str()).map(str::to_string),
+    })
+}
+
+/// Bind the status port, retrying briefly for TIME_WAIT or a just-exiting old
+/// instance. Err carries the process exit code to use.
+pub async fn bind_with_policy(
+    bind_addr: &str,
+    our_config_path: &str,
+    max_attempts: u32,
+    backoff: impl Fn(u32) -> std::time::Duration,
+) -> Result<tokio::net::TcpListener, i32> {
+    for attempt in 1..=max_attempts {
+        match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(l) => {
+                info!(addr = bind_addr, "Status server listening");
+                return Ok(l);
+            }
+            Err(e) if attempt < max_attempts => {
+                let wait = backoff(attempt);
+                tracing::warn!(
+                    error = %e, addr = bind_addr, attempt, backoff_ms = wait.as_millis() as u64,
+                    "Status server bind failed, retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, addr = bind_addr, "Status server bind failed after retries");
+            }
+        }
+    }
+
+    let sibling = probe_sibling(bind_addr).await;
+    match decide_sibling(our_config_path, sibling.as_ref()) {
+        SiblingAction::ExitForeign => {
+            tracing::error!(
+                addr = bind_addr,
+                "Port is held by a non-Azimuth process — exiting {EXIT_PORT_FOREIGN} for service restart"
+            );
+            Err(EXIT_PORT_FOREIGN)
+        }
+        SiblingAction::ExitSibling => {
+            let s = sibling.unwrap_or(SiblingStatus { has_node_id: true, daemon_pid: None, config_path: None });
+            tracing::error!(
+                addr = bind_addr, holder_pid = ?s.daemon_pid, holder_config = ?s.config_path,
+                "Another Azimuth daemon holds this port and was not replaced — exiting {EXIT_PORT_SIBLING}; \
+                 stop that daemon (or the AzimuthDaemon service) and start again"
+            );
+            Err(EXIT_PORT_SIBLING)
+        }
+        SiblingAction::TakeOver => {
+            tracing::warn!(addr = bind_addr, "A previous instance with this config holds the port — asking it to stop");
+            let stopped = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .ok();
+            if let Some(c) = stopped {
+                let _ = c.post(format!("http://{bind_addr}/shutdown")).send().await;
+            }
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if let Ok(l) = tokio::net::TcpListener::bind(bind_addr).await {
+                    info!(addr = bind_addr, "Took over the status port from the previous instance");
+                    return Ok(l);
+                }
+            }
+            tracing::error!(addr = bind_addr, "Previous instance did not release the port within 10 s");
+            Err(EXIT_PORT_SIBLING)
+        }
+    }
+}
+
+/// Browser origins allowed to ask the daemon to stop: the desktop webview and
+/// the daemon's own local dashboard. Any other web page is refused.
+pub fn origin_allowed(origin: &str) -> bool {
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) || origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("http://localhost")
+}
+
+/// POST /shutdown: graceful stop, loopback callers only.
+async fn stop_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"message": "loopback callers only"})),
+        );
+    }
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|o| o.to_str().ok()) {
+        if !origin_allowed(origin) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"message": "origin not allowed"})),
+            );
+        }
+    }
+    info!(peer = %peer, "Stop requested over HTTP");
+    state.stop_signal.notify_one();
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"message": "stopping", "daemon_pid": std::process::id()})),
+    )
+}
+
 pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
     let app = Router::new()
         .route("/", get(crate::dashboard::dashboard_handler))
@@ -1021,71 +1199,45 @@ pub async fn run_status_server(bind_addr: &str, state: Arc<AppState>) {
         .route("/serial/ports", get(serial_ports_handler))
         .route("/log/level", post(log_level_handler))
         .route("/log/path", get(log_path_handler))
+        .route("/shutdown", post(stop_handler))
         // The desktop app's webview calls this loopback-only server cross-origin
         // (tauri.localhost -> 127.0.0.1); without CORS every fetch is blocked.
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(Arc::clone(&state));
 
-    // Bind with retry: transient TIME_WAIT or a just-exiting old instance
-    // resolves within seconds. A daemon without its status server is invisible
-    // to the desktop app ("never fully loads"), so if the port stays taken we
-    // exit rather than run headless:
-    //   - a sibling Azimuth daemon already serves the port -> exit 0 (the app
-    //     talks to that one; NSSM AppExit for 0 is configured to Exit)
-    //   - anything else -> exit 42 (NSSM restarts us; sidecar exit is visible)
-    const MAX_BIND_ATTEMPTS: u32 = 10;
-    let mut listener = None;
-    for attempt in 1..=MAX_BIND_ATTEMPTS {
-        match tokio::net::TcpListener::bind(bind_addr).await {
-            Ok(l) => {
-                info!(addr = bind_addr, "Status server listening");
-                listener = Some(l);
-                break;
-            }
-            Err(e) if attempt < MAX_BIND_ATTEMPTS => {
-                let backoff_ms = std::cmp::min(100u64 * (1 << attempt), 5_000);
-                tracing::warn!(
-                    error = %e, addr = bind_addr, attempt, backoff_ms,
-                    "Status server bind failed, retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, addr = bind_addr, "Status server bind failed after retries");
-                let probe_url = format!("http://{bind_addr}/status");
-                let sibling = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()
-                    .ok();
-                let is_sibling = match sibling {
-                    Some(c) => match c.get(&probe_url).send().await {
-                        Ok(resp) => resp
-                            .json::<serde_json::Value>()
-                            .await
-                            .map(|v| v.get("node_id").is_some())
-                            .unwrap_or(false),
-                        Err(_) => false,
-                    },
-                    None => false,
-                };
-                if is_sibling {
-                    tracing::warn!(
-                        addr = bind_addr,
-                        "Another Azimuth daemon already serves this port — exiting (it stays in charge)"
-                    );
-                    std::process::exit(0);
-                }
-                tracing::error!(
-                    addr = bind_addr,
-                    "Port is held by a non-Azimuth process — exiting 42 for service restart"
-                );
-                std::process::exit(42);
-            }
+    // A daemon without its status server is invisible to the desktop app
+    // ("never fully loads"), so if the port stays taken we exit rather than
+    // run headless (see bind_with_policy for the exit codes).
+    let our_config = state.status.read().await.config_path_abs.clone();
+    let listener = match bind_with_policy(bind_addr, &our_config, 10, |attempt| {
+        std::time::Duration::from_millis(std::cmp::min(100u64 * (1 << attempt), 5_000))
+    })
+    .await
+    {
+        Ok(l) => l,
+        Err(code) => std::process::exit(code),
+    };
+    let stop = Arc::clone(&state.stop_signal);
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        stop.notified().await;
+        // Never wait forever on a stuck keep-alive connection.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            std::process::exit(0);
+        });
+    });
+    match served.await {
+        Ok(()) => {
+            info!("Status server stopped on request — exiting");
+            // Give the non-blocking log writer a moment to flush.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            std::process::exit(0);
         }
-    }
-    let listener = listener.expect("bind loop guarantees a listener or an exit");
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!(error = %e, "Status server error");
+        Err(e) => tracing::error!(error = %e, "Status server error"),
     }
 }
 
@@ -1488,5 +1640,112 @@ mod tests {
         let compact = serde_json::to_string(&s.to_info(true, false)).unwrap();
         assert!(compact.contains("\"config_error\":null"), "{compact}");
         assert!(compact.contains("\"config_state\":\"awaiting_setup\""), "{compact}");
+    }
+
+    // --- X3: sibling / stale daemon on the status port -----------------------
+
+    fn sib(pid: Option<u32>, cfg: Option<&str>) -> SiblingStatus {
+        SiblingStatus {
+            has_node_id: true,
+            daemon_pid: pid,
+            config_path: cfg.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn sibling_decision_matrix() {
+        let ours = "/home/u/config.toml";
+        assert_eq!(decide_sibling(ours, None), SiblingAction::ExitForeign);
+        let not_azimuth = SiblingStatus { has_node_id: false, daemon_pid: None, config_path: None };
+        assert_eq!(decide_sibling(ours, Some(&not_azimuth)), SiblingAction::ExitForeign);
+        assert_eq!(decide_sibling(ours, Some(&sib(Some(7), Some(ours)))), SiblingAction::TakeOver);
+        assert_eq!(
+            decide_sibling(ours, Some(&sib(Some(7), Some("/other/config.toml")))),
+            SiblingAction::ExitSibling
+        );
+        // v0.3.8 style sibling: no pid, no config path -> cannot be replaced.
+        assert_eq!(decide_sibling(ours, Some(&sib(None, None))), SiblingAction::ExitSibling);
+    }
+
+    #[test]
+    fn stop_origin_allowlist() {
+        assert!(origin_allowed("tauri://localhost"));
+        assert!(origin_allowed("http://tauri.localhost"));
+        assert!(origin_allowed("http://127.0.0.1:8420"));
+        assert!(!origin_allowed("https://evil.example"));
+        assert!(!origin_allowed("null"));
+    }
+
+    /// A fake daemon on an ephemeral port: serves /status and, when it is
+    /// asked to stop, releases the port.
+    async fn fake_daemon(status: serde_json::Value) -> String {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let app = Router::new()
+            .route("/status", get(move || {
+                let v = status.clone();
+                async move { Json(v) }
+            }))
+            .route("/shutdown", post(move || {
+                let tx = Arc::clone(&tx);
+                async move {
+                    if let Some(t) = tx.lock().unwrap().take() {
+                        let _ = t.send(());
+                    }
+                    StatusCode::ACCEPTED
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .ok();
+        });
+        addr
+    }
+
+    fn quick(_: u32) -> std::time::Duration {
+        std::time::Duration::from_millis(5)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn port_held_by_a_non_azimuth_process_exits_42() {
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap().to_string();
+        let err = bind_with_policy(&addr, "/c.toml", 2, quick).await.unwrap_err();
+        assert_eq!(err, EXIT_PORT_FOREIGN);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn port_held_by_another_azimuth_daemon_exits_43_not_0() {
+        let addr = fake_daemon(serde_json::json!({
+            "node_id": "n", "daemon_pid": 99, "config_path": "/other/config.toml"
+        }))
+        .await;
+        let err = bind_with_policy(&addr, "/c.toml", 2, quick).await.unwrap_err();
+        assert_eq!(err, EXIT_PORT_SIBLING);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn old_sibling_without_pid_exits_43() {
+        let addr = fake_daemon(serde_json::json!({"node_id": "n"})).await;
+        let err = bind_with_policy(&addr, "/c.toml", 2, quick).await.unwrap_err();
+        assert_eq!(err, EXIT_PORT_SIBLING);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn own_stale_instance_is_stopped_and_the_port_taken_over() {
+        let addr = fake_daemon(serde_json::json!({
+            "node_id": "n", "daemon_pid": 99, "config_path": "/c.toml"
+        }))
+        .await;
+        let listener = bind_with_policy(&addr, "/c.toml", 2, quick)
+            .await
+            .expect("same-config sibling must be replaced");
+        assert_eq!(listener.local_addr().unwrap().to_string(), addr);
     }
 }

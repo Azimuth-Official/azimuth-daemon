@@ -70,10 +70,18 @@ Section "Azimuth Daemon" SecDaemon
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppStderr "$INSTDIR\logs\daemon-error.log"'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppRotateFiles 1'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppRotateBytes 10485760'
-    ; Exit-code policy: 0 = daemon yielded to a sibling instance on the status
-    ; port (do NOT restart, or the pair flaps forever); anything else restarts.
+    ; Exit-code policy: 0 = stopped on request; 43 = another Azimuth daemon holds
+    ; the status port (do NOT restart, or the pair flaps forever); anything else
+    ; restarts.
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppExit Default Restart'
     nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppExit 0 Exit'
+    nsExec::ExecToLog '"$INSTDIR\nssm.exe" set AzimuthDaemon AppExit 43 Exit'
+
+    ; Bind WinUSB to Interface 0 of any RTL-SDR already attached. The installer
+    ; is elevated, so no extra prompt. Non-fatal: the app offers "Install SDR
+    ; driver" later if this finds no device or fails.
+    nsExec::ExecToLog '"$INSTDIR\azimuth-daemon.exe" --install-driver'
+    Pop $1
 
     ; Start Menu shortcuts
     CreateDirectory "$SMPROGRAMS\Azimuth"
