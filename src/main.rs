@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use api_client::ApiClient;
 use config::Config;
-use observation::{Observation, SubmitObservationsRequest};
+use observation::{category_for_signal_type, Observation, SubmitObservationsRequest};
 use sdr::SdrManager;
 use sdr::scanner::Scanner;
 use status_server::{AppState, RecentSignal, StatusState, run_status_server};
@@ -33,18 +33,6 @@ use status_server::{AppState, RecentSignal, StatusState, run_status_server};
 const NODE_NOT_REGISTERED_MSG: &str = "Node not registered — heartbeats suppressed, this node will \
      not appear on the dashboard. Set a valid api.key (from the azimuth.day dashboard) and restart, \
      or wait for the background registration retry.";
-
-fn category_for_signal_type(signal_type: &str) -> &str {
-    if signal_type.starts_with("lte_") {
-        "lte"
-    } else if signal_type.starts_with("fm_") {
-        "fm"
-    } else if signal_type.starts_with("dtv_") {
-        "dtv"
-    } else {
-        "other"
-    }
-}
 
 fn update_status_from_observations(state: &mut StatusState, observations: &[Observation]) {
     let count = observations.len() as u64;

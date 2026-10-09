@@ -32,3 +32,17 @@ pub struct SubmitObservationsRequest {
 pub struct SubmitObservationsResponse {
     pub accepted: u32,
 }
+
+/// Maps a full signal type (`fm_rds`, `lte_pss`, `dtv_atsc`, `dtv_dvbt`, ...) to its
+/// scoring category. Bare category names pass through unchanged.
+pub fn category_for_signal_type(signal_type: &str) -> &str {
+    if signal_type == "lte" || signal_type.starts_with("lte_") {
+        "lte"
+    } else if signal_type == "fm" || signal_type.starts_with("fm_") {
+        "fm"
+    } else if signal_type == "dtv" || signal_type.starts_with("dtv_") {
+        "dtv"
+    } else {
+        "other"
+    }
+}

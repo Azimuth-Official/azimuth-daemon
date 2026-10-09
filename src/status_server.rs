@@ -145,7 +145,7 @@ fn estimate_sdr_multiplier(recent_signals: &[RecentSignal], device_count: usize)
     let mut by_type: std::collections::HashMap<&str, Vec<u64>> = std::collections::HashMap::new();
     for signal in recent_signals {
         by_type
-            .entry(signal.signal_type.as_str())
+            .entry(crate::observation::category_for_signal_type(&signal.signal_type))
             .or_default()
             .push(signal.frequency_hz);
     }
