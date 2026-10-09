@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::observation::{
-    RejectedObservation, SubmitObservationsRequest, SubmitObservationsResponse, SubmitOutcome,
+    RejectedBody, RejectedObservation, SubmitObservationsRequest, SubmitObservationsResponse,
+    SubmitOutcome,
 };
 
 /// Non-2xx API response with the status code preserved so callers can react
@@ -215,13 +216,22 @@ impl ApiClient {
 
         let data: SubmitObservationsResponse = resp.json().await?;
         debug!(accepted = data.accepted, "Observations submitted");
-        Ok(SubmitOutcome { accepted: data.accepted, rejected: Vec::new() })
+        Ok(SubmitOutcome { accepted: data.accepted, rejected: data.rejected })
     }
 }
 
 /// Per-item rejections carried by an all-invalid 400 response body.
-pub fn rejected_from_error(_err: &anyhow::Error) -> Vec<RejectedObservation> {
-    Vec::new()
+pub fn rejected_from_error(err: &anyhow::Error) -> Vec<RejectedObservation> {
+    let Some(e) = err.downcast_ref::<HttpStatusError>() else {
+        return Vec::new();
+    };
+    // The body is "Observation submit failed: <json>"; find the JSON object.
+    let Some(start) = e.body.find('{') else {
+        return Vec::new();
+    };
+    serde_json::from_str::<RejectedBody>(&e.body[start..])
+        .map(|b| b.rejected)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

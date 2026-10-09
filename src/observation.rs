@@ -31,6 +31,16 @@ pub struct SubmitObservationsRequest {
 #[derive(Debug, Deserialize)]
 pub struct SubmitObservationsResponse {
     pub accepted: u32,
+    /// Absent on servers that predate per-item validation.
+    #[serde(default)]
+    pub rejected: Vec<RejectedObservation>,
+}
+
+/// Body of an all-invalid 400: only the per-item list matters to us.
+#[derive(Debug, Deserialize)]
+pub struct RejectedBody {
+    #[serde(default)]
+    pub rejected: Vec<RejectedObservation>,
 }
 
 /// One item the server refused inside an otherwise accepted batch.
