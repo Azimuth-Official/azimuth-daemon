@@ -1,151 +1,171 @@
-//! WinUSB driver detection and auto-installation for RTL2832U devices.
+//! Windows driver detection and the elevated install mode for RTL2832U devices.
 //!
-//! Detection uses libwdi (via wdi-rs) to enumerate USB devices and check if the
-//! RTL2832U has a working driver. Installation uses libwdi's driver preparation
-//! and install flow — the same approach used by Zadig — which handles self-signed
-//! certificate creation, catalog signing, and driver package installation.
+//! Detection reads the driver bound to Interface 0 (MI_00) through libwdi.
+//! Installation happens ONLY in `azimuth-daemon --install-driver`, which the
+//! desktop app launches elevated (UAC) and the installer runs while it is
+//! already elevated. The normal, unelevated sidecar never installs anything:
+//! it reports `driver_missing` / `wrong_driver` and lets the app ask for admin
+//! approval.
+//!
+//! libwdi's `wdi_prepare_driver` generates a self-signed certificate and
+//! catalog for the WinUSB package, and `wdi_install_driver` adds that
+//! certificate to the machine's trusted publishers: documented in the release
+//! notes.
 
-use serde::Serialize;
-use tracing::{error, info, warn};
-use wdi_rs::{create_list, CreateListOptions, DriverInstaller, DriverType};
+use std::time::{Duration, Instant};
 
-const RTL2832U_VID: u16 = 0x0BDA;
-const RTL2832U_PID_V4: u16 = 0x2832; // RTL2832U V4
-const RTL2832U_PID_V3: u16 = 0x2838; // RTL2832U V3
+use tracing::{info, warn};
+use wdi_rs::{
+    create_list, install_driver, prepare_driver, CreateListOptions, Device, DriverType,
+    InstallDriverOptions, PrepareDriverOptions,
+};
 
-/// Helper to check if a PID is a valid RTL2832U variant.
-fn is_valid_rtl2832u_pid(pid: u16) -> bool {
-    matches!(pid, RTL2832U_PID_V4 | RTL2832U_PID_V3)
+use super::driver_state::{
+    classify_nodes, is_known_device, DriverInfo, DriverStateKind, InstallDeviceReport,
+    InstallResult, UsbNode,
+};
+
+fn list_devices() -> Result<Vec<Device>, String> {
+    create_list(CreateListOptions { list_all: true, list_hubs: false, trim_whitespaces: true })
+        .map(|l| l.iter().collect())
+        .map_err(|e| format!("{e:?}"))
 }
 
-/// Helper to get a product name for a valid RTL2832U PID.
-fn get_rtl2832u_product_name(pid: u16) -> &'static str {
-    match pid {
-        RTL2832U_PID_V4 => "RTL2832U V4",
-        RTL2832U_PID_V3 => "RTL2832U V3",
-        _ => "Unknown RTL2832U variant",
-    }
+fn to_nodes(devices: &[Device]) -> Vec<UsbNode> {
+    devices
+        .iter()
+        .filter(|d| is_known_device(d.vid, d.pid))
+        .map(|d| UsbNode {
+            vid: d.vid,
+            pid: d.pid,
+            mi: if d.is_composite { Some(d.mi) } else { None },
+            is_composite: d.is_composite,
+            driver: d.driver.clone(),
+        })
+        .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DriverStatus {
-    Installed,
-    NeedsInstall,
-    DeviceNotFound,
-    CheckFailed(String),
-}
-
-impl std::fmt::Display for DriverStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Installed => write!(f, "installed"),
-            Self::NeedsInstall => write!(f, "needs_install"),
-            Self::DeviceNotFound => write!(f, "not_found"),
-            Self::CheckFailed(e) => write!(f, "check_failed: {e}"),
-        }
-    }
-}
-
-/// Check whether the RTL2832U is present and has a working driver.
-pub fn check_driver_status() -> DriverStatus {
-    let devices = match create_list(CreateListOptions {
-        list_all: true,
-        list_hubs: false,
-        trim_whitespaces: true,
-    }) {
-        Ok(list) => list,
+/// Current state of Interface 0 of every attached supported RTL2832U.
+pub fn query_driver_info() -> DriverInfo {
+    match list_devices() {
+        Ok(devices) => classify_nodes(&to_nodes(&devices)),
         Err(e) => {
-            warn!(error = ?e, "libwdi device enumeration failed");
-            return DriverStatus::CheckFailed(format!("{e:?}"));
+            warn!(error = %e, "libwdi device enumeration failed");
+            DriverInfo::new(DriverStateKind::CheckFailed, format!("Device enumeration failed: {e}"))
         }
+    }
+}
+
+/// True when the process token is an administrator's (elevated).
+pub fn is_elevated() -> bool {
+    // SAFETY: IsUserAnAdmin has no preconditions.
+    unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
+}
+
+/// Interface-0 nodes of every attached supported device (optionally narrowed
+/// to one VID:PID) that still need WinUSB.
+fn targets(devices: &[Device], vid: Option<u16>, pid: Option<u16>, interface: u8) -> Vec<Device> {
+    devices
+        .iter()
+        .filter(|d| is_known_device(d.vid, d.pid))
+        .filter(|d| vid.is_none_or(|v| d.vid == v) && pid.is_none_or(|p| d.pid == p))
+        .filter(|d| if d.is_composite { d.mi == interface } else { true })
+        .cloned()
+        .collect()
+}
+
+fn bound_is_usable(d: &Device) -> bool {
+    d.driver
+        .as_deref()
+        .map(super::driver_state::bound_driver_name)
+        .is_some_and(|(_, usable)| usable)
+}
+
+fn work_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("azimuth-wdi-{}", std::process::id()))
+}
+
+/// Bind WinUSB to the given interface of one device, replacing whatever
+/// driver is there. Needs elevation.
+fn install_one(device: &Device) -> Result<(), String> {
+    let dir = work_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let dir_s = dir.to_string_lossy().to_string();
+    let inf = format!("rtl2832u_if{}.inf", device.mi);
+    let prep = PrepareDriverOptions { driver_type: DriverType::WinUsb, ..Default::default() };
+    let result = prepare_driver(device, &dir_s, &inf, &prep)
+        .and_then(|()| install_driver(device, &dir_s, &inf, &InstallDriverOptions::default()))
+        .map_err(|e| format!("{e:?}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// `--install-driver`: returns the overall result and a per-device report.
+pub fn install_cli(
+    vid: Option<u16>,
+    pid: Option<u16>,
+    interface: u8,
+) -> (InstallResult, Vec<InstallDeviceReport>) {
+    let devices = match list_devices() {
+        Ok(d) => d,
+        Err(e) => return (InstallResult::Other(format!("device enumeration failed: {e}")), vec![]),
     };
+    let wanted = targets(&devices, vid, pid, interface);
+    if wanted.is_empty() {
+        return (InstallResult::NoDevice, vec![]);
+    }
+    let pending: Vec<&Device> = wanted.iter().filter(|d| !bound_is_usable(d)).collect();
+    let before_info = classify_nodes(&to_nodes(&devices));
+    if pending.is_empty() {
+        let reports = wanted
+            .iter()
+            .map(|d| InstallDeviceReport::new(d.vid, d.pid, interface, &before_info, &before_info))
+            .collect();
+        return (InstallResult::AlreadyOk, reports);
+    }
+    if !is_elevated() {
+        return (InstallResult::NeedsElevation, vec![]);
+    }
 
-    // Try both PID V4 and V3 in order (prefer V4)
-    for pid in &[RTL2832U_PID_V4, RTL2832U_PID_V3] {
-        let matches = devices.from_vid_pid(RTL2832U_VID, *pid);
-        if let Some(dev) = matches.first() {
-            let product_name = if *pid == RTL2832U_PID_V3 { "V3" } else { "V4" };
-            if let Some(ref driver) = dev.driver {
-                info!(driver, pid = ?pid, product = product_name, "RTL2832U has driver installed");
-                return DriverStatus::Installed;
-            } else {
-                info!(desc = ?dev.desc, pid = ?pid, product = product_name, "RTL2832U found without driver");
-                return DriverStatus::NeedsInstall;
+    let mut first_error: Option<String> = None;
+    for d in &pending {
+        info!(vid = d.vid, pid = d.pid, mi = d.mi, "Binding WinUSB");
+        if let Err(e) = install_one(d) {
+            warn!(error = %e, "WinUSB install failed for a device");
+            if e.contains("NeedsAdmin") || e.contains("Access") {
+                return (InstallResult::NeedsElevation, vec![]);
             }
+            first_error.get_or_insert(e);
         }
     }
 
-    info!("No RTL2832U device found (VID_{RTL2832U_VID:04X} PID_{{0x{:04X} or 0x{:04X}}})", RTL2832U_PID_V4, RTL2832U_PID_V3);
-    DriverStatus::DeviceNotFound
-}
-
-/// Check driver status and install WinUSB if needed.
-/// Returns final status after any installation attempt.
-pub fn ensure_driver() -> DriverStatus {
-    let status = check_driver_status();
-    if status != DriverStatus::NeedsInstall {
-        return status;
-    }
-
-    info!("Attempting WinUSB driver installation for RTL2832U via libwdi");
-
-    // Try both PID V4 and V3 in order (prefer V4)
-    for (pid, product_name) in &[(RTL2832U_PID_V4, "V4"), (RTL2832U_PID_V3, "V3")] {
-        match DriverInstaller::for_device(RTL2832U_VID, *pid)
-            .with_driver_type(DriverType::WinUsb)
-            .install()
-        {
-            Ok(dev) => {
-                info!(desc = ?dev.desc, pid = ?pid, product = product_name, "WinUSB driver installed successfully");
-                return DriverStatus::Installed;
-            }
-            Err(e) => {
-                warn!(pid = ?pid, product = product_name, error = ?e, "WinUSB driver installation failed for this PID, trying next");
-            }
+    // Re-enumeration: the new binding appears a few seconds later.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut after = devices.clone();
+    loop {
+        if let Ok(now) = list_devices() {
+            after = now;
         }
+        let done = targets(&after, vid, pid, interface).iter().all(bound_is_usable);
+        if done || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
-
-    error!("WinUSB driver installation failed for all RTL2832U variants");
-    DriverStatus::CheckFailed("install failed for all PID variants".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_valid_rtl2832u_pid_v4() {
-        assert!(is_valid_rtl2832u_pid(RTL2832U_PID_V4));
-    }
-
-    #[test]
-    fn test_is_valid_rtl2832u_pid_v3() {
-        assert!(is_valid_rtl2832u_pid(RTL2832U_PID_V3));
-    }
-
-    #[test]
-    fn test_is_valid_rtl2832u_pid_invalid() {
-        assert!(!is_valid_rtl2832u_pid(0x1234));
-        assert!(!is_valid_rtl2832u_pid(0x0000));
-        assert!(!is_valid_rtl2832u_pid(0xFFFF));
-    }
-
-    #[test]
-    fn test_get_rtl2832u_product_name_v4() {
-        assert_eq!(get_rtl2832u_product_name(RTL2832U_PID_V4), "RTL2832U V4");
-    }
-
-    #[test]
-    fn test_get_rtl2832u_product_name_v3() {
-        assert_eq!(get_rtl2832u_product_name(RTL2832U_PID_V3), "RTL2832U V3");
-    }
-
-    #[test]
-    fn test_get_rtl2832u_product_name_invalid() {
-        assert_eq!(
-            get_rtl2832u_product_name(0x1234),
-            "Unknown RTL2832U variant"
-        );
+    let after_info = classify_nodes(&to_nodes(&after));
+    let reports: Vec<InstallDeviceReport> = pending
+        .iter()
+        .map(|d| InstallDeviceReport::new(d.vid, d.pid, interface, &before_info, &after_info))
+        .collect();
+    let all_ok = targets(&after, vid, pid, interface).iter().all(bound_is_usable);
+    if all_ok {
+        (InstallResult::Ok, reports)
+    } else {
+        (
+            InstallResult::InstallFailed(
+                first_error.unwrap_or_else(|| "the device did not re-enumerate with WinUSB".to_string()),
+            ),
+            reports,
+        )
     }
 }

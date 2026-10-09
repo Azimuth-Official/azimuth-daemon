@@ -186,6 +186,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wdi-rs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

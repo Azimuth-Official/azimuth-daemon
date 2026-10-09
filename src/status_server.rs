@@ -18,13 +18,11 @@ use tracing::{info, warn};
 use crate::config::{Config, ConfigProblem, NtripConfig};
 use crate::node_runtime::{self, ApplyMsg, ConfigState, Registrar, SdrParams};
 use crate::rtk::{self, PersistedRtkConfig};
+use crate::sdr::driver_state::{self, DriverInfo, DriverStateKind, SdrTestState};
 use crate::sdr::SdrManager;
 use crate::gps::AccuracyPoint;
 use std::collections::VecDeque;
 
-const RTL_SDR_VID: u16 = 0x0BDA;
-const RTL_SDR_PID_V4: u16 = 0x2832; // RTL2832U V4
-const RTL_SDR_PID_V3: u16 = 0x2838; // RTL2832U V3
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalBreakdown {
@@ -93,6 +91,17 @@ pub struct StatusInfo {
     pub region_source: String,
     pub on_air: bool,
     pub on_air_reason: Option<String>,
+    /// State of Interface 0 of the attached RTL2832U (refreshed on re-detect).
+    pub driver: DriverInfo,
+    pub sdr_test_last: Option<serde_json::Value>,
+    pub sdr_diagnostics: SdrDiagnostics,
+}
+
+/// Counters that help support triage SDR problems.
+#[derive(Debug, Clone, Serialize)]
+pub struct SdrDiagnostics {
+    /// "[R82xx] PLL not locked!" records seen from the tuner driver.
+    pub pll_lock_failures: u64,
 }
 
 pub struct StatusState {
@@ -142,6 +151,10 @@ pub struct StatusState {
     pub last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Location the node currently runs with (updated by POST /config/write).
     pub live_location: (f64, f64, f64),
+    pub driver: DriverInfo,
+    pub sdr_test_last: Option<serde_json::Value>,
+    /// When the observation loop last completed a cycle with an open device.
+    pub sdr_last_capture_ok_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A node is "on air" when it is registered, has an open SDR and the server
@@ -249,7 +262,16 @@ impl StatusState {
             region_source: "default".to_string(),
             last_accepted_at: None,
             live_location: (0.0, 0.0, 0.0),
+            driver: DriverInfo::not_applicable(),
+            sdr_test_last: None,
+            sdr_last_capture_ok_at: None,
         }
+    }
+
+    /// Record the driver state and keep the legacy `driver_status` in step.
+    pub fn set_driver(&mut self, info: DriverInfo) {
+        self.driver_status = info.legacy_status();
+        self.driver = info;
     }
 
     /// (on_air, reason). Reason codes are checked in priority order.
@@ -315,6 +337,11 @@ impl StatusState {
             region_source: self.region_source.clone(),
             on_air: self.on_air().0,
             on_air_reason: self.on_air().1,
+            driver: self.driver.clone(),
+            sdr_test_last: self.sdr_test_last.clone(),
+            sdr_diagnostics: SdrDiagnostics {
+                pll_lock_failures: crate::sdr::pll_lock_failures(),
+            },
         }
     }
 }
@@ -339,6 +366,9 @@ pub struct AppState {
     pub gps_cfg_tx: tokio::sync::watch::Sender<crate::config::GpsConfig>,
     /// Deferred node registration, kicked by a config write.
     pub registrar: Arc<Registrar>,
+    /// The SDR devices, shared with the observation loop so `/sdr/test` can
+    /// test through the handle the scanner already holds.
+    pub sdr: Arc<std::sync::Mutex<SdrManager>>,
     /// Notified when an authorised local caller asks the daemon to stop.
     pub stop_signal: Arc<tokio::sync::Notify>,
 }
@@ -352,6 +382,11 @@ struct SdrListEntry {
     serial: Option<String>,
     bus: u8,
     address: u8,
+    /// Interface 0 driver state (same value as `/status.driver.state`).
+    driver_state: DriverStateKind,
+    bound_driver: Option<String>,
+    /// Tuner chip, known only for a device the daemon holds open.
+    tuner: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -359,10 +394,18 @@ struct SdrTestRequest {
     index: u32,
 }
 
+/// `/sdr/test` response (C5). `opened` is the legacy boolean older desktop
+/// builds still read.
 #[derive(Debug, Clone, Serialize)]
 struct SdrTestResponse {
     index: u32,
     opened: bool,
+    state: SdrTestState,
+    detail: String,
+    tuner: Option<String>,
+    holders: Vec<String>,
+    vid: Option<String>,
+    pid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,8 +420,12 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusInfo> 
     Json(s.to_info(scanning_enabled, scanner_active))
 }
 
-async fn sdr_list_handler(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let entries = tokio::task::block_in_place(enumerate_sdr_devices);
+async fn sdr_list_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sdr = Arc::clone(&state.sdr);
+    let entries = tokio::task::spawn_blocking(move || enumerate_sdr_devices(&sdr))
+        .await
+        .map_err(|e| anyhow::anyhow!("enumeration task failed: {e}"))
+        .and_then(|r| r);
     match entries {
         Ok(list) => Ok(Json(list)),
         Err(e) => {
@@ -393,38 +440,143 @@ async fn sdr_list_handler(State(_state): State<Arc<AppState>>) -> impl IntoRespo
     }
 }
 
+/// How long `/sdr/test` waits for the scanner to release the device lock.
+const SDR_TEST_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn lock_with_timeout(
+    m: &std::sync::Mutex<SdrManager>,
+    wait: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'_, SdrManager>> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// What the scanner's own bookkeeping says, used only when the device lock
+/// cannot be obtained because a sweep is running.
+struct ScannerFacts {
+    scanner_active: bool,
+    sdr_connected: bool,
+}
+
+/// A REAL test of device `index`.
+///   - scanner idle or device lock free: test through the handle the scanner
+///     already holds (tuner name + a live read), or open the device fresh when
+///     none is held;
+///   - lock busy for the whole wait: a sweep is in progress, so this daemon itself
+///     holds the device and is streaming from it (`ok`, with that detail);
+///     if no sweep is active the timeout is reported as a USB error.
+fn run_sdr_test(
+    sdr: &std::sync::Mutex<SdrManager>,
+    index: u32,
+    facts: ScannerFacts,
+    lock_wait: std::time::Duration,
+) -> (driver_state::SdrTestVerdict, DriverInfo) {
+    let driver = crate::sdr::current_driver_info();
+    let access_means_in_use = cfg!(windows);
+    let Some(mut guard) = lock_with_timeout(sdr, lock_wait) else {
+        let streaming = facts.scanner_active && facts.sdr_connected;
+        let verdict = if streaming {
+            driver_state::SdrTestVerdict {
+                state: SdrTestState::Ok,
+                detail: "The scanner is using the RTL-SDR right now (a sweep is in progress).".to_string(),
+                tuner: None,
+            }
+        } else {
+            driver_state::SdrTestVerdict {
+                state: SdrTestState::UsbError,
+                detail: "usb_error: the device did not become available within 10 s".to_string(),
+                tuner: None,
+            }
+        };
+        return (verdict, driver);
+    };
+
+    // Through the scanner's own handle.
+    if let Some(dev) = guard.device_mut(index as usize) {
+        let tuner = dev.tuner_id().unwrap_or_else(|| "unknown".to_string());
+        let verdict = if dev.live_check() {
+            driver_state::SdrTestVerdict {
+                state: SdrTestState::Ok,
+                detail: format!("The RTL-SDR is open and streaming (tuner {tuner})."),
+                tuner: Some(tuner),
+            }
+        } else {
+            driver_state::SdrTestVerdict {
+                state: SdrTestState::UsbError,
+                detail: "usb_error: the open device returned no samples".to_string(),
+                tuner: Some(tuner),
+            }
+        };
+        return (verdict, driver);
+    }
+
+    // Nothing held: a fresh open attempt (the lock stays held so the
+    // observation loop cannot race us for the device).
+    let open = if matches!(driver.state, DriverStateKind::NotFound) {
+        Err(driver_state::OpenFailure::NotFound)
+    } else {
+        crate::sdr::probe_open(index)
+    };
+    let verdict = driver_state::classify_test(&driver, open, access_means_in_use);
+    (verdict, driver)
+}
+
 async fn sdr_test_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SdrTestRequest>,
 ) -> impl IntoResponse {
-    // When the scanner holds the device handle, opening a second WinUSB handle
-    // fails with "Access denied". Use the scanner's cached connection state instead.
-    if state.scanning_enabled.load(Ordering::Relaxed) {
+    let facts = {
         let s = state.status.read().await;
-        let connected = s.sdr_connected && s.device_count > req.index as usize;
-        return Ok((StatusCode::OK, Json(SdrTestResponse {
-            index: req.index,
-            opened: connected,
-        })));
-    }
-
-    // Scanner not enabled — safe to open a test handle (no contention).
-    let result = tokio::task::block_in_place(move || test_sdr_device(req.index));
-    match result {
-        Ok(opened) => Ok((StatusCode::OK, Json(SdrTestResponse {
-            index: req.index,
-            opened,
-        }))),
-        Err(e) => {
-            warn!(index = req.index, error = %e, "SDR test failed");
-            Err((
-                StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!("SDR test failed: {}", e),
-                }),
-            ))
+        ScannerFacts {
+            scanner_active: state.scanner_active.load(Ordering::Relaxed),
+            sdr_connected: s.sdr_connected,
         }
+    };
+    let sdr = Arc::clone(&state.sdr);
+    let index = req.index;
+    let joined = tokio::task::spawn_blocking(move || run_sdr_test(&sdr, index, facts, SDR_TEST_LOCK_WAIT)).await;
+    let (verdict, driver) = match joined {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(index, error = %e, "SDR test task failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MessageResponse { message: format!("SDR test failed: {e}") }),
+            ));
+        }
+    };
+    let holders = if verdict.state == SdrTestState::InUse {
+        tokio::task::spawn_blocking(crate::sdr::holders::likely_holders).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let response = SdrTestResponse {
+        index,
+        opened: verdict.state == SdrTestState::Ok,
+        state: verdict.state,
+        detail: verdict.detail,
+        tuner: verdict.tuner,
+        holders,
+        vid: driver.vid.clone(),
+        pid: driver.pid.clone(),
+    };
+    {
+        let mut s = state.status.write().await;
+        s.set_driver(driver);
+        s.sdr_test_last = serde_json::to_value(&response).ok();
     }
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[derive(Debug, Serialize)]
@@ -964,44 +1116,40 @@ async fn scanner_stop_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     })
 }
 
-fn enumerate_sdr_devices() -> anyhow::Result<Vec<SdrListEntry>> {
+fn enumerate_sdr_devices(sdr: &std::sync::Mutex<SdrManager>) -> anyhow::Result<Vec<SdrListEntry>> {
+    let driver = crate::sdr::current_driver_info();
+    // Tuner names are known only for devices the daemon already holds open;
+    // do not block on a running sweep for them.
+    let tuners: Vec<Option<String>> = match sdr.try_lock() {
+        Ok(mut g) => (0..g.device_count()).map(|i| g.device_mut(i).and_then(|d| d.tuner_id())).collect(),
+        Err(_) => Vec::new(),
+    };
     let mut entries = Vec::new();
     let mut index = 0usize;
     for device in rusb::devices()?.iter() {
         let desc = device.device_descriptor()?;
-        if desc.vendor_id() == RTL_SDR_VID {
-            let product_name = match desc.product_id() {
-                RTL_SDR_PID_V4 => "RTL2832U V4".to_string(),
-                RTL_SDR_PID_V3 => "RTL2832U V3".to_string(),
-                _ => continue, // Skip non-matching PIDs
-            };
-            let serial = device
-                .open()
-                .ok()
-                .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
-            entries.push(SdrListEntry {
-                index,
-                vendor_id: format!("{:04X}", desc.vendor_id()),
-                product_id: format!("{:04X}", desc.product_id()),
-                product_name,
-                serial,
-                bus: device.bus_number(),
-                address: device.address(),
-            });
-            index += 1;
+        if !driver_state::is_known_device(desc.vendor_id(), desc.product_id()) {
+            continue;
         }
+        let serial = device
+            .open()
+            .ok()
+            .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
+        entries.push(SdrListEntry {
+            index,
+            vendor_id: format!("{:04X}", desc.vendor_id()),
+            product_id: format!("{:04X}", desc.product_id()),
+            product_name: driver_state::device_label(desc.vendor_id(), desc.product_id()),
+            serial,
+            bus: device.bus_number(),
+            address: device.address(),
+            driver_state: driver.state,
+            bound_driver: driver.bound_driver.clone(),
+            tuner: tuners.get(index).cloned().flatten(),
+        });
+        index += 1;
     }
     Ok(entries)
-}
-
-fn test_sdr_device(index: u32) -> anyhow::Result<bool> {
-    // Use default sample rate and auto gain for a brief open/close test.
-    let sample_rate = 2_400_000;
-    let gain = 0;
-    let manager = SdrManager::new(Some(index), sample_rate, gain);
-    let opened = manager.is_connected();
-    // Manager is dropped here, closing the handle.
-    Ok(opened)
 }
 
 /// Exit code: the port is held by something that is not an Azimuth daemon.
@@ -1498,6 +1646,7 @@ mod tests {
             apply_tx,
             gps_cfg_tx,
             registrar,
+            sdr: Arc::new(std::sync::Mutex::new(SdrManager::empty())),
             stop_signal: Arc::new(tokio::sync::Notify::new()),
         });
         Harness { state, apply_rx, dir, seen, client }
@@ -1557,10 +1706,13 @@ mod tests {
         assert!(h.apply_rx.try_recv().is_ok());
         let mut registered = false;
         for _ in 0..100 {
-            if h.state.status.read().await.registration_state == "registered" {
+            let st = h.state.status.read().await;
+            // The display name is fetched right after the state flips.
+            if st.registration_state == "registered" && st.node_display_name.is_some() {
                 registered = true;
                 break;
             }
+            drop(st);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(registered, "registration must complete after the write");
@@ -1747,5 +1899,57 @@ mod tests {
             .await
             .expect("same-config sibling must be replaced");
         assert_eq!(listener.local_addr().unwrap().to_string(), addr);
+    }
+
+    // --- R2: /sdr/test really tests ------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sdr_test_never_trusts_the_cached_connected_flag() {
+        // HEAD answered `opened: true` from `sdr_connected && device_count > index`
+        // whenever scanning was enabled (always), without touching the device.
+        let h = harness("sdrtest").await;
+        // No dongle attached (never touch the real hardware of the test machine).
+        *crate::sdr::TEST_HW.lock().unwrap() = Some((
+            DriverInfo::new(DriverStateKind::NotFound, "No RTL-SDR is connected."),
+            Err(driver_state::OpenFailure::NotFound),
+        ));
+        {
+            let mut s = h.state.status.write().await;
+            s.sdr_connected = true;
+            s.device_count = 1;
+        }
+        let resp = sdr_test_handler(State(Arc::clone(&h.state)), Json(SdrTestRequest { index: 0 }))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(v["opened"], true, "cached flag must not produce opened:true: {v}");
+        assert_eq!(v["state"], "not_found", "no dongle is attached to this machine: {v}");
+        assert!(v["detail"].as_str().unwrap().len() > 3);
+        // The result is kept for /status.
+        let s = h.state.status.read().await;
+        assert_eq!(s.sdr_test_last.as_ref().unwrap()["state"], "not_found");
+        assert_eq!(s.driver.state, DriverStateKind::NotFound);
+        assert_eq!(s.driver_status, "DeviceNotFound");
+        *crate::sdr::TEST_HW.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
+    #[test]
+    fn sdr_test_while_a_sweep_holds_the_device_is_ok_only_if_the_scanner_is_active() {
+        let m = std::sync::Mutex::new(SdrManager::empty());
+        let _held = m.lock().unwrap();
+        let wait = std::time::Duration::from_millis(150);
+        let active = ScannerFacts { scanner_active: true, sdr_connected: true };
+        let (v, _) = std::thread::scope(|sc| {
+            sc.spawn(|| run_sdr_test(&m, 0, active, wait)).join().unwrap()
+        });
+        assert_eq!(v.state, SdrTestState::Ok);
+        let idle = ScannerFacts { scanner_active: false, sdr_connected: true };
+        let (v, _) = std::thread::scope(|sc| {
+            sc.spawn(|| run_sdr_test(&m, 0, idle, wait)).join().unwrap()
+        });
+        assert_eq!(v.state, SdrTestState::UsbError);
     }
 }

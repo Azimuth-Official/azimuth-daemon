@@ -95,10 +95,46 @@ struct Cli {
     #[arg(long)]
     region: Option<String>,
 
+    /// Bind WinUSB to Interface 0 of the attached RTL-SDR(s), print one JSON
+    /// line and exit (0 ok, 2 no device, 3 needs elevation, 4 install failed,
+    /// 5 other / not applicable). Windows only; needs administrator rights.
+    #[arg(long)]
+    install_driver: bool,
+
+    /// With --install-driver: USB vendor id in hex (default: every supported dongle)
+    #[arg(long, value_parser = parse_hex_u16)]
+    vid: Option<u16>,
+
+    /// With --install-driver: USB product id in hex
+    #[arg(long, value_parser = parse_hex_u16)]
+    pid: Option<u16>,
+
+    /// With --install-driver: interface number to bind (default 0)
+    #[arg(long, default_value_t = 0)]
+    interface: u8,
+
     /// Log filter, e.g. "warn,azimuth_daemon=debug". RUST_LOG still wins.
     /// Lets a support session start the sidecar verbose without editing config.
     #[arg(long)]
     log_level: Option<String>,
+}
+
+fn parse_hex_u16(s: &str) -> Result<u16, String> {
+    u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+        .map_err(|e| format!("expected a hex number like 0bda: {e}"))
+}
+
+/// `--install-driver`: stdout carries exactly one JSON line; diagnostics go to
+/// stderr so the launching app can parse stdout.
+fn run_install_driver_mode(cli: &Cli) -> i32 {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .init();
+    let (result, devices) = sdr::run_install_driver(cli.vid, cli.pid, cli.interface);
+    println!("{}", sdr::driver_state::install_report_json(&result, &devices));
+    result.exit_code()
 }
 
 #[tokio::main]
@@ -106,6 +142,9 @@ async fn main() -> anyhow::Result<()> {
     // Parse first: the log directory is derived from --config, and the desktop
     // sidecar always passes an explicit path. Nothing logs before this point.
     let cli = Cli::parse();
+    if cli.install_driver {
+        std::process::exit(run_install_driver_mode(&cli));
+    }
     let log_handle = logging::init(&cli.config, cli.log_level.as_deref());
 
     // Setup wizard mode
@@ -195,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             config.node.location.altitude_m,
         );
     }
+    let sdr: SharedSdr = Arc::new(std::sync::Mutex::new(SdrManager::empty()));
     let (apply_tx, mut apply_rx) = tokio::sync::mpsc::unbounded_channel::<ApplyMsg>();
     let (gps_cfg_tx, gps_cfg_rx) = tokio::sync::watch::channel(config.gps.clone().unwrap_or_default());
     let stop_signal = Arc::new(tokio::sync::Notify::new());
@@ -215,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         apply_tx,
         gps_cfg_tx,
         registrar: Arc::clone(&registrar),
+        sdr: Arc::clone(&sdr),
         stop_signal: Arc::clone(&stop_signal),
     });
 
@@ -326,43 +367,31 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // SDR manager — handles driver install on Windows, enumerates all devices
-    let mut sdr_manager = SdrManager::new(
+    // SDR manager: enumerates and opens all devices. Driver installation is
+    // never attempted here (it needs administrator rights): the driver state is
+    // reported through /status instead.
+    let opened = SdrManager::new(
         config.sdr.device_index,
         config.sdr.sample_rate,
         config.sdr.gain,
     );
-    {
-        let mut state = app_state.status.write().await;
-        state.sdr_connected = sdr_manager.is_connected();
-        state.device_count = sdr_manager.device_count();
-        state.sdr_name = sdr_manager
-            .device_serials()
-            .into_iter()
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "RTL-SDR".to_string());
-
-        #[cfg(target_os = "windows")]
-        {
-            state.driver_status =
-                format!("{:?}", sdr::driver_install::check_driver_status());
-        }
-    }
-
+    let (heartbeat_device_count, heartbeat_serials) =
+        (opened.device_count(), opened.device_serials());
     info!(
-        devices = sdr_manager.device_count(),
-        serials = ?sdr_manager.device_serials(),
+        devices = heartbeat_device_count,
+        serials = ?heartbeat_serials,
         "SDR devices initialized"
     );
+    publish_sdr(&app_state.status, &opened).await;
+    *lock_sdr(&sdr) = opened;
+    refresh_driver_state(&app_state.status).await;
+    spawn_driver_refresh(Arc::clone(&app_state.status));
 
     // Spawn heartbeat loop with device info. The node id is re-read from
     // shared state every tick so a deferred registration is picked up, and
     // placeholder ids are never sent (they can only 404).
     let heartbeat_client = Arc::clone(&client);
     let heartbeat_interval = config.daemon.heartbeat_interval_secs;
-    let heartbeat_device_count = sdr_manager.device_count();
-    let heartbeat_serials = sdr_manager.device_serials();
     let app_state_hb = Arc::clone(&app_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_interval));
@@ -511,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
             &app_state,
             &mut apply_rx,
             &mut scanner,
-            &mut sdr_manager,
+            &sdr,
             &mut sdr_params,
         )
         .await;
@@ -525,7 +554,7 @@ async fn main() -> anyhow::Result<()> {
                 .scanner_active
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let discovery = tokio::task::block_in_place(|| {
-                scanner.discover_stations(&mut sdr_manager)
+                scanner.discover_stations(&mut lock_sdr(&sdr))
             });
             app_state
                 .scanner_active
@@ -553,12 +582,12 @@ async fn main() -> anyhow::Result<()> {
                 _ = tokio::time::sleep(scan_interval) => {}
                 msg = apply_rx.recv() => {
                     if let Some(msg) = msg {
-                        apply_config_msg(&app_state, &mut scanner, &mut sdr_manager, &mut sdr_params, msg).await;
+                        apply_config_msg(&app_state, &mut scanner, &sdr, &mut sdr_params, msg).await;
                     }
                 }
             }
             while let Ok(msg) = apply_rx.try_recv() {
-                apply_config_msg(&app_state, &mut scanner, &mut sdr_manager, &mut sdr_params, msg).await;
+                apply_config_msg(&app_state, &mut scanner, &sdr, &mut sdr_params, msg).await;
             }
 
             if !scanning_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -568,29 +597,23 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            if sdr_manager.device_count() == 0 {
+            if lock_sdr(&sdr).device_count() == 0 {
                 cycles_without_sdr += 1;
                 if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 {
                     warn!(
                         cycles = cycles_without_sdr,
                         "No SDR devices open — attempting re-detection"
                     );
-                    sdr_manager = SdrManager::new(
+                    let fresh = SdrManager::new(
                         sdr_params.device_index,
                         sdr_params.sample_rate,
                         sdr_params.gain,
                     );
-                    let mut state = app_state.status.write().await;
-                    state.sdr_connected = sdr_manager.is_connected();
-                    state.device_count = sdr_manager.device_count();
-                    if sdr_manager.device_count() > 0 {
-                        state.sdr_name = sdr_manager
-                            .device_serials()
-                            .into_iter()
-                            .next()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| "RTL-SDR".to_string());
-                        drop(state);
+                    let found = fresh.device_count() > 0;
+                    publish_sdr(&app_state.status, &fresh).await;
+                    *lock_sdr(&sdr) = fresh;
+                    refresh_driver_state(&app_state.status).await;
+                    if found {
                         info!("SDR re-detected — resuming scanning");
                         cycles_without_sdr = 0;
                     } else {
@@ -612,7 +635,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("Re-running station discovery sweep");
                 scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);
                 let discovery = tokio::task::block_in_place(|| {
-                    scanner.discover_stations(&mut sdr_manager)
+                    scanner.discover_stations(&mut lock_sdr(&sdr))
                 });
                 scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 info!(
@@ -625,13 +648,16 @@ async fn main() -> anyhow::Result<()> {
 
             scanner_active.store(true, std::sync::atomic::Ordering::Relaxed);
             let observations = tokio::task::block_in_place(|| {
-                scanner.run_cycle(&mut sdr_manager)
+                scanner.run_cycle(&mut lock_sdr(&sdr))
             });
             scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
 
-            if !observations.is_empty() {
+            {
                 let mut state = app_state.status.write().await;
-                update_status_from_observations(&mut state, &observations);
+                state.sdr_last_capture_ok_at = Some(chrono::Utc::now());
+                if !observations.is_empty() {
+                    update_status_from_observations(&mut state, &observations);
+                }
             }
 
             // Submits under the LIVE node id (registration may finish after
@@ -653,7 +679,8 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let observations = tokio::task::block_in_place(|| {
-                let device = match sdr_manager.device_mut(0) {
+                let mut sdr_guard = lock_sdr(&sdr);
+                let device = match sdr_guard.device_mut(0) {
                     Some(d) => d,
                     None => return Vec::new(),
                 };
@@ -705,19 +732,64 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+type SharedSdr = Arc<std::sync::Mutex<SdrManager>>;
+
+/// Lock the shared SDR manager, recovering from a poisoned lock (a panic in a
+/// scan must not brick `/sdr/test` and every later cycle).
+fn lock_sdr(sdr: &SharedSdr) -> std::sync::MutexGuard<'_, SdrManager> {
+    sdr.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Copy the manager's device facts into the live status.
+async fn publish_sdr(status: &Arc<RwLock<StatusState>>, manager: &SdrManager) {
+    let mut state = status.write().await;
+    state.sdr_connected = manager.is_connected();
+    state.device_count = manager.device_count();
+    state.sdr_name = manager
+        .device_serials()
+        .into_iter()
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if manager.is_connected() { "RTL-SDR".to_string() } else { "No device".to_string() });
+}
+
+/// Re-read the driver state (blocking OS calls) into `/status.driver`.
+async fn refresh_driver_state(status: &Arc<RwLock<StatusState>>) {
+    if let Ok(info) = tokio::task::spawn_blocking(sdr::current_driver_info).await {
+        status.write().await.set_driver(info);
+    }
+}
+
+/// While the driver is not usable, keep re-reading it so a fix made outside
+/// the daemon (the elevated install) shows up without a restart.
+fn spawn_driver_refresh(status: Arc<RwLock<StatusState>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let state = status.read().await.driver.state;
+            if !matches!(
+                state,
+                sdr::driver_state::DriverStateKind::Ok | sdr::driver_state::DriverStateKind::NotApplicable
+            ) {
+                refresh_driver_state(&status).await;
+            }
+        }
+    });
+}
+
 /// Block the observation loop until a complete config is in place, adopting
 /// any config writes that arrive meanwhile.
 async fn wait_until_configured(
     app_state: &Arc<AppState>,
     apply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApplyMsg>,
     scanner: &mut Scanner,
-    sdr_manager: &mut SdrManager,
+    sdr: &SharedSdr,
     sdr_params: &mut SdrParams,
 ) {
     let mut logged = false;
     loop {
         while let Ok(msg) = apply_rx.try_recv() {
-            apply_config_msg(app_state, scanner, sdr_manager, sdr_params, msg).await;
+            apply_config_msg(app_state, scanner, sdr, sdr_params, msg).await;
         }
         if app_state.status.read().await.config_state == ConfigState::Ok {
             return;
@@ -730,7 +802,7 @@ async fn wait_until_configured(
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             msg = apply_rx.recv() => {
                 if let Some(msg) = msg {
-                    apply_config_msg(app_state, scanner, sdr_manager, sdr_params, msg).await;
+                    apply_config_msg(app_state, scanner, sdr, sdr_params, msg).await;
                 }
             }
         }
@@ -742,7 +814,7 @@ async fn wait_until_configured(
 async fn apply_config_msg(
     app_state: &Arc<AppState>,
     scanner: &mut Scanner,
-    sdr_manager: &mut SdrManager,
+    sdr: &SharedSdr,
     sdr_params: &mut SdrParams,
     msg: ApplyMsg,
 ) {
@@ -754,10 +826,10 @@ async fn apply_config_msg(
         || msg.sdr.gain != sdr_params.gain
     {
         info!("SDR settings changed — reopening the device");
-        *sdr_manager = SdrManager::new(msg.sdr.device_index, msg.sdr.sample_rate, msg.sdr.gain);
-        let mut state = app_state.status.write().await;
-        state.sdr_connected = sdr_manager.is_connected();
-        state.device_count = sdr_manager.device_count();
+        let fresh = SdrManager::new(msg.sdr.device_index, msg.sdr.sample_rate, msg.sdr.gain);
+        publish_sdr(&app_state.status, &fresh).await;
+        *lock_sdr(sdr) = fresh;
+        refresh_driver_state(&app_state.status).await;
     }
     *sdr_params = msg.sdr;
 }

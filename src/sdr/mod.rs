@@ -1,8 +1,10 @@
 #[cfg(target_os = "windows")]
 pub mod driver_install;
 
+pub mod driver_state;
 pub mod dtv;
 pub mod fm_demod;
+pub mod holders;
 pub mod lte;
 pub mod rds;
 pub mod scanner;
@@ -11,6 +13,7 @@ pub mod recovery;
 use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{info, warn};
 use crate::identity;
+use driver_state::{DriverInfo, DriverStateKind, OpenFailure};
 
 /// Linux: detach the kernel driver (`dvb_usb_rtl28xxu`) that claims the RTL2832U —
 /// especially over usbip — before rtl-sdr-rs opens it, or `open()` fails with "open
@@ -45,6 +48,85 @@ fn detach_rtl_kernel_drivers() {
 
 #[cfg(not(target_os = "linux"))]
 fn detach_rtl_kernel_drivers() {}
+
+/// "[R82xx] PLL not locked!" records seen from rtl-sdr-rs (see `logging`).
+pub static PLL_LOCK_FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Frequency of the most recent tune, for diagnostics that fire from a log hook.
+pub static CURRENT_TUNE_HZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn pll_lock_failures() -> u64 {
+    PLL_LOCK_FAILS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Unit tests must not touch whatever dongle happens to be plugged into the
+/// machine running them: they install a fake hardware answer here instead.
+#[cfg(test)]
+pub static TEST_HW: std::sync::Mutex<Option<(DriverInfo, Result<String, OpenFailure>)>> =
+    std::sync::Mutex::new(None);
+
+/// Current driver state of Interface 0 of the attached RTL2832U.
+pub fn current_driver_info() -> DriverInfo {
+    #[cfg(test)]
+    if let Some((info, _)) = TEST_HW.lock().unwrap().as_ref() {
+        return info.clone();
+    }
+    #[cfg(feature = "qa-fault-injection")]
+    if let Some(injected) = driver_state::driver_fault_from_env() {
+        return injected;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        driver_install::query_driver_info()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No driver installation is needed off Windows; just report presence.
+        let present = rusb::devices().map(|l| {
+            l.iter().any(|d| {
+                d.device_descriptor()
+                    .map(|desc| driver_state::is_known_device(desc.vendor_id(), desc.product_id()))
+                    .unwrap_or(false)
+            })
+        });
+        match present {
+            Ok(true) => DriverInfo::not_applicable(),
+            Ok(false) => DriverInfo::new(DriverStateKind::NotFound, "No RTL-SDR is connected."),
+            Err(e) => DriverInfo::new(DriverStateKind::CheckFailed, format!("USB enumeration failed: {e}")),
+        }
+    }
+}
+
+/// Open device `index` just long enough to read the tuner name, then close it.
+/// This is a REAL open (never a cached flag).
+pub fn probe_open(index: u32) -> Result<String, OpenFailure> {
+    #[cfg(test)]
+    if let Some((_, open)) = TEST_HW.lock().unwrap().as_ref() {
+        return open.clone();
+    }
+    detach_rtl_kernel_drivers();
+    let mut dev = RtlSdr::open_with_index(index as usize)
+        .map_err(|e| driver_state::parse_open_error(&format!("{e}")))?;
+    let tuner = dev.get_tuner_id().map(|t| t.to_string()).unwrap_or_else(|_| "unknown".to_string());
+    let _ = dev.close();
+    Ok(tuner)
+}
+
+/// Elevated driver install (`--install-driver`). Windows only.
+pub fn run_install_driver(
+    vid: Option<u16>,
+    pid: Option<u16>,
+    interface: u8,
+) -> (driver_state::InstallResult, Vec<driver_state::InstallDeviceReport>) {
+    #[cfg(target_os = "windows")]
+    {
+        driver_install::install_cli(vid, pid, interface)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (vid, pid, interface);
+        (driver_state::InstallResult::NotApplicable, Vec::new())
+    }
+}
 
 /// Gain configuration for SDR tuner.
 /// Auto: AGC mode (tuner controls gain).
@@ -123,6 +205,16 @@ impl SdrDevice {
         self.config.sample_rate
     }
 
+    /// Tuner chip name ("R820T", "R828D", ...), read from the open handle.
+    pub fn tuner_id(&self) -> Option<String> {
+        self.device.get_tuner_id().ok().map(|t| t.to_string())
+    }
+
+    /// Prove the open handle still streams: read a small IQ block.
+    pub fn live_check(&self) -> bool {
+        self.capture_raw(4096).map(|b| !b.is_empty()).unwrap_or(false)
+    }
+
     pub fn config(&self) -> &SdrDeviceConfig {
         &self.config
     }
@@ -144,6 +236,7 @@ impl SdrDevice {
                 freq_hz
             );
         }
+        CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
         self.device
             .set_center_freq(freq_hz as u32)
             .map_err(|e| anyhow::Error::new(e).context(format!("set_center_freq({} Hz)", freq_hz)))
@@ -201,25 +294,21 @@ impl Drop for SdrManager {
 }
 
 impl SdrManager {
+    /// A manager with no devices, used until the first real open completes.
+    pub fn empty() -> Self {
+        Self { devices: Vec::new() }
+    }
+
     /// Enumerate and open RTL-SDR devices.
     /// If device_index is Some(n), open only that device.
     /// If None, open all detected devices.
     pub fn new(device_index: Option<u32>, sample_rate: u32, gain: i32) -> Self {
-        // Windows driver install check
-        #[cfg(target_os = "windows")]
-        {
-            let drv = driver_install::check_driver_status();
-            if drv == driver_install::DriverStatus::NeedsInstall {
-                warn!("RTL2832U detected without driver — attempting WinUSB install");
-                let result = driver_install::ensure_driver();
-                match &result {
-                    driver_install::DriverStatus::Installed => {
-                        info!("WinUSB driver installed successfully — waiting for device")
-                    }
-                    other => warn!(?other, "Driver install did not succeed"),
-                }
-                std::thread::sleep(std::time::Duration::from_secs(3));
-            }
+        // Driver installation needs administrator rights and is never attempted
+        // here: the unelevated daemon only reports the state (`/status.driver`);
+        // `azimuth-daemon --install-driver` does the elevated install.
+        let drv = current_driver_info();
+        if !matches!(drv.state, DriverStateKind::Ok | DriverStateKind::NotApplicable | DriverStateKind::NotFound) {
+            warn!(state = ?drv.state, message = %drv.message, "RTL-SDR driver is not usable");
         }
 
         let count = match RtlSdr::get_device_count() {

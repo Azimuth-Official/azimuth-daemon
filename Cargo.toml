@@ -21,6 +21,9 @@ crate-type = ["cdylib", "rlib"]
 # shared-dependency default change.
 default = ["udev"]
 udev = ["serialport/libudev"]
+# TEST BUILDS ONLY. Lets QA force a driver state (e.g. wrong_driver) to prove the
+# UI copy. NEVER part of `default`; release builds must not enable it.
+qa-fault-injection = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -57,6 +60,8 @@ serialport = { version = "4", default-features = false }
 [target.'cfg(windows)'.dependencies]
 # WinUSB driver detection + auto-install for RTL2832U (libwdi/Zadig backend)
 wdi-rs = "0.1"
+# IsUserAnAdmin, for the --install-driver elevation check. Already in the tree.
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # JNI bridge for the Observer app's OTG SDR mode
