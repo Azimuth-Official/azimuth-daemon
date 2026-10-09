@@ -4,7 +4,8 @@
 # =============================================================================
 
 # Region code: ISO country code (US, DE, JP, ...) or "AUTO" (any case) to use the
-# country that contains [node.location]. The daemon resolves this into FM/LTE/DTV
+# country that contains [node.location] (offline lookup in a bundled public-domain
+# Natural Earth boundary dataset). The daemon resolves this into FM/LTE/DTV
 # sweep plans at startup and overrides the [scanning.*] sweep ranges below; a
 # location that is not inside any known country gets the worldwide default plan
 # (see "region_effective" / "region_source" in GET /status). Also settable via
@@ -87,13 +88,16 @@ max_observations_per_cycle = 20
 # Example (Rochester MN area):
 # frequencies = [92_700_000, 96_100_000, 100_300_000, 101_700_000]
 frequencies = []
-# Auto-sweep parameters (used when mode = "sweep" or "both")
+# Auto-sweep parameters (used when mode = "sweep" or "both").
+# The sweep is a channel-relative survey: each channel is judged against the noise
+# floor of its own capture and confirmed by FM demodulation, with no station cap.
+# The region plan sets the raster: 200 kHz in the Americas and Korea, 100 kHz elsewhere.
 sweep_start = 87_500_000
 sweep_end = 108_000_000
 sweep_step = 200_000
-# Power threshold for station detection during sweep (dBFS, -20 filters noise)
+# Kept for compatibility with older configs; the channel-relative survey does not
+# use these two whole-capture gates.
 sweep_threshold = -20.0
-# Minimum SNR for FM station validation during sweep (dB)
 sweep_min_snr_db = 8.0
 
 [scanning.lte]
@@ -126,7 +130,10 @@ step = 5_000_000
 # decides the standard and the channel raster).
 # Leave empty to rely on auto-sweep, or add known local channels.
 # The sweep range below is the ATSC default (UHF 14-36, 470-608 MHz); when `region`
-# is set or "AUTO" resolves a country, that country's range replaces it.
+# is set or "AUTO" resolves a country, that country's range, channel width and
+# standard replace it (DVB-T/T2 regions tune channel centres on the 7 or 8 MHz raster
+# up to the country's DTT upper edge). Detections are reported as dtv_atsc, dtv_dvbt
+# or dtv_dvbt2, only when a signal is actually detected.
 frequencies = []
 # Auto-sweep parameters
 sweep_start = 470_000_000

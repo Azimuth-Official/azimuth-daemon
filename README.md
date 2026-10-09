@@ -16,15 +16,15 @@ Full getting-started guide: [azimuth.day/docs/getting-started](https://azimuth.d
 
 | Signal | Method | Frequency range |
 |--------|--------|----------------|
-| FM broadcast | RDS PI code extraction + SNR | 65–108 MHz (incl. OIRT and Japan bands) |
+| FM broadcast | Channel-relative survey (spectrum vs. the capture's own noise floor, FM-demodulation check), RDS PI code | 65–108 MHz (incl. OIRT and Japan bands); 200 kHz raster in the Americas and Korea, 100 kHz elsewhere |
 | LTE | PSS/SSS cell ID detection | regional bands up to the tuner limit |
-| DTV | ATSC pilot tone; DVB-T / DVB-T2 cyclic-prefix detection | UHF 470 MHz up to the region's upper edge (most of Europe: 694 MHz) |
+| DTV | ATSC pilot tone (`dtv_atsc`); DVB-T (`dtv_dvbt`) and DVB-T2 (`dtv_dvbt2`) cyclic-prefix detection | UHF 470 MHz up to the region's upper edge (most of Europe: 694 MHz) |
 | GPS (optional) | NMEA over serial | reference timing and position truth |
 | RTK (optional) | NTRIP client (GEODNET, Onocoy, RTK2GO, custom casters) | centimeter-level corrections |
 
 ## Features
 
-- **Regional frequency scanning** — embedded region database (30+ countries, worldwide fallback) selects FM/LTE/DTV sweep plans from the node's location (`region = "AUTO"`) or from `region = "XX"` / `--region XX`
+- **Regional frequency scanning** — embedded region database (30+ countries, worldwide fallback) selects FM/LTE/DTV sweep plans from the node's location (`region = "AUTO"`, resolved offline from a bundled public-domain Natural Earth boundary dataset) or from `region = "XX"` / `--region XX`
 - **SDR self-healing** — 4-level recovery escalation: reopen device → USB bus reset → OS-level USB restart → clean process restart under the service manager
 - **Local web dashboard** — real-time status at `http://127.0.0.1:8420` (signals, GPS fix, SDR health, upload stats)
 - **HTTP control API** — status, SDR list/test, config write, scanner start/stop, RTK and GPS status endpoints
@@ -121,6 +121,40 @@ a warning in the log. An explicit code always wins over the location. The effect
 region and why it was chosen are reported by `GET /status` as `region_effective` and
 `region_source` (`explicit`, `auto:location` or `default`) and logged at startup.
 
+The boundary dataset is [Natural Earth](https://www.naturalearthdata.com/) admin-0
+countries (1:10m, public domain), simplified and compacted into a 156 KB file inside the
+binary (`data/country-boundaries.bin`, with its generator and verification tools in
+`data/tools/`). Border accuracy: a position at least 5 km from a land border resolves to
+the right country in all but rare narrow-feature cases (enclaves, river borders); within
+a few km of a coastline, or on a small islet, it can resolve to no country and falls back
+to the worldwide default plan. See `data/README.md` for the measured agreement figures.
+
+### DTV: ATSC, DVB-T and DVB-T2
+
+The region plan chooses the standard, channel width and channel numbering (ATSC 6 MHz in
+North America; DVB-T/T2 on the 7 or 8 MHz raster in Europe and elsewhere, ending at that
+country's upper DTT edge; channel centres are tuned, not channel edges). DVB detection
+correlates the cyclic prefix for every FFT size and guard interval the standards allow.
+DVB-T2 is recognised from its FFT size (1K, 4K, 16K, 32K) or guard interval (1/128,
+19/256, 19/128), not decoded; a 2K/8K signal with a DVB-T guard interval is reported as
+`dtv_dvbt` with `t2_possible: true`. An observation is emitted only when a signal is
+detected, with `source_id` `dvb_ch<N>` and `raw_data` holding `fft_mode`,
+`guard_interval`, `rho`, `contrast`, `cfo_hz`, `channel`, `bandwidth_mhz` and
+`t2_possible`.
+
+### FM survey
+
+FM discovery no longer judges each channel by the whole capture's power (which the
+tuner's automatic gain makes meaningless). One capture covers about eight channels; each
+is compared with that capture's own noise floor, then confirmed by FM-demodulating it
+(and, when present, the stereo pilot and an RDS PI). There is no cap on the number of
+stations, and every sweep evaluates every channel of the plan: `GET /status` shows
+`evaluated`, `total`, `found` and `tune_failed` per band under `sweep`. The raster follows
+the region (200 kHz in the US, Canada, Mexico, Brazil, Argentina, Chile and Korea; 100 kHz
+elsewhere, including the worldwide default). A weak station that is an exact repeat of a
+much stronger one on the neighbouring channel is indistinguishable from spill and is not
+reported. Stations found earlier are kept with slightly relaxed gates.
+
 ### Windows: RTL-SDR driver
 
 Windows needs the WinUSB driver bound to Interface 0 of the dongle. The desktop
@@ -142,7 +176,7 @@ includes `sweep` (per band: when the last sweep started and finished, channels
 evaluated of total, stations found, tune failures, next rediscovery), `gps` (state, port,
 baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
 `[R82xx] PLL not locked!` message from the tuner driver is counted in
-`sdr_diagnostics.pll_lock_failures` instead of being printed. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
+`sdr_diagnostics.pll_lock_failures` instead of being printed: the "PLL not locked" tuner chatter users used to see on the console no longer appears. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
 
 ### Local control API safety
 
@@ -190,6 +224,15 @@ SHA-256; the script never sets `XWIN_ACCEPT_LICENSE` for you.
 
 ## Current version
 
-**v0.4.0** — setup and reliability release. A config saved by the setup wizard now takes effect in the running daemon (no restart): it validates, applies location/region/scan plan and registers the node, and `/status` reports `config_state` (`awaiting_setup`, `ok`, `invalid`) instead of a frozen startup error. Observations are submitted under the live node id. `region = "AUTO"` follows the node's location. Real `/sdr/test`, precise driver states and an elevated `--install-driver` mode. Better GPS detection (natural COM-port order, no auto-probing of phone/modem ports, baud promotion, precise errors, live NMEA preview). Per-item rejection reporting for observation batches. `POST /shutdown` and clear exit codes when another daemon holds port 8420 (43).
+**v0.4.0** — setup, detection and reliability release.
+
+- **DVB-T and DVB-T2 detection.** New cyclic-prefix detector and signal types `dtv_dvbt` and `dtv_dvbt2`; DVB regions now tune channel centres on the correct 7/8 MHz raster up to each country's DTT edge. This follows community reports from France and the UK that DVB-T muxes were being missed.
+- **FM survey.** Channel-relative detection with FM-demodulation confirmation, no 3-station cap, every channel evaluated per sweep, region-aware 100/200 kHz raster, and per-band sweep status in `/status`.
+- **USB stall recovery.** Some RTL2832U dongles intermittently stall a USB control transfer. The daemon now re-issues the tune, resets and re-initialises the dongle (open, sample rate, tuner, gain) and retries the same channel, instead of abandoning it; counters are in `sdr_diagnostics`, and a dongle that cannot be brought up is reported as `device_error` while the daemon stays alive.
+- **`region = "AUTO"`** resolves the country from the node's location with a bundled Natural Earth boundary dataset (public domain) and applies that country's full FM/LTE/DTV plan; `region_effective` and `region_source` are reported.
+- **Setup applies live.** A config saved by the setup wizard takes effect in the running daemon (no restart): it validates, applies location/region/scan plan and registers the node, and `/status` reports `config_state` (`awaiting_setup`, `ok`, `invalid`) instead of a frozen startup error. Observations are submitted under the live node id.
+- **SDR and Windows driver.** Real `/sdr/test`, precise driver states, an elevated `--install-driver` mode, and no more "PLL not locked" console chatter (counted instead).
+- **GPS.** Natural COM-port order, no auto-probing of phone/modem ports, baud promotion, precise errors, live NMEA preview.
+- **API.** Per-item rejection reporting for observation batches; `POST /shutdown` and clear exit codes when another daemon holds port 8420 (43); CSRF and DNS-rebinding protection of the local control API.
 
 The Windows driver installer uses [libwdi](https://github.com/pbatard/libwdi) 1.5.1 through the `wdi-rs` crate, under the LGPL option; see `THIRD_PARTY_NOTICES.md`. It generates a self-signed catalog certificate for the WinUSB package and installs it on the machine when the driver is installed.

@@ -101,16 +101,24 @@ refuses to start with a `FATAL: ... is an empty DIRECTORY` message.
 
 `AZIMUTH_REGION` (default `AUTO`) sets `region` in the generated config. `AUTO` (any
 case) picks the country that contains `AZIMUTH_NODE_LAT` / `AZIMUTH_NODE_LON` using an
-offline boundary dataset and applies that country's full FM, LTE and DTV plan: for
-example a node in France scans FM 87.5-108 MHz and DVB-T/T2 channels at 8 MHz spacing,
-a node in the US scans ATSC at 6 MHz, and a node in Japan scans FM 76-95 MHz. A location
-that is not inside any known country (open water, or the placeholder `0,0`) gets the
-worldwide default plan and a warning in `docker logs`. An explicit code, e.g.
-`AZIMUTH_REGION=FR`, always wins over the location. The container log shows the resolved
-region at startup, and `GET /status` reports `region_effective` and `region_source`
-(`explicit`, `auto:location` or `default`). DTV detection covers ATSC (pilot tone) and
-DVB-T/DVB-T2 (cyclic-prefix); DVB-T2 is recognised from its FFT size and guard interval,
-not decoded.
+offline boundary dataset bundled in the image (Natural Earth, public domain) and applies
+that country's full FM, LTE and DTV plan. For example a node in France scans FM at 100 kHz
+spacing and DVB-T/T2 channel centres on the 8 MHz raster up to the DTT edge, a node in the
+US scans FM at 200 kHz and ATSC at 6 MHz, and a node in Japan scans FM 76-95 MHz. A
+location that is not inside any known country (open water, within a few km of a coast, or
+the placeholder `0,0`) gets the worldwide default plan and a warning in `docker logs`. An
+explicit code, e.g. `AZIMUTH_REGION=FR`, always wins over the location. The container log
+shows the resolved region at startup, and `GET /status` reports `region_effective` and
+`region_source` (`explicit`, `auto:location` or `default`).
+
+DTV detection covers ATSC (pilot tone, `dtv_atsc`) and DVB-T / DVB-T2 (cyclic prefix,
+`dtv_dvbt` / `dtv_dvbt2`); DVB-T2 is recognised from its FFT size and guard interval, not
+decoded. FM discovery is channel-relative with no station cap; progress per band is in
+`GET /status` under `sweep`. The old "PLL not locked" tuner chatter is no longer printed
+(it is counted in `sdr_diagnostics`), and a dongle that stalls USB transfers is reset and
+re-initialised automatically (`device_error` in `/status` if it cannot be recovered).
+Image 0.4.0 and later; the HEALTHCHECK (section 6) is healthy only when `config_state`
+is `"ok"`.
 
 ## 4. USB / RTL-SDR passthrough (real hardware)
 
