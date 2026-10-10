@@ -79,15 +79,12 @@ pub fn parse_tasklist_line(line: &str) -> Option<(u32, String)> {
     Some((pid, name))
 }
 
-/// `tasklist` with a hard 3 s bound (killed on timeout). None = could not tell.
-#[cfg(windows)]
-fn list_processes() -> Option<Vec<(u32, String)>> {
+/// Run `cmd` (no shell) with a hard 3 s bound: stdout on success, None when it
+/// cannot start, exits non-zero or has to be killed.
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+fn run_bounded(cmd: &mut std::process::Command) -> Option<Vec<u8>> {
     use std::io::Read;
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = std::process::Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .creation_flags(CREATE_NO_WINDOW)
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -111,13 +108,39 @@ fn list_processes() -> Option<Vec<(u32, String)>> {
         }
     };
     let buf = reader.join().ok()?;
-    if !status.success() {
-        return None;
-    }
+    status.success().then_some(buf)
+}
+
+#[cfg(windows)]
+fn list_processes() -> Option<Vec<(u32, String)>> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let buf = run_bounded(
+        std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW),
+    )?;
     Some(String::from_utf8_lossy(&buf).lines().filter_map(parse_tasklist_line).collect())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// Parse one `ps -axo pid=,comm=` line: `  123 /usr/bin/name` (comm may hold spaces
+/// and a path; the program name is the last path component).
+pub fn parse_ps_line(line: &str) -> Option<(u32, String)> {
+    let line = line.trim_start();
+    let (pid, rest) = line.split_once(char::is_whitespace)?;
+    let pid = pid.parse::<u32>().ok()?;
+    let name = rest.trim().rsplit('/').next()?.trim();
+    (!name.is_empty()).then(|| (pid, name.to_string()))
+}
+
+/// macOS and other unix without /proc.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn list_processes() -> Option<Vec<(u32, String)>> {
+    let buf = run_bounded(std::process::Command::new("ps").args(["-axo", "pid=,comm="]))?;
+    Some(String::from_utf8_lossy(&buf).lines().filter_map(parse_ps_line).collect())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn list_processes() -> Option<Vec<(u32, String)>> {
     None
 }
@@ -201,5 +224,16 @@ mod tests {
         assert_eq!(holder_state_from(None, 1), HolderState::Unknown);
         assert_eq!(holder_state_from(Some(&[p(1, "bash")]), 9), HolderState::NotRunning);
         assert_eq!(holder_state_from(Some(&[p(2, "SDRSharp.exe")]), 9), HolderState::Running);
+    }
+
+    #[test]
+    fn ps_output_parses_pids_paths_and_names_with_spaces() {
+        assert_eq!(parse_ps_line("  412 /Applications/SDR++.app/Contents/MacOS/sdrpp"), Some((412, "sdrpp".into())));
+        assert_eq!(parse_ps_line("1 /sbin/launchd"), Some((1, "launchd".into())));
+        assert_eq!(parse_ps_line(" 90 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome"), Some((90, "Google Chrome".into())));
+        assert_eq!(parse_ps_line("77 rtl_tcp"), Some((77, "rtl_tcp".into())));
+        assert_eq!(parse_ps_line("PID COMM"), None);
+        assert_eq!(parse_ps_line(""), None);
+        assert_eq!(parse_ps_line("12"), None);
     }
 }

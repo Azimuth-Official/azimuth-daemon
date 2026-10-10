@@ -587,6 +587,10 @@ fn run_sdr_test(
     // observation loop cannot race us for the device).
     let open = if matches!(driver.state, DriverStateKind::NotFound) {
         Err(driver_state::OpenFailure::NotFound)
+    } else if crate::sdr::holders::holder_state() != crate::sdr::holders::HolderState::NotRunning {
+        // A recognised program runs (or the process list is unreadable): do no
+        // I/O on the dongle, report in_use.
+        Err(driver_state::OpenFailure::Busy)
     } else {
         crate::sdr::probe_open(index)
     };
