@@ -173,6 +173,36 @@ pub fn owner_after_open(holder_at_open: HolderState, opened_devices: usize) -> b
     holder_at_open == HolderState::NotRunning && opened_devices > 0
 }
 
+/// What `replace_sdr` does before opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenPlan {
+    /// Open the dongle now.
+    Open,
+    /// Another program runs (or status is unknown) and we are a newcomer: no I/O, report in_use.
+    Yield,
+}
+
+/// A daemon that already owned the dongle keeps the right to re-open it after
+/// losing its handle: the other daemon seen as `Running` may itself be parked
+/// in_use holding nothing, and yielding to it would park both forever.
+pub fn reopen_plan(was_owner: bool, holder: HolderState) -> ReopenPlan {
+    if newcomer_must_yield(was_owner, holder) {
+        ReopenPlan::Yield
+    } else {
+        ReopenPlan::Open
+    }
+}
+
+/// Ownership after a re-open attempt: a former owner stays owner only if it got
+/// a device and nobody refused it as held; otherwise a third program took it.
+pub fn owner_after_reopen(was_owner: bool, holder_at_open: HolderState, opened_devices: usize, held: bool) -> bool {
+    if was_owner {
+        opened_devices > 0 && !held
+    } else {
+        owner_after_open(holder_at_open, opened_devices)
+    }
+}
+
 /// Run a USB reset ONLY when `plan` allows it. A known holder process means no
 /// reset ever: the newcomer yields (flag set, in-use error), the owner just
 /// reopens its own handle. A known held dongle short-circuits without touching
@@ -561,6 +591,36 @@ mod tests {
         assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
         assert!(!flag.load(Ordering::Relaxed), "must not park itself in_use");
         assert_eq!(n.get(), 0, "no reset next to a running holder");
+    }
+
+    #[test]
+    fn reopen_plan_lets_a_former_owner_open_next_to_a_parked_daemon() {
+        use HolderState::*;
+        assert_eq!(reopen_plan(true, Running), ReopenPlan::Open);
+        assert_eq!(reopen_plan(true, Unknown), ReopenPlan::Open);
+        assert_eq!(reopen_plan(false, Running), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, Unknown), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, NotRunning), ReopenPlan::Open);
+    }
+
+    #[test]
+    fn owner_after_reopen_keeps_ownership_only_with_a_device_and_not_held() {
+        use HolderState::*;
+        assert!(owner_after_reopen(true, Running, 1, false));
+        assert!(!owner_after_reopen(true, Running, 0, false));
+        assert!(!owner_after_reopen(true, Running, 1, true));
+        assert!(owner_after_reopen(false, NotRunning, 1, false));
+        assert!(!owner_after_reopen(false, Running, 1, false));
+    }
+
+    #[test]
+    fn owner_that_lost_its_handle_reopens_instead_of_yielding_to_a_parked_daemon() {
+        // A opens uncontended (owner); B appears (Running); A loses its device and re-detects.
+        let owner = AtomicBool::new(false);
+        owner.store(owner_after_open(HolderState::NotRunning, 1), Ordering::Relaxed);
+        let was_owner = owner.load(Ordering::Relaxed);
+        fresh_start_with(&owner, &AtomicBool::new(false)); // what replace_sdr does first
+        assert_eq!(reopen_plan(was_owner, HolderState::Running), ReopenPlan::Open);
     }
 
     #[test]

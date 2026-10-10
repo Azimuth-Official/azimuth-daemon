@@ -759,22 +759,31 @@ const IN_USE_RETRY: Duration = Duration::from_secs(20);
 
 async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &SdrParams) {
     *lock_sdr(sdr) = SdrManager::empty();
+    let was_owner = sdr::dongle::OWNER.load(std::sync::atomic::Ordering::Relaxed);
     sdr::dongle::fresh_start();
     // A fresh start is a newcomer: with a recognised program running (or the
     // process list unreadable) it does NO I/O on the dongle and reports in_use.
     // The process list is read here, with the SDR mutex NOT held.
     let holder = tokio::task::block_in_place(sdr::holders::holder_state);
-    if sdr::dongle::newcomer_must_yield(false, holder) {
+    if sdr::dongle::reopen_plan(was_owner, holder) == sdr::dongle::ReopenPlan::Yield {
         sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
         publish_in_use(status, sdr).await;
         return;
     }
-    let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
-    // Opened with no other program running: this daemon owns the dongle now, so an
-    // early stall next to a daemon that appears later never parks both in_use.
-    if sdr::dongle::owner_after_open(holder, fresh.device_count()) {
+    // A former owner keeps OWNER during its re-open so a stall inside it never
+    // resets the bus next to a running holder.
+    if was_owner {
         sdr::dongle::OWNER.store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("SDR opened uncontended: this daemon owns the dongle");
+    }
+    let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
+    // Opened with no other program running (or re-opened by the former owner): this
+    // daemon owns the dongle, so an early stall next to a daemon that appears later
+    // never parks both in_use. A former owner whose open got nothing or was refused
+    // as held lost the dongle to a third program: clear OWNER.
+    let owns = sdr::dongle::owner_after_reopen(was_owner, holder, fresh.device_count(), sdr::dongle::held_by_other());
+    sdr::dongle::OWNER.store(owns, std::sync::atomic::Ordering::Relaxed);
+    if owns {
+        tracing::info!("SDR opened: this daemon owns the dongle");
     }
     publish_sdr(status, &fresh).await;
     *lock_sdr(sdr) = fresh;
