@@ -733,6 +733,25 @@ async fn read_window(
     }
 }
 
+/// Whether a serial open failure means "the port exists but we may not use it".
+/// Unix reports that as `Io(PermissionDenied)`. serialport on Windows maps
+/// ERROR_ACCESS_DENIED (port held by another process) to `NoDevice`, and only
+/// the localized message differs, so the signal is: `NoDevice` for a port that
+/// is currently enumerated. A port that is not enumerated is genuinely gone.
+fn open_error_is_denied(kind: &tokio_serial::ErrorKind, port_listed: bool) -> bool {
+    match kind {
+        tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => true,
+        tokio_serial::ErrorKind::NoDevice => port_listed,
+        _ => false,
+    }
+}
+
+/// `port_listed` input for `open_error_is_denied`. Only Windows needs it, so
+/// other platforms skip the enumeration and keep their behaviour unchanged.
+fn port_listed_for_denied(port: &str) -> bool {
+    cfg!(windows) && canonical_listed_port(port, &list_serial_ports(), true).is_some()
+}
+
 /// One real attempt at one baud: open, read for `window`, classify. On NMEA the
 /// still-open reader is returned.
 async fn attempt_port(
@@ -757,7 +776,7 @@ async fn attempt_port(
             }
         }
         Err(e) => {
-            if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
+            if open_error_is_denied(&e.kind, port_listed_for_denied(port)) {
                 warn_permission_denied(port);
                 Attempt::Denied
             } else {
@@ -809,7 +828,7 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
                 }
             }
             Err(e) => {
-                if e.kind == tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) {
+                if open_error_is_denied(&e.kind, port_listed_for_denied(port)) {
                     return PreviewResult {
                         lines: vec![],
                         verdict: "access_denied".to_string(),
@@ -1212,6 +1231,30 @@ pub async fn run_gps_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_io_permission_denied() {
+        let k = tokio_serial::ErrorKind::Io(std::io::ErrorKind::PermissionDenied);
+        assert!(open_error_is_denied(&k, false));
+        assert!(open_error_is_denied(&k, true));
+    }
+
+    #[test]
+    fn denied_nodevice_listed() {
+        assert!(open_error_is_denied(&tokio_serial::ErrorKind::NoDevice, true));
+    }
+
+    #[test]
+    fn not_denied_nodevice_unlisted() {
+        assert!(!open_error_is_denied(&tokio_serial::ErrorKind::NoDevice, false));
+    }
+
+    #[test]
+    fn not_denied_io_other() {
+        let k = tokio_serial::ErrorKind::Io(std::io::ErrorKind::Other);
+        assert!(!open_error_is_denied(&k, true));
+        assert!(!open_error_is_denied(&k, false));
+    }
 
     // VK-172-class u-blox receivers emit combined-constellation "$GN" talkers.
     const GNGGA: &str = "$GNGGA,173000.00,4139.7541,N,09121.3906,W,1,08,1.2,215.3,M,-33.9,M,,*40";
