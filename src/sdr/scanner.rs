@@ -1146,6 +1146,11 @@ impl Scanner {
                                 ?action,
                                 "Recovery action failed"
                             );
+                            // Another program holds the dongle: escalating to a
+                            // bus reset or PnP restart would fight it for the device.
+                            if crate::sdr::dongle::is_in_use_anyhow(&err) {
+                                return None;
+                            }
                             match self.recovery_manager.record_recovery_failure(action) {
                                 Some(next_action) => action = next_action,
                                 None => return None,
@@ -1175,7 +1180,7 @@ impl Scanner {
                 // Close rtl-sdr handle first — WinUSB rejects concurrent handles
                 let closed = sdr_manager.close_device(device_idx);
                 std::thread::sleep(Duration::from_millis(200));
-                reset_usb_bus_device(device_idx)?;
+                crate::sdr::dongle::guarded_usb_reset(|| reset_usb_bus_device(device_idx))?;
                 std::thread::sleep(Duration::from_millis(500));
                 if let Some((pos, config, _serial)) = closed {
                     sdr_manager.reopen_device_at(device_idx, pos, &config)?;

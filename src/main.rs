@@ -593,7 +593,7 @@ async fn main() -> anyhow::Result<()> {
 
             if lock_sdr(&sdr).device_count() == 0 {
                 cycles_without_sdr += 1;
-                if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 {
+                if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 || sdr::dongle::held_by_other() {
                     warn!(
                         cycles = cycles_without_sdr,
                         "No SDR devices open — attempting re-detection"
@@ -638,6 +638,7 @@ async fn main() -> anyhow::Result<()> {
                 scanner.run_cycle(&mut lock_sdr(&sdr))
             });
             scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            publish_in_use(&app_state.status, &sdr).await;
 
             {
                 let mut state = app_state.status.write().await;
@@ -737,6 +738,33 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
     publish_sdr(status, &fresh).await;
     *lock_sdr(sdr) = fresh;
     refresh_driver_state(status).await;
+    publish_in_use(status, sdr).await;
+}
+
+/// While another program holds the dongle, release our handle and report
+/// `in_use` (with the likely holders) where the desktop reads it
+/// (`sdr_connected=false` + `sdr_test_last.state`); once it is free again, drop
+/// that stale verdict.
+async fn publish_in_use(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr) {
+    if !sdr::dongle::held_by_other() {
+        let mut s = status.write().await;
+        if s.sdr_connected && s.sdr_test_last.as_ref().is_some_and(|v| v["state"] == "in_use") {
+            s.sdr_test_last = None;
+        }
+        return;
+    }
+    let empty = SdrManager::empty();
+    *lock_sdr(sdr) = empty;
+    let holders = tokio::task::spawn_blocking(sdr::holders::likely_holders).await.unwrap_or_default();
+    let mut s = status.write().await;
+    s.sdr_connected = false;
+    s.device_count = 0;
+    s.sdr_name = "No device".to_string();
+    s.sdr_test_last = Some(serde_json::json!({
+        "index": 0, "opened": false, "state": "in_use", "tuner": null, "holders": holders,
+        "detail": "Another program is using the RTL-SDR. Close it; Azimuth retries automatically.",
+        "vid": null, "pid": null,
+    }));
 }
 
 /// Copy the manager's device facts into the live status.

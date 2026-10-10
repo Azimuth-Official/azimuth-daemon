@@ -12,7 +12,7 @@
 // Shared with the `tune_stress` example, which uses only part of it.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -20,6 +20,7 @@ use rtl_sdr_rs::error::RtlsdrError;
 use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{debug, info, warn};
 
+use super::driver_state::{self, OpenFailure};
 use super::stall;
 
 /// Tunes that hit a stall and succeeded after being re-issued.
@@ -34,6 +35,75 @@ pub static TUNE_LADDER_CYCLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static INIT_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Last reason the device could not be brought up; cleared on success.
 pub static DEVICE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// Another process holds the dongle (set when a USB reset or open is refused
+/// with Access/Busy; cleared by the next successful open). While set, the
+/// daemon neither resets nor steals the device; it reports `in_use` and retries
+/// the open.
+pub static HELD_BY_OTHER: AtomicBool = AtomicBool::new(false);
+
+/// Windows/WinUSB refuses a second claimer with Access; on Linux Access is a
+/// udev permission problem and says nothing about another holder.
+pub const ACCESS_MEANS_IN_USE: bool = cfg!(windows);
+
+pub fn held_by_other() -> bool {
+    HELD_BY_OTHER.load(Ordering::Relaxed)
+}
+
+const IN_USE_PREFIX: &str = "device in use: ";
+
+pub fn in_use_error() -> RtlsdrError {
+    RtlsdrError::RtlsdrErr(format!("{IN_USE_PREFIX}another program holds the RTL-SDR"))
+}
+
+pub fn is_in_use(e: &RtlsdrError) -> bool {
+    matches!(e, RtlsdrError::RtlsdrErr(m) if m.starts_with(IN_USE_PREFIX))
+}
+
+pub fn is_in_use_anyhow(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<RtlsdrError>().is_some_and(is_in_use))
+}
+
+/// A refused USB reset/open that means "someone else has the device": Busy, or
+/// Access where Access means that (`access_means_in_use`).
+pub fn reset_failure_means_held(e: &anyhow::Error, access_means_in_use: bool) -> bool {
+    e.chain().any(|c| match c.downcast_ref::<rusb::Error>() {
+        Some(rusb::Error::Busy) => true,
+        Some(rusb::Error::Access) => access_means_in_use,
+        _ => false,
+    })
+}
+
+/// Run a USB reset ONLY while nobody else is known to hold the device. A known
+/// holder short-circuits to the in-use error without touching the bus; a reset
+/// refused as held sets `flag` and returns the in-use error. Any other failure
+/// is returned unchanged.
+pub fn guarded_reset_with(
+    flag: &AtomicBool,
+    access_means_in_use: bool,
+    reset: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if flag.load(Ordering::Relaxed) {
+        return Err(anyhow::Error::new(in_use_error()));
+    }
+    match reset() {
+        Err(e) if reset_failure_means_held(&e, access_means_in_use) => {
+            flag.store(true, Ordering::Relaxed);
+            warn!(error = %e, "USB reset refused: another program holds the RTL-SDR; not resetting or reopening it");
+            Err(anyhow::Error::new(in_use_error()))
+        }
+        other => other,
+    }
+}
+
+fn guarded_reset(index: usize) -> anyhow::Result<()> {
+    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, || usb_reset(index))
+}
+
+/// Recovery's reset (`recovery::reset_usb_bus_device`), with the same holder guard.
+pub fn guarded_usb_reset(reset: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, reset)
+}
 
 pub fn device_error() -> Option<String> {
     DEVICE_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -176,19 +246,40 @@ fn open_initialized_once(p: &InitParams) -> Result<RtlSdr, RtlsdrError> {
 pub fn open_with_ladder(p: &InitParams) -> Result<RtlSdr, RtlsdrError> {
     let result = stall::init_ladder(
         stall::INIT_ATTEMPTS,
-        is_rtl_stall,
+        |e| is_rtl_stall(e) && !held_by_other(),
         || {
             INIT_STALL_RESETS.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = usb_reset(p.index as usize) {
-                warn!(index = p.index, error = %e, "USB reset before re-init failed");
+            if let Err(e) = guarded_reset(p.index as usize) {
+                if !is_in_use_anyhow(&e) {
+                    warn!(index = p.index, error = %e, "USB reset before re-init failed");
+                }
             }
         },
         std::thread::sleep,
         |attempt| warn!(index = p.index, attempt, "RTL-SDR stalled during open/init; resetting and redoing the init"),
         || open_initialized_once(p),
     );
+    // A refused open (Busy, or Access on Windows) or a stall whose reset was
+    // refused means another program holds the dongle.
+    let result = result.map_err(|e| {
+        let refused = match driver_state::parse_open_error(&e.to_string()) {
+            OpenFailure::Busy => true,
+            OpenFailure::Access => ACCESS_MEANS_IN_USE,
+            _ => false,
+        };
+        if is_in_use(&e) || held_by_other() || refused {
+            HELD_BY_OTHER.store(true, Ordering::Relaxed);
+            in_use_error()
+        } else {
+            e
+        }
+    });
     match &result {
-        Ok(_) => set_device_error(None),
+        Ok(_) => {
+            HELD_BY_OTHER.store(false, Ordering::Relaxed);
+            set_device_error(None)
+        }
+        Err(e) if is_in_use(e) => set_device_error(Some(format!("device {} is in use by another program", p.index))),
         Err(e) => {
             INIT_FAILURES.fetch_add(1, Ordering::Relaxed);
             set_device_error(Some(format!("device {} did not initialise: {e}", p.index)));
@@ -201,8 +292,10 @@ pub fn open_with_ladder(p: &InitParams) -> Result<RtlSdr, RtlsdrError> {
 /// FIRST, wait for re-enumeration, then the full ladder open.
 pub fn reset_and_reopen(p: &InitParams) -> Result<RtlSdr, RtlsdrError> {
     std::thread::sleep(Duration::from_millis(200));
-    if let Err(e) = usb_reset(p.index as usize) {
-        warn!(index = p.index, error = %e, "USB reset before reopen failed; reopening anyway");
+    match guarded_reset(p.index as usize) {
+        Err(e) if is_in_use_anyhow(&e) => return Err(in_use_error()),
+        Err(e) => warn!(index = p.index, error = %e, "USB reset before reopen failed; reopening anyway"),
+        Ok(()) => {}
     }
     std::thread::sleep(Duration::from_millis(500));
     open_with_ladder(p)
@@ -283,5 +376,43 @@ mod tests {
         assert_eq!(device_error().as_deref(), Some("x"));
         set_device_error(None);
         assert_eq!(device_error(), None);
+    }
+
+    #[test]
+    fn refused_reset_means_held_not_a_stall_and_is_never_retried() {
+        let flag = AtomicBool::new(false);
+        let resets = std::cell::Cell::new(0);
+        let refuse = || {
+            resets.set(resets.get() + 1);
+            Err(anyhow::Error::new(rusb::Error::Access).context("reset"))
+        };
+        // Windows: Access on reset = held by another process.
+        let e = guarded_reset_with(&flag, true, refuse).unwrap_err();
+        assert!(is_in_use_anyhow(&e));
+        assert!(flag.load(Ordering::Relaxed));
+        assert_eq!(resets.get(), 1);
+        // Held now: no further reset is even attempted.
+        let e = guarded_reset_with(&flag, true, refuse).unwrap_err();
+        assert!(is_in_use_anyhow(&e));
+        assert_eq!(resets.get(), 1, "no USB reset of a device another process holds");
+        // The in-use error is not a stall, so the stall ladder never retries it.
+        assert!(!is_rtl_stall(&in_use_error()));
+    }
+
+    #[test]
+    fn access_on_linux_is_a_permission_problem_and_flaky_usb_keeps_recovery() {
+        let flag = AtomicBool::new(false);
+        let e = guarded_reset_with(&flag, false, || Err(anyhow::Error::new(rusb::Error::Access))).unwrap_err();
+        assert!(!is_in_use_anyhow(&e));
+        assert!(!flag.load(Ordering::Relaxed));
+        // Pipe/Io/NoDevice are ordinary USB trouble, never "in use".
+        for err in [rusb::Error::Pipe, rusb::Error::Io, rusb::Error::NoDevice] {
+            let e = guarded_reset_with(&flag, true, || Err(anyhow::Error::new(err))).unwrap_err();
+            assert!(!is_in_use_anyhow(&e));
+        }
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(guarded_reset_with(&flag, true, || Ok(())).is_ok());
+        let busy = guarded_reset_with(&flag, false, || Err(anyhow::Error::new(rusb::Error::Busy))).unwrap_err();
+        assert!(is_in_use_anyhow(&busy));
     }
 }

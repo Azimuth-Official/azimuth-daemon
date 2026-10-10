@@ -532,6 +532,18 @@ fn run_sdr_test(
 ) -> (driver_state::SdrTestVerdict, DriverInfo) {
     let driver = crate::sdr::current_driver_info();
     let access_means_in_use = cfg!(windows);
+    // Another program holds the dongle (refused reset/open seen by the scanner):
+    // never `ok`, whatever a fresh open of a shared handle appears to do.
+    if crate::sdr::dongle::held_by_other() {
+        return (
+            driver_state::SdrTestVerdict {
+                state: SdrTestState::InUse,
+                detail: "Another program is using the RTL-SDR.".to_string(),
+                tuner: None,
+            },
+            driver,
+        );
+    }
     let Some(mut guard) = lock_with_timeout(sdr, lock_wait) else {
         let verdict = if facts.scanner_active && facts.sdr_connected {
             // Not a pass: nothing was read through the handle.

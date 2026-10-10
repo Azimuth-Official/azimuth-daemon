@@ -533,8 +533,13 @@ impl SdrManager {
         // without a reset left it wedged (every later open and tune failed).
         info!(index, serial = %serial, "Resetting and reopening SDR device after repeated pipe errors");
         std::thread::sleep(std::time::Duration::from_millis(200));
-        if let Err(e) = recovery::reset_usb_bus_device(index) {
-            warn!(index, error = %e, "USB reset before reopen failed; reopening anyway");
+        match dongle::guarded_usb_reset(|| recovery::reset_usb_bus_device(index)) {
+            // Another program holds the dongle: no reset, no reopen. The handle
+            // is already dropped, so the manager goes empty and the daemon
+            // reports `in_use` and retries the open later.
+            Err(e) if dongle::is_in_use_anyhow(&e) => return Err(e),
+            Err(e) => warn!(index, error = %e, "USB reset before reopen failed; reopening anyway"),
+            Ok(()) => {}
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
 
