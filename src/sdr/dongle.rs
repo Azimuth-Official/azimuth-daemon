@@ -21,6 +21,7 @@ use rtl_sdr_rs::{RtlSdr, TunerGain};
 use tracing::{debug, info, warn};
 
 use super::driver_state::{self, OpenFailure};
+use super::holders::HolderState;
 use super::stall;
 
 /// Tunes that hit a stall and succeeded after being re-issued.
@@ -94,17 +95,18 @@ pub enum StallPlan {
 
 /// Tie-break between two daemons: the one that has streamed since its own open
 /// owns the dongle; the newcomer yields. Never marks the owner in_use merely
-/// because another process exists.
-pub fn stall_plan(owner: bool, other_holder_running: bool) -> StallPlan {
-    match (other_holder_running, owner) {
-        (false, _) => StallPlan::Reset,
-        (true, true) => StallPlan::ReopenNoReset,
-        (true, false) => StallPlan::InUse,
+/// because another process exists. `Unknown` holder status is treated like
+/// `Running` for every reset decision (never reset on a guess).
+pub fn stall_plan(owner: bool, holder: HolderState) -> StallPlan {
+    match (holder, owner) {
+        (HolderState::NotRunning, _) => StallPlan::Reset,
+        (_, true) => StallPlan::ReopenNoReset,
+        (_, false) => StallPlan::InUse,
     }
 }
 
 fn current_stall_plan() -> StallPlan {
-    stall_plan(OWNER.load(Ordering::Relaxed), super::holders::other_holder_running())
+    stall_plan(OWNER.load(Ordering::Relaxed), super::holders::holder_state())
 }
 
 /// Stall events seen so far (tune re-issues, init resets, ladder cycles).
@@ -114,24 +116,52 @@ pub fn stall_total() -> u64 {
         + TUNE_LADDER_CYCLES_TOTAL.load(Ordering::Relaxed)
 }
 
-/// (discard_batch, become_owner) for a finished sweep. A sweep that stalled
-/// while another process runs, or after the dongle was found held, was
-/// contended: its observations may be mis-tuned and are dropped. A clean sweep
-/// that produced something makes this daemon the owner.
-pub fn sweep_verdict(held: bool, stalled: bool, holder_running: bool, produced: bool) -> (bool, bool) {
-    let contended = held || (stalled && holder_running);
-    (contended, !contended && !stalled && produced)
+/// (discard_batch, become_owner) for a finished sweep. Held, or a newcomer
+/// next to a running/unknown holder, or an owner that stalled next to a running
+/// holder: the batch was contended and is dropped. A newcomer NEVER becomes
+/// owner while a holder runs or is unknown. A clean sweep that did its tuning
+/// I/O (productive or not, so quiet RF counts) makes this daemon the owner.
+pub fn sweep_verdict(held: bool, stalled: bool, holder: HolderState, owner: bool, tuned: bool) -> (bool, bool) {
+    if held || (!owner && holder != HolderState::NotRunning) {
+        return (true, false);
+    }
+    (stalled && holder == HolderState::Running, !owner && !stalled && tuned)
 }
 
-/// Apply `sweep_verdict` to the live counters; true = drop this sweep's batch.
-pub fn sweep_finished(stalls_before: u64, produced: bool) -> bool {
-    let stalled = stall_total() != stalls_before;
-    let holder = stalled && super::holders::other_holder_running();
-    let (discard, owner) = sweep_verdict(held_by_other(), stalled, holder, produced);
-    if owner {
-        OWNER.store(true, Ordering::Relaxed);
+/// Apply the verdict to `owner`; true = drop this sweep's batch.
+pub fn finish_sweep(owner: &AtomicBool, held: bool, stalled: bool, holder: HolderState, tuned: bool) -> bool {
+    let (discard, become_owner) = sweep_verdict(held, stalled, holder, owner.load(Ordering::Relaxed), tuned);
+    if become_owner {
+        owner.store(true, Ordering::Relaxed);
     }
     discard
+}
+
+/// Live version: a newcomer always checks for a holder; an owner only after a stall.
+pub fn sweep_finished(stalls_before: u64, tuned: bool) -> bool {
+    let stalled = stall_total() != stalls_before;
+    let holder = if OWNER.load(Ordering::Relaxed) && !stalled {
+        HolderState::NotRunning
+    } else {
+        super::holders::holder_state()
+    };
+    finish_sweep(&OWNER, held_by_other(), stalled, holder, tuned)
+}
+
+/// A fresh start (`replace_sdr`): not the owner, nothing known to hold the dongle.
+pub fn fresh_start_with(owner: &AtomicBool, held: &AtomicBool) {
+    owner.store(false, Ordering::Relaxed);
+    held.store(false, Ordering::Relaxed);
+}
+
+pub fn fresh_start() {
+    fresh_start_with(&OWNER, &HELD_BY_OTHER);
+}
+
+/// A newcomer must not do ANY I/O while a recognised program runs (or status is
+/// unknown): mark the dongle held and tell the caller to leave it alone.
+pub fn newcomer_must_yield(owner: bool, holder: HolderState) -> bool {
+    !owner && holder != HolderState::NotRunning
 }
 
 /// Run a USB reset ONLY when `plan` allows it. A known holder process means no
@@ -497,7 +527,7 @@ mod tests {
     #[test]
     fn newcomer_with_a_known_holder_yields_on_first_stall_with_zero_resets() {
         let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
-        let plan = || stall_plan(false, true);
+        let plan = || stall_plan(false, HolderState::Running);
         let e = guarded_reset_with(&flag, true, plan, counting_reset(&n)).unwrap_err();
         assert!(is_in_use_anyhow(&e) && flag.load(Ordering::Relaxed));
         assert_eq!(n.get(), 0, "no USB reset while a known holder runs");
@@ -506,7 +536,7 @@ mod tests {
     #[test]
     fn owner_keeps_the_dongle_reopens_but_never_resets_or_yields() {
         let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
-        let plan = || stall_plan(true, true);
+        let plan = || stall_plan(true, HolderState::Running);
         assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
         assert_eq!(n.get(), 0);
         assert!(!flag.load(Ordering::Relaxed), "owner is never in_use merely because another process exists");
@@ -516,19 +546,57 @@ mod tests {
     fn no_holder_process_keeps_the_ordinary_reset_recovery() {
         let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
         for owner in [false, true] {
-            assert!(guarded_reset_with(&flag, true, || stall_plan(owner, false), counting_reset(&n)).is_ok());
+            assert!(guarded_reset_with(&flag, true, || stall_plan(owner, HolderState::NotRunning), counting_reset(&n)).is_ok());
         }
         assert_eq!(n.get(), 2);
         assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn contended_sweeps_are_discarded_and_only_clean_ones_confer_ownership() {
-        // (held, stalled, holder_running, produced) -> (discard, owner)
-        assert_eq!(sweep_verdict(true, false, false, true), (true, false));
-        assert_eq!(sweep_verdict(false, true, true, true), (true, false));
-        assert_eq!(sweep_verdict(false, true, false, true), (false, false), "plain stall: batch kept, not yet owner");
-        assert_eq!(sweep_verdict(false, false, true, true), (false, true));
-        assert_eq!(sweep_verdict(false, false, false, false), (false, false));
+    fn unknown_holder_status_never_resets() {
+        let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
+        let e = guarded_reset_with(&flag, true, || stall_plan(false, HolderState::Unknown), counting_reset(&n)).unwrap_err();
+        assert!(is_in_use_anyhow(&e));
+        assert!(guarded_reset_with(&AtomicBool::new(false), true, || stall_plan(true, HolderState::Unknown), counting_reset(&n)).is_ok());
+        assert_eq!(n.get(), 0);
+    }
+
+    #[test]
+    fn no_stall_next_to_a_running_holder_is_discarded_and_never_confers_ownership() {
+        use HolderState::*;
+        let owner = AtomicBool::new(false);
+        assert!(finish_sweep(&owner, false, false, Running, true), "newcomer batch dropped");
+        assert!(finish_sweep(&owner, false, false, Unknown, true));
+        assert!(!owner.load(Ordering::Relaxed));
+        assert!(newcomer_must_yield(false, Running) && newcomer_must_yield(false, Unknown));
+        assert!(!newcomer_must_yield(true, Running) && !newcomer_must_yield(false, NotRunning));
+    }
+
+    #[test]
+    fn quiet_rf_clean_sweep_makes_the_owner_and_an_owner_keeps_clean_batches() {
+        use HolderState::*;
+        let owner = AtomicBool::new(false);
+        assert!(!finish_sweep(&owner, false, false, NotRunning, true), "tuned, nothing found: still clean");
+        assert!(owner.load(Ordering::Relaxed));
+        // Owner next to a holder: clean batch kept, stalled batch dropped, still owner.
+        assert!(!finish_sweep(&owner, false, false, Running, true));
+        assert!(finish_sweep(&owner, false, true, Running, true));
+        assert!(owner.load(Ordering::Relaxed));
+        // A plain stall with no holder keeps the batch and does not confer ownership.
+        let fresh = AtomicBool::new(false);
+        assert!(!finish_sweep(&fresh, false, true, NotRunning, true));
+        assert!(!fresh.load(Ordering::Relaxed));
+        // Held always drops.
+        assert!(finish_sweep(&owner, true, false, NotRunning, true));
+    }
+
+    #[test]
+    fn a_fresh_start_clears_held_and_owner_and_flags_are_independent_per_dongle() {
+        let (o1, h1, o2, h2) = (AtomicBool::new(true), AtomicBool::new(true), AtomicBool::new(true), AtomicBool::new(true));
+        fresh_start_with(&o1, &h1);
+        assert!(!o1.load(Ordering::Relaxed) && !h1.load(Ordering::Relaxed));
+        // Production keeps ONE process-wide pair (single-dongle scope); the helpers
+        // take the flags, so a per-index array can be dropped in without change.
+        assert!(o2.load(Ordering::Relaxed) && h2.load(Ordering::Relaxed));
     }
 }

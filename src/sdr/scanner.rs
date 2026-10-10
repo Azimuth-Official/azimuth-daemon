@@ -1190,7 +1190,9 @@ impl Scanner {
             RecoveryAction::OsDeviceRestart => {
                 info!(device = device_idx, "Executing Level 3 recovery: OS device restart");
                 // A PnP restart would drop another running program's session too.
-                if crate::sdr::holders::other_holder_running() {
+                if crate::sdr::dongle::held_by_other()
+                    || crate::sdr::holders::holder_state() != crate::sdr::holders::HolderState::NotRunning
+                {
                     return Err(anyhow::Error::new(crate::sdr::dongle::in_use_error()));
                 }
                 // Close handle before OS-level device restart

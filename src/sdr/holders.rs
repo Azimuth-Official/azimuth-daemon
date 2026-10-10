@@ -57,11 +57,9 @@ pub fn holders_from_processes(procs: &[(u32, String)], own_pid: u32) -> Vec<Stri
 }
 
 #[cfg(target_os = "linux")]
-fn list_processes() -> Vec<(u32, String)> {
+fn list_processes() -> Option<Vec<(u32, String)>> {
     let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return out;
-    };
+    let dir = std::fs::read_dir("/proc").ok()?;
     for entry in dir.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
@@ -70,7 +68,7 @@ fn list_processes() -> Vec<(u32, String)> {
             out.push((pid, comm.trim().to_string()));
         }
     }
-    out
+    Some(out)
 }
 
 /// Parse one `tasklist /FO CSV /NH` line: `"name.exe","1234","Console",...`.
@@ -81,39 +79,75 @@ pub fn parse_tasklist_line(line: &str) -> Option<(u32, String)> {
     Some((pid, name))
 }
 
+/// `tasklist` with a hard 3 s bound (killed on timeout). None = could not tell.
 #[cfg(windows)]
-fn list_processes() -> Vec<(u32, String)> {
+fn list_processes() -> Option<Vec<(u32, String)>> {
+    use std::io::Read;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("tasklist")
+    let mut child = std::process::Command::new("tasklist")
         .args(["/FO", "CSV", "/NH"])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(parse_tasklist_line)
-                .collect()
-        })
-        .unwrap_or_default()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let buf = reader.join().ok()?;
+    if !status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).lines().filter_map(parse_tasklist_line).collect())
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn list_processes() -> Vec<(u32, String)> {
-    Vec::new()
+fn list_processes() -> Option<Vec<(u32, String)>> {
+    None
 }
 
-/// A recognised SDR program (or another azimuth-daemon) is running right now.
+/// Whether a recognised SDR program (or another azimuth-daemon) runs.
+/// `Unknown` (listing failed or timed out) is never read as `NotRunning`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderState {
+    Running,
+    NotRunning,
+    Unknown,
+}
+
+pub fn holder_state_from(procs: Option<&[(u32, String)]>, own_pid: u32) -> HolderState {
+    match procs {
+        None => HolderState::Unknown,
+        Some(p) if holders_from_processes(p, own_pid).is_empty() => HolderState::NotRunning,
+        Some(_) => HolderState::Running,
+    }
+}
+
 /// Process enumeration only: it never touches the dongle.
-pub fn other_holder_running() -> bool {
-    !holders_from_processes(&list_processes(), std::process::id()).is_empty()
+pub fn holder_state() -> HolderState {
+    holder_state_from(list_processes().as_deref(), std::process::id())
 }
 
 /// Likely holders of the SDR right now: recognised running programs, or the
 /// generic list when none is recognisable.
 pub fn likely_holders() -> Vec<String> {
-    let found = holders_from_processes(&list_processes(), std::process::id());
+    let found = holders_from_processes(&list_processes().unwrap_or_default(), std::process::id());
     if found.is_empty() {
         LIKELY_HOLDERS.iter().map(|s| s.to_string()).collect()
     } else {
@@ -160,5 +194,12 @@ mod tests {
     #[test]
     fn likely_holders_never_returns_empty() {
         assert!(!likely_holders().is_empty());
+    }
+
+    #[test]
+    fn a_failed_listing_is_unknown_never_not_running() {
+        assert_eq!(holder_state_from(None, 1), HolderState::Unknown);
+        assert_eq!(holder_state_from(Some(&[p(1, "bash")]), 9), HolderState::NotRunning);
+        assert_eq!(holder_state_from(Some(&[p(2, "SDRSharp.exe")]), 9), HolderState::Running);
     }
 }

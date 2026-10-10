@@ -534,7 +534,9 @@ fn run_sdr_test(
     let access_means_in_use = cfg!(windows);
     // Another program holds the dongle (refused reset/open seen by the scanner):
     // never `ok`, whatever a fresh open of a shared handle appears to do.
-    if crate::sdr::dongle::held_by_other() {
+    if crate::sdr::dongle::held_by_other()
+        && crate::sdr::holders::holder_state() != crate::sdr::holders::HolderState::NotRunning
+    {
         return (
             driver_state::SdrTestVerdict {
                 state: SdrTestState::InUse,
@@ -588,6 +590,10 @@ fn run_sdr_test(
     } else {
         crate::sdr::probe_open(index)
     };
+    // The holder is gone and a real open works: the held mark was stale.
+    if open.is_ok() {
+        crate::sdr::dongle::HELD_BY_OTHER.store(false, Ordering::Relaxed);
+    }
     let verdict = driver_state::classify_test(&driver, open, access_means_in_use);
     (verdict, driver)
 }

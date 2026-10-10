@@ -551,7 +551,8 @@ async fn main() -> anyhow::Result<()> {
             let discovery = tokio::task::block_in_place(|| {
                 scanner.discover_stations(&mut lock_sdr(&sdr))
             });
-            sdr::dongle::sweep_finished(stalls_before, !discovery.fm_stations.is_empty());
+            let tuned = lock_sdr(&sdr).device_count() > 0;
+            tokio::task::block_in_place(|| sdr::dongle::sweep_finished(stalls_before, tuned));
             publish_in_use(&app_state.status, &sdr).await;
             app_state
                 .scanner_active
@@ -599,7 +600,7 @@ async fn main() -> anyhow::Result<()> {
                 // Held by a recognised running program: do not open (init writes
                 // would disturb its session); wait for it to exit.
                 let held_retry = sdr::dongle::held_by_other()
-                    && !tokio::task::block_in_place(sdr::holders::other_holder_running);
+                    && tokio::task::block_in_place(sdr::holders::holder_state) == sdr::holders::HolderState::NotRunning;
                 if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 || held_retry {
                     warn!(
                         cycles = cycles_without_sdr,
@@ -632,7 +633,8 @@ async fn main() -> anyhow::Result<()> {
                 let discovery = tokio::task::block_in_place(|| {
                     scanner.discover_stations(&mut lock_sdr(&sdr))
                 });
-                sdr::dongle::sweep_finished(stalls_before, !discovery.fm_stations.is_empty());
+                let tuned = lock_sdr(&sdr).device_count() > 0;
+                tokio::task::block_in_place(|| sdr::dongle::sweep_finished(stalls_before, tuned));
                 publish_in_use(&app_state.status, &sdr).await;
                 scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
                 info!(
@@ -651,7 +653,8 @@ async fn main() -> anyhow::Result<()> {
             scanner_active.store(false, std::sync::atomic::Ordering::Relaxed);
             // A cycle that stalled next to another running SDR program, or ended
             // with the dongle held, was contended: its readings may be mis-tuned.
-            let observations = if sdr::dongle::sweep_finished(stalls_before, !observations.is_empty()) {
+            let tuned = lock_sdr(&sdr).device_count() > 0;
+            let observations = if tokio::task::block_in_place(|| sdr::dongle::sweep_finished(stalls_before, tuned)) {
                 warn!(dropped = observations.len(), "Dropping observations captured while the RTL-SDR was contended");
                 Vec::new()
             } else {
@@ -751,9 +754,21 @@ fn lock_sdr(sdr: &SharedSdr) -> std::sync::MutexGuard<'_, SdrManager> {
 /// its handle is closed (a second claim on the same interface would fail), and
 /// the blocking open (USB resets and backoff sleeps in the stall ladder) runs in
 /// `block_in_place`, never on an async worker.
+/// Open-retry period while the dongle is held (capped by the scan interval).
+const IN_USE_RETRY: Duration = Duration::from_secs(20);
+
 async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &SdrParams) {
     *lock_sdr(sdr) = SdrManager::empty();
-    sdr::dongle::OWNER.store(false, std::sync::atomic::Ordering::Relaxed);
+    sdr::dongle::fresh_start();
+    // A fresh start is a newcomer: with a recognised program running (or the
+    // process list unreadable) it does NO I/O on the dongle and reports in_use.
+    // The process list is read here, with the SDR mutex NOT held.
+    let holder = tokio::task::block_in_place(sdr::holders::holder_state);
+    if sdr::dongle::newcomer_must_yield(false, holder) {
+        sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
+        publish_in_use(status, sdr).await;
+        return;
+    }
     let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
     publish_sdr(status, &fresh).await;
     *lock_sdr(sdr) = fresh;
@@ -765,9 +780,6 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
 /// `in_use` (with the likely holders) where the desktop reads it
 /// (`sdr_connected=false` + `sdr_test_last.state`); once it is free again, drop
 /// that stale verdict.
-/// Open-retry period while the dongle is held (capped by the scan interval).
-const IN_USE_RETRY: Duration = Duration::from_secs(20);
-
 async fn publish_in_use(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr) {
     if !sdr::dongle::held_by_other() {
         let mut s = status.write().await;
