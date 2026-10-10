@@ -196,12 +196,14 @@ pub fn reopen_plan(was_owner: bool, holder: HolderState, only_peer_daemons: bool
     }
 }
 
-/// Ownership after a re-open attempt: a former owner stays owner through a
-/// zero-device or failed (non-held) open so it retries; only a refusal as held
-/// (a third program took the dongle) clears it.
-pub fn owner_after_reopen(was_owner: bool, holder_at_open: HolderState, opened_devices: usize, held: bool) -> bool {
+/// Ownership after a re-open attempt: a former owner stays owner whatever the
+/// open did (zero devices, failure, or a refusal as held), so it retries once the
+/// other program exits. A NEW owner is only ever created from `NotRunning`, so a
+/// sticky former owner never makes two owners. `HELD_BY_OTHER` alone governs
+/// in_use publishing. Non-owners follow `owner_after_open`.
+pub fn owner_after_reopen(was_owner: bool, holder_at_open: HolderState, opened_devices: usize, _held: bool) -> bool {
     if was_owner {
-        !held
+        true
     } else {
         owner_after_open(holder_at_open, opened_devices)
     }
@@ -611,10 +613,11 @@ mod tests {
     }
 
     #[test]
-    fn owner_after_reopen_survives_a_failed_open_and_clears_only_when_held() {
+    fn owner_after_reopen_is_sticky_for_a_former_owner_even_when_held() {
         use HolderState::*;
         assert!(owner_after_reopen(true, Running, 0, false));
-        assert!(!owner_after_reopen(true, Running, 0, true));
+        assert!(owner_after_reopen(true, Running, 0, true));
+        assert!(owner_after_reopen(true, Running, 1, true));
         assert!(owner_after_reopen(true, Running, 1, false));
         assert!(owner_after_reopen(false, NotRunning, 1, false));
         assert!(!owner_after_reopen(false, NotRunning, 0, false));
@@ -644,6 +647,19 @@ mod tests {
         owner.store(was_owner, Ordering::Relaxed); // replace_sdr restores it on yield
         let was_owner = owner.load(Ordering::Relaxed);
         assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open, "third party exited, peer parked");
+    }
+
+    #[test]
+    fn owner_refused_as_held_stays_owner_and_reopens_once_the_third_party_exits() {
+        // A owns, peer B parked. A's re-open is refused as held (unrecognised program).
+        let owner = AtomicBool::new(true);
+        let was_owner = owner.load(Ordering::Relaxed);
+        fresh_start_with(&owner, &AtomicBool::new(false));
+        owner.store(owner_after_reopen(was_owner, HolderState::Running, 0, true), Ordering::Relaxed);
+        assert!(owner.load(Ordering::Relaxed), "held refusal must not clear OWNER");
+        // The program exits; only the parked peer remains.
+        let was_owner = owner.load(Ordering::Relaxed);
+        assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open);
     }
 
     #[test]

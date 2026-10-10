@@ -780,8 +780,8 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
     let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
     // Opened with no other program running (or re-opened by the former owner): this
     // daemon owns the dongle, so an early stall next to a daemon that appears later
-    // never parks both in_use. A former owner whose open got nothing or was refused
-    // as held lost the dongle to a third program: clear OWNER.
+    // never parks both in_use. A former owner stays owner even if refused as held
+    // (HELD_BY_OTHER governs in_use), so it re-opens once the other program exits.
     let owns = sdr::dongle::owner_after_reopen(was_owner, holder, fresh.device_count(), sdr::dongle::held_by_other());
     sdr::dongle::OWNER.store(owns, std::sync::atomic::Ordering::Relaxed);
     if owns {
