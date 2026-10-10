@@ -620,6 +620,43 @@ pub fn describe_failure(saw_bytes: bool, denied: bool, error: Option<&str>) -> (
     }
 }
 
+/// Status published while no port is open: `(state, error_kind, error_hint, port)`.
+pub type IdleGpsStatus = (&'static str, Option<String>, Option<String>, Option<String>);
+
+/// Decide the `/status.gps` fields when nothing is open right now. A port
+/// denied this round, or a still-present port whose last recorded result is
+/// `access_denied` (it sits in retry backoff, so it is not re-probed), keeps the
+/// access-denied error visible. Otherwise a forced port reports wrong_baud /
+/// no_data, and anything else is plain "absent" with no port.
+pub fn idle_gps_status(
+    present: &[SerialPortInfo],
+    results: &HashMap<String, String>,
+    denied_this_round: Option<&str>,
+    forced: Option<&str>,
+) -> IdleGpsStatus {
+    let denied = denied_this_round.map(str::to_string).or_else(|| {
+        present
+            .iter()
+            .find(|p| results.get(&p.port_name).map(String::as_str) == Some("access_denied"))
+            .map(|p| p.port_name.clone())
+    });
+    if let Some(p) = denied {
+        let hint = access_denied_hint(&p);
+        return ("error", Some("access_denied".to_string()), Some(hint), Some(p));
+    }
+    if let Some(f) = forced {
+        let r = results.get(f).cloned().unwrap_or_default();
+        let kind = if r == "wrong_baud" { "wrong_baud" } else { "no_data" };
+        let hint = if kind == "wrong_baud" {
+            format!("{f} sends data that is not NMEA at the rates tried; set the receiver's baud rate explicitly.")
+        } else {
+            format!("Nothing was read from the selected port {f}. Check the port choice and the cable.")
+        };
+        return ("error", Some(kind.to_string()), Some(hint), Some(f.to_string()));
+    }
+    ("absent", None, None, None)
+}
+
 /// One entry of `/status.gps.candidates`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpsCandidateInfo {
@@ -957,9 +994,11 @@ pub async fn run_gps_task(
             debug!("No GPS candidates, retrying in {}s", DETECTION_INTERVAL_SECS);
             {
                 let mut s = state.write().await;
-                s.gps_info.state = "absent".to_string();
-                s.gps_info.error_kind = None;
-                s.gps_info.error_hint = None;
+                let (st, kind, hint, port) = idle_gps_status(&ports, &results, None, None);
+                s.gps_info.state = st.to_string();
+                s.gps_info.error_kind = kind;
+                s.gps_info.error_hint = hint;
+                s.gps_info.port = port;
                 s.gps_info.candidates = ui_candidates(&ports, &candidates, &results);
             }
             pause(&mut cfg_rx, DETECTION_INTERVAL_SECS).await;
@@ -1034,27 +1073,12 @@ pub async fn run_gps_task(
                     s.gps_info.candidates = ui_candidates(&ports, &candidates, &results);
                     s.gps_info.port = None;
                     s.gps_info.baud = None;
-                    if let Some(p) = denied_port.as_ref() {
-                        s.gps_info.state = "error".to_string();
-                        s.gps_info.error_kind = Some("access_denied".to_string());
-                        s.gps_info.error_hint = Some(access_denied_hint(p));
-                        s.gps_info.port = Some(p.clone());
-                    } else if let Some(f) = forced.as_ref() {
-                        let r = results.get(f).cloned().unwrap_or_default();
-                        let kind = if r == "wrong_baud" { "wrong_baud" } else { "no_data" };
-                        s.gps_info.state = "error".to_string();
-                        s.gps_info.error_kind = Some(kind.to_string());
-                        s.gps_info.error_hint = Some(if kind == "wrong_baud" {
-                            format!("{f} sends data that is not NMEA at the rates tried; set the receiver's baud rate explicitly.")
-                        } else {
-                            format!("Nothing was read from the selected port {f}. Check the port choice and the cable.")
-                        });
-                        s.gps_info.port = Some(f.clone());
-                    } else {
-                        s.gps_info.state = "absent".to_string();
-                        s.gps_info.error_kind = None;
-                        s.gps_info.error_hint = None;
-                    }
+                    let (st, kind, hint, port) =
+                        idle_gps_status(&ports, &results, denied_port.as_deref(), forced.as_deref());
+                    s.gps_info.state = st.to_string();
+                    s.gps_info.error_kind = kind;
+                    s.gps_info.error_hint = hint;
+                    s.gps_info.port = port;
                 }
                 debug!("No GPS validated this round, retrying in {}s", DETECTION_INTERVAL_SECS);
                 pause(&mut cfg_rx, DETECTION_INTERVAL_SECS).await;
@@ -1244,6 +1268,59 @@ pub async fn run_gps_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn results_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn idle_status_keeps_denied_error_for_present_port_in_backoff() {
+        let present = vec![port_info("COM1", "usb"), port_info("COM2", "usb")];
+        let results = results_of(&[("COM1", "access_denied"), ("COM2", "access_denied")]);
+        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None);
+        assert_eq!(state, "error");
+        assert_eq!(kind.as_deref(), Some("access_denied"));
+        assert_eq!(hint, Some(access_denied_hint("COM1")));
+        assert_eq!(port.as_deref(), Some("COM1"));
+    }
+
+    #[test]
+    fn idle_status_prefers_port_denied_this_round() {
+        let present = vec![port_info("COM1", "usb"), port_info("COM2", "usb")];
+        let results = results_of(&[("COM1", "access_denied"), ("COM2", "access_denied")]);
+        let (state, kind, _, port) = idle_gps_status(&present, &results, Some("COM2"), None);
+        assert_eq!(state, "error");
+        assert_eq!(kind.as_deref(), Some("access_denied"));
+        assert_eq!(port.as_deref(), Some("COM2"));
+    }
+
+    #[test]
+    fn idle_status_without_denial_is_absent_with_no_port() {
+        let present = vec![port_info("COM1", "usb")];
+        let results = results_of(&[("COM1", "no_data")]);
+        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None);
+        assert_eq!(state, "absent");
+        assert!(kind.is_none() && hint.is_none() && port.is_none());
+    }
+
+    #[test]
+    fn idle_status_ignores_stale_denied_result_for_unplugged_port() {
+        let present = vec![port_info("COM2", "usb")];
+        let results = results_of(&[("COM1", "access_denied")]);
+        let (state, _, _, port) = idle_gps_status(&present, &results, None, None);
+        assert_eq!(state, "absent");
+        assert!(port.is_none());
+    }
+
+    #[test]
+    fn idle_status_forced_port_keeps_existing_reports() {
+        let present = vec![port_info("COM5", "usb")];
+        let results = results_of(&[("COM5", "wrong_baud")]);
+        let (state, kind, _, port) = idle_gps_status(&present, &results, None, Some("COM5"));
+        assert_eq!((state, kind.as_deref(), port.as_deref()), ("error", Some("wrong_baud"), Some("COM5")));
+        let (_, kind, _, _) = idle_gps_status(&present, &HashMap::new(), None, Some("COM5"));
+        assert_eq!(kind.as_deref(), Some("no_data"));
+    }
 
     fn port_info(name: &str, kind: &str) -> SerialPortInfo {
         SerialPortInfo {
