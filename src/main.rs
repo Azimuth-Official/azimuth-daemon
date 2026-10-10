@@ -770,6 +770,12 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
         return;
     }
     let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
+    // Opened with no other program running: this daemon owns the dongle now, so an
+    // early stall next to a daemon that appears later never parks both in_use.
+    if sdr::dongle::owner_after_open(holder, fresh.device_count()) {
+        sdr::dongle::OWNER.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("SDR opened uncontended: this daemon owns the dongle");
+    }
     publish_sdr(status, &fresh).await;
     *lock_sdr(sdr) = fresh;
     refresh_driver_state(status).await;

@@ -164,6 +164,15 @@ pub fn newcomer_must_yield(owner: bool, holder: HolderState) -> bool {
     !owner && holder != HolderState::NotRunning
 }
 
+/// Open-time ownership: a daemon whose open found no other program running
+/// (`NotRunning`) and produced at least one open device owns the dongle at once.
+/// A second daemon sees it `Running` and yields before any I/O; if both race past
+/// the check, the exclusive USB claim makes one open fail. Without this, an early
+/// stall left both daemons non-owners next to each other: mutual `in_use` forever.
+pub fn owner_after_open(holder_at_open: HolderState, opened_devices: usize) -> bool {
+    holder_at_open == HolderState::NotRunning && opened_devices > 0
+}
+
 /// Run a USB reset ONLY when `plan` allows it. A known holder process means no
 /// reset ever: the newcomer yields (flag set, in-use error), the owner just
 /// reopens its own handle. A known held dongle short-circuits without touching
@@ -531,6 +540,27 @@ mod tests {
         let e = guarded_reset_with(&flag, true, plan, counting_reset(&n)).unwrap_err();
         assert!(is_in_use_anyhow(&e) && flag.load(Ordering::Relaxed));
         assert_eq!(n.get(), 0, "no USB reset while a known holder runs");
+    }
+
+    #[test]
+    fn owner_after_open_only_for_an_uncontended_open_with_a_device() {
+        use HolderState::*;
+        assert!(owner_after_open(NotRunning, 1));
+        assert!(!owner_after_open(NotRunning, 0));
+        assert!(!owner_after_open(Running, 1));
+        assert!(!owner_after_open(Unknown, 1));
+    }
+
+    #[test]
+    fn uncontended_opener_survives_a_stall_after_a_second_daemon_appears() {
+        // Livelock: A opens alone, B appears (Running), A stalls before any sweep finished.
+        let (owner, flag, n) = (AtomicBool::new(false), AtomicBool::new(false), std::cell::Cell::new(0));
+        owner.store(owner_after_open(HolderState::NotRunning, 1), Ordering::Relaxed);
+        let plan = || stall_plan(owner.load(Ordering::Relaxed), HolderState::Running);
+        assert_eq!(plan(), StallPlan::ReopenNoReset);
+        assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
+        assert!(!flag.load(Ordering::Relaxed), "must not park itself in_use");
+        assert_eq!(n.get(), 0, "no reset next to a running holder");
     }
 
     #[test]
