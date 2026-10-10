@@ -81,7 +81,7 @@ pub fn parse_tasklist_line(line: &str) -> Option<(u32, String)> {
 
 /// Run `cmd` (no shell) with a hard 3 s bound: stdout on success, None when it
 /// cannot start, exits non-zero or has to be killed.
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+#[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "android")))))]
 fn run_bounded(cmd: &mut std::process::Command) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut child = cmd
@@ -125,6 +125,7 @@ fn list_processes() -> Option<Vec<(u32, String)>> {
 
 /// Parse one `ps -axo pid=,comm=` line: `  123 /usr/bin/name` (comm may hold spaces
 /// and a path; the program name is the last path component).
+#[cfg(any(all(unix, not(any(target_os = "linux", target_os = "android"))), test))]
 pub fn parse_ps_line(line: &str) -> Option<(u32, String)> {
     let line = line.trim_start();
     let (pid, rest) = line.split_once(char::is_whitespace)?;
@@ -134,10 +135,17 @@ pub fn parse_ps_line(line: &str) -> Option<(u32, String)> {
 }
 
 /// macOS and other unix without /proc.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn list_processes() -> Option<Vec<(u32, String)>> {
     let buf = run_bounded(std::process::Command::new("ps").args(["-axo", "pid=,comm="]))?;
     Some(String::from_utf8_lossy(&buf).lines().filter_map(parse_ps_line).collect())
+}
+
+/// Android: USB access is an exclusive UsbManager fd, so there is no process-level
+/// holder to detect (and toybox `ps` may be sandboxed): report none, recovery unchanged.
+#[cfg(target_os = "android")]
+fn list_processes() -> Option<Vec<(u32, String)>> {
+    Some(Vec::new())
 }
 
 #[cfg(not(any(unix, windows)))]
