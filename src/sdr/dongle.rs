@@ -226,6 +226,12 @@ pub fn parked_peer_may_claim(was_owner: bool, holder: HolderState, only_peer_dae
     !was_owner && holder == HolderState::Running && only_peer_daemons && lock == LockProbe::Acquired
 }
 
+/// A newcomer that saw no holder may open the dongle only if the owner lock is not
+/// held by another process (the owner is invisible to the process list).
+pub fn newcomer_may_open(was_owner: bool, claimed: bool, lock: LockProbe) -> bool {
+    was_owner || claimed || lock != LockProbe::HeldElsewhere
+}
+
 /// Becoming owner requires the lock when one is available.
 pub fn owner_after_open_locked(owner_by_open: bool, lock: LockProbe) -> bool {
     owner_by_open && lock != LockProbe::HeldElsewhere
@@ -695,6 +701,16 @@ mod tests {
         assert!(!parked_peer_may_claim(false, Unknown, false, Acquired));
         assert!(!parked_peer_may_claim(true, Running, true, Acquired), "owners use reopen_plan");
         assert!(!parked_peer_may_claim(false, NotRunning, true, Acquired));
+    }
+
+    #[test]
+    fn newcomer_does_no_io_when_another_process_holds_the_lock() {
+        use LockProbe::*;
+        assert!(!newcomer_may_open(false, false, HeldElsewhere));
+        assert!(newcomer_may_open(false, false, Acquired));
+        assert!(newcomer_may_open(false, false, Unavailable), "no lock: today's behavior");
+        assert!(newcomer_may_open(true, false, HeldElsewhere), "former owner is sticky");
+        assert!(newcomer_may_open(false, true, Acquired));
     }
 
     #[test]

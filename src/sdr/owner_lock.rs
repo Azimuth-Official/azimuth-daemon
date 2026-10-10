@@ -32,18 +32,43 @@ pub fn lock_path() -> Option<PathBuf> {
     }
 }
 
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+/// Open the existing lock file read-only: flock / LockFileEx need no write access,
+/// and never `create(true)` on someone else's file (fs.protected_regular).
+fn open_existing(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+fn create_new_lock(path: &Path) -> std::io::Result<File> {
     let mut o = std::fs::OpenOptions::new();
-    o.read(true).write(true).create(true).truncate(false);
+    o.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o666);
     }
-    o.open(path)
+    let f = o.open(path)?;
+    #[cfg(unix)]
+    {
+        // Defeat the umask on the file WE created so another user's daemon can open it.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    Ok(f)
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    match open_existing(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match create_new_lock(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => open_existing(path),
+                other => other,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Try to take (or keep) the lock at `path` in `slot`. Already holding it is `Acquired`.
@@ -95,6 +120,29 @@ mod tests {
         assert_eq!(probe_and_hold_at(&path, &s2), LockProbe::HeldElsewhere, "separate open file description is refused in-process");
         *s1.lock().unwrap() = None;
         assert_eq!(probe_and_hold_at(&path, &s2), LockProbe::Acquired, "free once the holder drops");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lock_works_on_a_read_only_handle() {
+        let path = tmp("ro");
+        std::fs::write(&path, b"").unwrap();
+        let (f1, f2) = (open_existing(&path).unwrap(), open_existing(&path).unwrap());
+        assert!(f1.try_lock().is_ok(), "read-only handle can lock");
+        assert!(matches!(f2.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_lock_file_is_world_writable_and_existing_files_are_reopened() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("mode");
+        let _ = std::fs::remove_file(&path);
+        let s = Mutex::new(None);
+        assert_eq!(probe_and_hold_at(&path, &s), LockProbe::Acquired);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+        assert!(create_new_lock(&path).is_err(), "create_new never clobbers an existing file");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -607,10 +607,15 @@ async fn main() -> anyhow::Result<()> {
                         || (state == sdr::holders::HolderState::Running && peers_only)
                 };
                 if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 || held_retry {
-                    warn!(
-                        cycles = cycles_without_sdr,
-                        "No SDR devices open — attempting re-detection"
-                    );
+                    if sdr::dongle::held_by_other() {
+                        // Parked next to a live owner/holder: routine, not a fault.
+                        tracing::debug!(cycles = cycles_without_sdr, "SDR in use by another program — retrying open");
+                    } else {
+                        warn!(
+                            cycles = cycles_without_sdr,
+                            "No SDR devices open — attempting re-detection"
+                        );
+                    }
                     replace_sdr(&app_state.status, &sdr, &sdr_params).await;
                     let found = lock_sdr(&sdr).device_count() > 0;
                     if found {
@@ -788,6 +793,15 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
         sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
         publish_in_use(status, sdr).await;
         return;
+    }
+    // The owner may be invisible to the process list: take the lock BEFORE any dongle I/O.
+    if !was_owner && !claimed {
+        let probe = sdr::owner_lock::acquire();
+        if !sdr::dongle::newcomer_may_open(was_owner, claimed, probe) {
+            sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
+            publish_in_use(status, sdr).await;
+            return;
+        }
     }
     // A former owner (or a daemon that just claimed) keeps OWNER during its open so a
     // stall inside it never resets the bus next to a running holder.
