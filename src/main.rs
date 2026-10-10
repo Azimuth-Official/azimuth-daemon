@@ -764,8 +764,10 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
     // A fresh start is a newcomer: with a recognised program running (or the
     // process list unreadable) it does NO I/O on the dongle and reports in_use.
     // The process list is read here, with the SDR mutex NOT held.
-    let holder = tokio::task::block_in_place(sdr::holders::holder_state);
-    if sdr::dongle::reopen_plan(was_owner, holder) == sdr::dongle::ReopenPlan::Yield {
+    let (holder, peers_only) = tokio::task::block_in_place(sdr::holders::holder_snapshot);
+    if sdr::dongle::reopen_plan(was_owner, holder, peers_only) == sdr::dongle::ReopenPlan::Yield {
+        // A former owner stays owner (sticky) so it re-opens once the third-party program exits.
+        sdr::dongle::OWNER.store(was_owner, std::sync::atomic::Ordering::Relaxed);
         sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
         publish_in_use(status, sdr).await;
         return;

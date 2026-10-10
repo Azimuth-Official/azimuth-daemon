@@ -170,6 +170,21 @@ pub fn holder_state_from(procs: Option<&[(u32, String)]>, own_pid: u32) -> Holde
     }
 }
 
+/// True when at least one recognised holder runs and EVERY one is another
+/// azimuth-daemon (no third-party SDR program).
+pub fn only_peer_daemons(procs: &[(u32, String)], own_pid: u32) -> bool {
+    let h = holders_from_processes(procs, own_pid);
+    !h.is_empty() && h.iter().all(|l| l == "another azimuth-daemon")
+}
+
+/// One process listing -> (holder state, holders are peer daemons only).
+pub fn holder_snapshot() -> (HolderState, bool) {
+    let procs = list_processes();
+    let own = std::process::id();
+    let peers = procs.as_deref().is_some_and(|p| only_peer_daemons(p, own));
+    (holder_state_from(procs.as_deref(), own), peers)
+}
+
 /// Process enumeration only: it never touches the dongle.
 pub fn holder_state() -> HolderState {
     holder_state_from(list_processes().as_deref(), std::process::id())
@@ -199,6 +214,15 @@ mod tests {
         let procs = [p(10, "SDRSharp.exe"), p(11, "SDR++.exe"), p(12, "explorer.exe"), p(13, "rtl_tcp.exe")];
         let h = holders_from_processes(&procs, 1);
         assert_eq!(h, vec!["SDR#/SDRSharp", "SDR++", "rtl_tcp"]);
+    }
+
+    #[test]
+    fn only_peer_daemons_is_false_with_a_third_party_or_nobody() {
+        let d = p(200, "azimuth-daemon.exe");
+        assert!(only_peer_daemons(&[p(100, "azimuth-daemon.exe"), d.clone()], 100));
+        assert!(!only_peer_daemons(&[p(100, "azimuth-daemon.exe"), d.clone(), p(5, "SDRSharp.exe")], 100));
+        assert!(!only_peer_daemons(&[p(100, "azimuth-daemon.exe"), p(6, "explorer.exe")], 100), "nobody else: control");
+        assert!(!only_peer_daemons(&[p(5, "rtl_tcp.exe")], 100));
     }
 
     #[test]

@@ -183,21 +183,25 @@ pub enum ReopenPlan {
 }
 
 /// A daemon that already owned the dongle keeps the right to re-open it after
-/// losing its handle: the other daemon seen as `Running` may itself be parked
-/// in_use holding nothing, and yielding to it would park both forever.
-pub fn reopen_plan(was_owner: bool, holder: HolderState) -> ReopenPlan {
-    if newcomer_must_yield(was_owner, holder) {
+/// losing its handle, but only when every recognised running holder is another
+/// azimuth-daemon (possibly parked in_use, holding nothing). A third-party
+/// program, or an unreadable process list, makes it yield like a newcomer.
+pub fn reopen_plan(was_owner: bool, holder: HolderState, only_peer_daemons: bool) -> ReopenPlan {
+    if was_owner && holder == HolderState::Running && only_peer_daemons {
+        ReopenPlan::Open
+    } else if newcomer_must_yield(false, holder) {
         ReopenPlan::Yield
     } else {
         ReopenPlan::Open
     }
 }
 
-/// Ownership after a re-open attempt: a former owner stays owner only if it got
-/// a device and nobody refused it as held; otherwise a third program took it.
+/// Ownership after a re-open attempt: a former owner stays owner through a
+/// zero-device or failed (non-held) open so it retries; only a refusal as held
+/// (a third program took the dongle) clears it.
 pub fn owner_after_reopen(was_owner: bool, holder_at_open: HolderState, opened_devices: usize, held: bool) -> bool {
     if was_owner {
-        opened_devices > 0 && !held
+        !held
     } else {
         owner_after_open(holder_at_open, opened_devices)
     }
@@ -594,33 +598,52 @@ mod tests {
     }
 
     #[test]
-    fn reopen_plan_lets_a_former_owner_open_next_to_a_parked_daemon() {
+    fn reopen_plan_lets_a_former_owner_open_only_next_to_peer_daemons() {
         use HolderState::*;
-        assert_eq!(reopen_plan(true, Running), ReopenPlan::Open);
-        assert_eq!(reopen_plan(true, Unknown), ReopenPlan::Open);
-        assert_eq!(reopen_plan(false, Running), ReopenPlan::Yield);
-        assert_eq!(reopen_plan(false, Unknown), ReopenPlan::Yield);
-        assert_eq!(reopen_plan(false, NotRunning), ReopenPlan::Open);
+        assert_eq!(reopen_plan(true, Running, true), ReopenPlan::Open);
+        assert_eq!(reopen_plan(true, Running, false), ReopenPlan::Yield, "third party present");
+        assert_eq!(reopen_plan(true, Unknown, false), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, Running, true), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, Running, false), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, Unknown, false), ReopenPlan::Yield);
+        assert_eq!(reopen_plan(false, NotRunning, false), ReopenPlan::Open);
+        assert_eq!(reopen_plan(true, NotRunning, false), ReopenPlan::Open);
     }
 
     #[test]
-    fn owner_after_reopen_keeps_ownership_only_with_a_device_and_not_held() {
+    fn owner_after_reopen_survives_a_failed_open_and_clears_only_when_held() {
         use HolderState::*;
+        assert!(owner_after_reopen(true, Running, 0, false));
+        assert!(!owner_after_reopen(true, Running, 0, true));
         assert!(owner_after_reopen(true, Running, 1, false));
-        assert!(!owner_after_reopen(true, Running, 0, false));
-        assert!(!owner_after_reopen(true, Running, 1, true));
         assert!(owner_after_reopen(false, NotRunning, 1, false));
+        assert!(!owner_after_reopen(false, NotRunning, 0, false));
         assert!(!owner_after_reopen(false, Running, 1, false));
     }
 
     #[test]
-    fn owner_that_lost_its_handle_reopens_instead_of_yielding_to_a_parked_daemon() {
-        // A opens uncontended (owner); B appears (Running); A loses its device and re-detects.
-        let owner = AtomicBool::new(false);
-        owner.store(owner_after_open(HolderState::NotRunning, 1), Ordering::Relaxed);
+    fn owner_keeps_the_right_to_reopen_after_an_empty_open_next_to_a_parked_peer() {
+        // A owns; peer B parked (Running, peers only). A's device vanishes: re-open gets 0 devices
+        // (not held); the device is replugged and A retries: must Open, not Yield.
+        let owner = AtomicBool::new(owner_after_open(HolderState::NotRunning, 1));
         let was_owner = owner.load(Ordering::Relaxed);
-        fresh_start_with(&owner, &AtomicBool::new(false)); // what replace_sdr does first
-        assert_eq!(reopen_plan(was_owner, HolderState::Running), ReopenPlan::Open);
+        fresh_start_with(&owner, &AtomicBool::new(false));
+        assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open);
+        owner.store(owner_after_reopen(was_owner, HolderState::Running, 0, false), Ordering::Relaxed);
+        let was_owner = owner.load(Ordering::Relaxed);
+        fresh_start_with(&owner, &AtomicBool::new(false));
+        assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open);
+    }
+
+    #[test]
+    fn owner_yielding_to_a_third_party_stays_sticky_and_reopens_when_only_the_peer_remains() {
+        let owner = AtomicBool::new(true);
+        let was_owner = owner.load(Ordering::Relaxed);
+        fresh_start_with(&owner, &AtomicBool::new(false));
+        assert_eq!(reopen_plan(was_owner, HolderState::Running, false), ReopenPlan::Yield);
+        owner.store(was_owner, Ordering::Relaxed); // replace_sdr restores it on yield
+        let was_owner = owner.load(Ordering::Relaxed);
+        assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open, "third party exited, peer parked");
     }
 
     #[test]
