@@ -92,15 +92,19 @@ pub fn probe_and_hold_at(path: &Path, slot: &Mutex<Option<File>>) -> LockProbe {
 
 /// Take (or keep) this process's ownership lock.
 pub fn acquire() -> LockProbe {
-    match lock_path() {
+    let probe = match lock_path() {
         Some(p) => probe_and_hold_at(&p, &HELD),
         None => LockProbe::Unavailable,
-    }
+    };
+    // Mirror "this process holds it" for dongle.rs (which cannot name this module).
+    super::dongle::LOCK_HELD.store(probe == LockProbe::Acquired, std::sync::atomic::Ordering::Relaxed);
+    probe
 }
 
 /// Drop the lock (a daemon that tried to claim but did not end up owning).
 pub fn release() {
     *HELD.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    super::dongle::LOCK_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

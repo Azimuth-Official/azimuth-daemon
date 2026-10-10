@@ -80,13 +80,18 @@ pub fn reset_failure_means_held(e: &anyhow::Error, access_means_in_use: bool) ->
 /// start (`replace_sdr`), set by `sweep_finished`.
 pub static OWNER: AtomicBool = AtomicBool::new(false);
 
+/// This process holds the OS owner lock (`owner_lock::acquire` sets it, `release`
+/// clears it; never set where no lock exists, e.g. Android). Read-only here.
+pub static LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
 /// What a stall may do to the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallPlan {
     /// Nobody else is running: the ordinary USB reset + reopen.
     Reset,
     /// A known holder process runs but we own the dongle: reopen our own handle,
-    /// NEVER reset the bus (it would hit the newcomer's/holder's session too).
+    /// NEVER reset the bus (it would hit the holder's session too). Exception: the
+    /// lock-holding owner next to only parked peer daemons resets (`Reset`).
     ReopenNoReset,
     /// A known holder process runs and we have not streamed yet: we are the
     /// newcomer, so yield (`in_use`), no reset.
@@ -97,9 +102,22 @@ pub enum StallPlan {
 /// owns the dongle; the newcomer yields. Never marks the owner in_use merely
 /// because another process exists. `Unknown` holder status is treated like
 /// `Running` for every reset decision (never reset on a guess).
+/// This form knows nothing about the OS owner lock (`stall_plan_locked`
+/// with the lock not held), so an owner next to any holder only reopens.
 pub fn stall_plan(owner: bool, holder: HolderState) -> StallPlan {
+    stall_plan_locked(owner, false, holder, false)
+}
+
+/// `stall_plan` plus the "holder keeps working" rule: an OWNER that holds the OS
+/// owner lock (`lock_held`) while the process snapshot is `Running` and EVERY
+/// holder is a parked peer azimuth-daemon (`only_peer_daemons`) may USB-reset its
+/// own dongle (a parked peer never opens the device). Any third-party holder, an
+/// `Unknown` snapshot, or no lock keeps the owner on `ReopenNoReset`; a
+/// non-owner still yields (`InUse`) unless nothing runs.
+pub fn stall_plan_locked(owner: bool, lock_held: bool, holder: HolderState, only_peer_daemons: bool) -> StallPlan {
     match (holder, owner) {
         (HolderState::NotRunning, _) => StallPlan::Reset,
+        (HolderState::Running, true) if lock_held && only_peer_daemons => StallPlan::Reset,
         (_, true) => StallPlan::ReopenNoReset,
         (_, false) => StallPlan::InUse,
     }
@@ -107,12 +125,14 @@ pub fn stall_plan(owner: bool, holder: HolderState) -> StallPlan {
 
 fn current_stall_plan() -> StallPlan {
     let started = std::time::Instant::now();
-    let holder = super::holders::holder_state();
+    // ONE bounded process listing gives both the state and the peers-only fact.
+    let (holder, peers_only) = super::holders::holder_snapshot();
     let elapsed = started.elapsed();
     if elapsed > Duration::from_secs(1) {
         warn!(elapsed_ms = elapsed.as_millis() as u64, "checking for other RTL-SDR programs took too long");
     }
-    stall_plan(OWNER.load(Ordering::Relaxed), holder)
+    let owner = OWNER.load(Ordering::Relaxed);
+    stall_plan_locked(owner, owner && LOCK_HELD.load(Ordering::Relaxed), holder, peers_only)
 }
 
 /// Stall events seen so far (tune re-issues, init resets, ladder cycles).
@@ -747,6 +767,43 @@ mod tests {
         assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
         assert_eq!(n.get(), 0);
         assert!(!flag.load(Ordering::Relaxed), "owner is never in_use merely because another process exists");
+    }
+
+    #[test]
+    fn stall_plan_locked_truth_table() {
+        use HolderState::*;
+        use StallPlan::*;
+        // (owner, lock_held, holder, only_peers) -> plan
+        let cases = [
+            (true, true, Running, true, Reset),
+            (true, true, Running, false, ReopenNoReset),
+            (true, false, Running, true, ReopenNoReset),
+            (true, true, Unknown, true, ReopenNoReset),
+            (true, true, Unknown, false, ReopenNoReset),
+            (true, true, NotRunning, false, Reset),
+            (true, false, NotRunning, false, Reset),
+            (false, true, Running, true, InUse),
+            (false, false, Running, true, InUse),
+            (false, true, Running, false, InUse),
+            (false, false, Unknown, false, InUse),
+            (false, true, Unknown, true, InUse),
+            (false, false, NotRunning, false, Reset),
+        ];
+        for (o, l, h, p, want) in cases {
+            assert_eq!(stall_plan_locked(o, l, h, p), want, "owner={o} lock={l} holder={h:?} peers={p}");
+        }
+    }
+
+    #[test]
+    fn lock_holding_owner_with_only_peer_daemons_runs_the_usb_reset() {
+        let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
+        let plan = || stall_plan_locked(true, true, HolderState::Running, true);
+        assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
+        assert_eq!(n.get(), 1, "reset closure must run");
+        assert!(!flag.load(Ordering::Relaxed));
+        let third = || stall_plan_locked(true, true, HolderState::Running, false);
+        assert!(guarded_reset_with(&flag, true, third, counting_reset(&n)).is_ok());
+        assert_eq!(n.get(), 1, "third-party holder: still no reset");
     }
 
     #[test]
