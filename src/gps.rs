@@ -621,7 +621,7 @@ pub fn describe_failure(saw_bytes: bool, denied: bool, error: Option<&str>) -> (
 }
 
 /// Status published while no port is open: `(state, error_kind, error_hint, port)`.
-pub type IdleGpsStatus = (&'static str, Option<String>, Option<String>, Option<String>);
+type IdleGpsStatus = (&'static str, Option<String>, Option<String>, Option<String>);
 
 /// Decide the `/status.gps` fields when nothing is open right now. A port
 /// denied this round, or a still-present port whose last recorded result is
@@ -633,12 +633,19 @@ pub fn idle_gps_status(
     results: &HashMap<String, String>,
     denied_this_round: Option<&str>,
     forced: Option<&str>,
+    eligible: &[String],
 ) -> IdleGpsStatus {
-    let denied = denied_this_round.map(str::to_string).or_else(|| {
-        present
+    // A stale denial is only trusted for a port that is still present AND
+    // still eligible for auto-probing (held back only by the retry backoff);
+    // an excluded port is never re-probed, so its old result must not stick.
+    // With a forced port, only that port may supply a stale denial.
+    let is_denied = |name: &str| results.get(name).map(String::as_str) == Some("access_denied");
+    let denied = denied_this_round.map(str::to_string).or_else(|| match forced {
+        Some(f) => (present.iter().any(|p| p.port_name == f) && is_denied(f)).then(|| f.to_string()),
+        None => present
             .iter()
-            .find(|p| results.get(&p.port_name).map(String::as_str) == Some("access_denied"))
-            .map(|p| p.port_name.clone())
+            .find(|p| is_denied(&p.port_name) && eligible.contains(&p.port_name))
+            .map(|p| p.port_name.clone()),
     });
     if let Some(p) = denied {
         let hint = access_denied_hint(&p);
@@ -989,13 +996,19 @@ pub async fn run_gps_task(
         results.retain(|name, _| ports.iter().any(|p| &p.port_name == name));
         let candidates = rank_candidates(&ports, &policy, &cache, Instant::now());
         let forced = policy.forced_port.clone().filter(|p| !p.is_empty());
+        // Ports the policy allows for auto-probing, ignoring the retry backoff.
+        let eligible: Vec<String> = rank_candidates(&ports, &policy, &ProbeCache::new(), Instant::now())
+            .into_iter()
+            .map(|c| c.port_name)
+            .collect();
 
         if candidates.is_empty() {
             debug!("No GPS candidates, retrying in {}s", DETECTION_INTERVAL_SECS);
             {
                 let mut s = state.write().await;
-                let (st, kind, hint, port) = idle_gps_status(&ports, &results, None, None);
+                let (st, kind, hint, port) = idle_gps_status(&ports, &results, None, None, &eligible);
                 s.gps_info.state = st.to_string();
+                s.gps_info.baud = None;
                 s.gps_info.error_kind = kind;
                 s.gps_info.error_hint = hint;
                 s.gps_info.port = port;
@@ -1074,7 +1087,7 @@ pub async fn run_gps_task(
                     s.gps_info.port = None;
                     s.gps_info.baud = None;
                     let (st, kind, hint, port) =
-                        idle_gps_status(&ports, &results, denied_port.as_deref(), forced.as_deref());
+                        idle_gps_status(&ports, &results, denied_port.as_deref(), forced.as_deref(), &eligible);
                     s.gps_info.state = st.to_string();
                     s.gps_info.error_kind = kind;
                     s.gps_info.error_hint = hint;
@@ -1269,6 +1282,10 @@ pub async fn run_gps_task(
 mod tests {
     use super::*;
 
+    fn all_of(present: &[SerialPortInfo]) -> Vec<String> {
+        present.iter().map(|p| p.port_name.clone()).collect()
+    }
+
     fn results_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
@@ -1277,7 +1294,7 @@ mod tests {
     fn idle_status_keeps_denied_error_for_present_port_in_backoff() {
         let present = vec![port_info("COM1", "usb"), port_info("COM2", "usb")];
         let results = results_of(&[("COM1", "access_denied"), ("COM2", "access_denied")]);
-        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None);
+        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None, &all_of(&present));
         assert_eq!(state, "error");
         assert_eq!(kind.as_deref(), Some("access_denied"));
         assert_eq!(hint, Some(access_denied_hint("COM1")));
@@ -1288,7 +1305,7 @@ mod tests {
     fn idle_status_prefers_port_denied_this_round() {
         let present = vec![port_info("COM1", "usb"), port_info("COM2", "usb")];
         let results = results_of(&[("COM1", "access_denied"), ("COM2", "access_denied")]);
-        let (state, kind, _, port) = idle_gps_status(&present, &results, Some("COM2"), None);
+        let (state, kind, _, port) = idle_gps_status(&present, &results, Some("COM2"), None, &all_of(&present));
         assert_eq!(state, "error");
         assert_eq!(kind.as_deref(), Some("access_denied"));
         assert_eq!(port.as_deref(), Some("COM2"));
@@ -1298,7 +1315,7 @@ mod tests {
     fn idle_status_without_denial_is_absent_with_no_port() {
         let present = vec![port_info("COM1", "usb")];
         let results = results_of(&[("COM1", "no_data")]);
-        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None);
+        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None, &all_of(&present));
         assert_eq!(state, "absent");
         assert!(kind.is_none() && hint.is_none() && port.is_none());
     }
@@ -1307,18 +1324,35 @@ mod tests {
     fn idle_status_ignores_stale_denied_result_for_unplugged_port() {
         let present = vec![port_info("COM2", "usb")];
         let results = results_of(&[("COM1", "access_denied")]);
-        let (state, _, _, port) = idle_gps_status(&present, &results, None, None);
+        let (state, _, _, port) = idle_gps_status(&present, &results, None, None, &all_of(&present));
         assert_eq!(state, "absent");
         assert!(port.is_none());
+    }
+
+    #[test]
+    fn idle_status_forced_port_ignores_stale_denial_on_other_port() {
+        let present = vec![port_info("COM1", "usb"), port_info("COM5", "usb")];
+        let results = results_of(&[("COM1", "access_denied"), ("COM5", "wrong_baud")]);
+        let (state, kind, _, port) = idle_gps_status(&present, &results, None, Some("COM5"), &all_of(&present));
+        assert_eq!((state, kind.as_deref(), port.as_deref()), ("error", Some("wrong_baud"), Some("COM5")));
+    }
+
+    #[test]
+    fn idle_status_ignores_denial_on_port_not_eligible_for_probing() {
+        let present = vec![port_info("COM1", "usb")];
+        let results = results_of(&[("COM1", "access_denied")]);
+        let (state, kind, hint, port) = idle_gps_status(&present, &results, None, None, &[]);
+        assert_eq!(state, "absent");
+        assert!(kind.is_none() && hint.is_none() && port.is_none());
     }
 
     #[test]
     fn idle_status_forced_port_keeps_existing_reports() {
         let present = vec![port_info("COM5", "usb")];
         let results = results_of(&[("COM5", "wrong_baud")]);
-        let (state, kind, _, port) = idle_gps_status(&present, &results, None, Some("COM5"));
+        let (state, kind, _, port) = idle_gps_status(&present, &results, None, Some("COM5"), &all_of(&present));
         assert_eq!((state, kind.as_deref(), port.as_deref()), ("error", Some("wrong_baud"), Some("COM5")));
-        let (_, kind, _, _) = idle_gps_status(&present, &HashMap::new(), None, Some("COM5"));
+        let (_, kind, _, _) = idle_gps_status(&present, &HashMap::new(), None, Some("COM5"), &all_of(&present));
         assert_eq!(kind.as_deref(), Some("no_data"));
     }
 
