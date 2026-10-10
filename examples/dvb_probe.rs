@@ -21,6 +21,8 @@ use rtl_sdr_rs::RtlSdr;
 mod driver_state;
 #[path = "../src/sdr/stall.rs"]
 mod stall;
+#[path = "../src/sdr/holders.rs"]
+mod holders;
 #[path = "../src/sdr/dongle.rs"]
 mod dongle;
 // The detector itself (self-contained, no daemon state).

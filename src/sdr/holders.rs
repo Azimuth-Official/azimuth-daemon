@@ -104,6 +104,12 @@ fn list_processes() -> Vec<(u32, String)> {
     Vec::new()
 }
 
+/// A recognised SDR program (or another azimuth-daemon) is running right now.
+/// Process enumeration only: it never touches the dongle.
+pub fn other_holder_running() -> bool {
+    !holders_from_processes(&list_processes(), std::process::id()).is_empty()
+}
+
 /// Likely holders of the SDR right now: recognised running programs, or the
 /// generic list when none is recognisable.
 pub fn likely_holders() -> Vec<String> {

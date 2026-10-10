@@ -74,17 +74,88 @@ pub fn reset_failure_means_held(e: &anyhow::Error, access_means_in_use: bool) ->
     })
 }
 
-/// Run a USB reset ONLY while nobody else is known to hold the device. A known
-/// holder short-circuits to the in-use error without touching the bus; a reset
-/// refused as held sets `flag` and returns the in-use error. Any other failure
-/// is returned unchanged.
+/// This daemon has completed a sweep without a stall since its own start: it is
+/// the OWNER of the dongle and never yields to a newcomer. Cleared by a fresh
+/// start (`replace_sdr`), set by `sweep_finished`.
+pub static OWNER: AtomicBool = AtomicBool::new(false);
+
+/// What a stall may do to the bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallPlan {
+    /// Nobody else is running: the ordinary USB reset + reopen.
+    Reset,
+    /// A known holder process runs but we own the dongle: reopen our own handle,
+    /// NEVER reset the bus (it would hit the newcomer's/holder's session too).
+    ReopenNoReset,
+    /// A known holder process runs and we have not streamed yet: we are the
+    /// newcomer, so yield (`in_use`), no reset.
+    InUse,
+}
+
+/// Tie-break between two daemons: the one that has streamed since its own open
+/// owns the dongle; the newcomer yields. Never marks the owner in_use merely
+/// because another process exists.
+pub fn stall_plan(owner: bool, other_holder_running: bool) -> StallPlan {
+    match (other_holder_running, owner) {
+        (false, _) => StallPlan::Reset,
+        (true, true) => StallPlan::ReopenNoReset,
+        (true, false) => StallPlan::InUse,
+    }
+}
+
+fn current_stall_plan() -> StallPlan {
+    stall_plan(OWNER.load(Ordering::Relaxed), super::holders::other_holder_running())
+}
+
+/// Stall events seen so far (tune re-issues, init resets, ladder cycles).
+pub fn stall_total() -> u64 {
+    TUNE_STALL_RETRIES_TOTAL.load(Ordering::Relaxed)
+        + INIT_STALL_RESETS.load(Ordering::Relaxed)
+        + TUNE_LADDER_CYCLES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// (discard_batch, become_owner) for a finished sweep. A sweep that stalled
+/// while another process runs, or after the dongle was found held, was
+/// contended: its observations may be mis-tuned and are dropped. A clean sweep
+/// that produced something makes this daemon the owner.
+pub fn sweep_verdict(held: bool, stalled: bool, holder_running: bool, produced: bool) -> (bool, bool) {
+    let contended = held || (stalled && holder_running);
+    (contended, !contended && !stalled && produced)
+}
+
+/// Apply `sweep_verdict` to the live counters; true = drop this sweep's batch.
+pub fn sweep_finished(stalls_before: u64, produced: bool) -> bool {
+    let stalled = stall_total() != stalls_before;
+    let holder = stalled && super::holders::other_holder_running();
+    let (discard, owner) = sweep_verdict(held_by_other(), stalled, holder, produced);
+    if owner {
+        OWNER.store(true, Ordering::Relaxed);
+    }
+    discard
+}
+
+/// Run a USB reset ONLY when `plan` allows it. A known holder process means no
+/// reset ever: the newcomer yields (flag set, in-use error), the owner just
+/// reopens its own handle. A known held dongle short-circuits without touching
+/// the bus. For unknown holders a reset refused as held sets `flag`. Any other
+/// failure is returned unchanged.
 pub fn guarded_reset_with(
     flag: &AtomicBool,
     access_means_in_use: bool,
+    plan: impl FnOnce() -> StallPlan,
     reset: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if flag.load(Ordering::Relaxed) {
         return Err(anyhow::Error::new(in_use_error()));
+    }
+    match plan() {
+        StallPlan::ReopenNoReset => return Ok(()),
+        StallPlan::InUse => {
+            flag.store(true, Ordering::Relaxed);
+            warn!("Stall while another RTL-SDR program is running and this daemon has not streamed yet: yielding (in_use), no USB reset");
+            return Err(anyhow::Error::new(in_use_error()));
+        }
+        StallPlan::Reset => {}
     }
     match reset() {
         Err(e) if reset_failure_means_held(&e, access_means_in_use) => {
@@ -97,12 +168,12 @@ pub fn guarded_reset_with(
 }
 
 fn guarded_reset(index: usize) -> anyhow::Result<()> {
-    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, || usb_reset(index))
+    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, current_stall_plan, || usb_reset(index))
 }
 
 /// Recovery's reset (`recovery::reset_usb_bus_device`), with the same holder guard.
 pub fn guarded_usb_reset(reset: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, reset)
+    guarded_reset_with(&HELD_BY_OTHER, ACCESS_MEANS_IN_USE, current_stall_plan, reset)
 }
 
 pub fn device_error() -> Option<String> {
@@ -387,12 +458,12 @@ mod tests {
             Err(anyhow::Error::new(rusb::Error::Access).context("reset"))
         };
         // Windows: Access on reset = held by another process.
-        let e = guarded_reset_with(&flag, true, refuse).unwrap_err();
+        let e = guarded_reset_with(&flag, true, || StallPlan::Reset, refuse).unwrap_err();
         assert!(is_in_use_anyhow(&e));
         assert!(flag.load(Ordering::Relaxed));
         assert_eq!(resets.get(), 1);
         // Held now: no further reset is even attempted.
-        let e = guarded_reset_with(&flag, true, refuse).unwrap_err();
+        let e = guarded_reset_with(&flag, true, || StallPlan::Reset, refuse).unwrap_err();
         assert!(is_in_use_anyhow(&e));
         assert_eq!(resets.get(), 1, "no USB reset of a device another process holds");
         // The in-use error is not a stall, so the stall ladder never retries it.
@@ -402,17 +473,62 @@ mod tests {
     #[test]
     fn access_on_linux_is_a_permission_problem_and_flaky_usb_keeps_recovery() {
         let flag = AtomicBool::new(false);
-        let e = guarded_reset_with(&flag, false, || Err(anyhow::Error::new(rusb::Error::Access))).unwrap_err();
+        let e = guarded_reset_with(&flag, false, || StallPlan::Reset, || Err(anyhow::Error::new(rusb::Error::Access))).unwrap_err();
         assert!(!is_in_use_anyhow(&e));
         assert!(!flag.load(Ordering::Relaxed));
         // Pipe/Io/NoDevice are ordinary USB trouble, never "in use".
         for err in [rusb::Error::Pipe, rusb::Error::Io, rusb::Error::NoDevice] {
-            let e = guarded_reset_with(&flag, true, || Err(anyhow::Error::new(err))).unwrap_err();
+            let e = guarded_reset_with(&flag, true, || StallPlan::Reset, || Err(anyhow::Error::new(err))).unwrap_err();
             assert!(!is_in_use_anyhow(&e));
         }
         assert!(!flag.load(Ordering::Relaxed));
-        assert!(guarded_reset_with(&flag, true, || Ok(())).is_ok());
-        let busy = guarded_reset_with(&flag, false, || Err(anyhow::Error::new(rusb::Error::Busy))).unwrap_err();
+        assert!(guarded_reset_with(&flag, true, || StallPlan::Reset, || Ok(())).is_ok());
+        let busy = guarded_reset_with(&flag, false, || StallPlan::Reset, || Err(anyhow::Error::new(rusb::Error::Busy))).unwrap_err();
         assert!(is_in_use_anyhow(&busy));
+    }
+
+    fn counting_reset(n: &std::cell::Cell<u32>) -> impl FnOnce() -> anyhow::Result<()> + '_ {
+        move || {
+            n.set(n.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn newcomer_with_a_known_holder_yields_on_first_stall_with_zero_resets() {
+        let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
+        let plan = || stall_plan(false, true);
+        let e = guarded_reset_with(&flag, true, plan, counting_reset(&n)).unwrap_err();
+        assert!(is_in_use_anyhow(&e) && flag.load(Ordering::Relaxed));
+        assert_eq!(n.get(), 0, "no USB reset while a known holder runs");
+    }
+
+    #[test]
+    fn owner_keeps_the_dongle_reopens_but_never_resets_or_yields() {
+        let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
+        let plan = || stall_plan(true, true);
+        assert!(guarded_reset_with(&flag, true, plan, counting_reset(&n)).is_ok());
+        assert_eq!(n.get(), 0);
+        assert!(!flag.load(Ordering::Relaxed), "owner is never in_use merely because another process exists");
+    }
+
+    #[test]
+    fn no_holder_process_keeps_the_ordinary_reset_recovery() {
+        let (flag, n) = (AtomicBool::new(false), std::cell::Cell::new(0));
+        for owner in [false, true] {
+            assert!(guarded_reset_with(&flag, true, || stall_plan(owner, false), counting_reset(&n)).is_ok());
+        }
+        assert_eq!(n.get(), 2);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn contended_sweeps_are_discarded_and_only_clean_ones_confer_ownership() {
+        // (held, stalled, holder_running, produced) -> (discard, owner)
+        assert_eq!(sweep_verdict(true, false, false, true), (true, false));
+        assert_eq!(sweep_verdict(false, true, true, true), (true, false));
+        assert_eq!(sweep_verdict(false, true, false, true), (false, false), "plain stall: batch kept, not yet owner");
+        assert_eq!(sweep_verdict(false, false, true, true), (false, true));
+        assert_eq!(sweep_verdict(false, false, false, false), (false, false));
     }
 }
