@@ -746,10 +746,23 @@ fn open_error_is_denied(kind: &tokio_serial::ErrorKind, port_listed: bool) -> bo
     }
 }
 
-/// `port_listed` input for `open_error_is_denied`. Only Windows needs it, so
-/// other platforms skip the enumeration and keep their behaviour unchanged.
-fn port_listed_for_denied(port: &str) -> bool {
-    cfg!(windows) && canonical_listed_port(port, &list_serial_ports(), true).is_some()
+/// Pure part of the listed check: `port` is enumerated in `ports` and is not a
+/// Bluetooth port (a Bluetooth port can fail to open only because its remote
+/// is off, which is not an access problem).
+fn listed_and_not_bluetooth(port: &str, ports: &[SerialPortInfo]) -> bool {
+    match canonical_listed_port(port, ports, true) {
+        Some(name) => !ports.iter().any(|p| p.port_name == name && is_bluetooth_port(p)),
+        None => false,
+    }
+}
+
+/// Classify an open error for `port`. Enumeration happens only for `NoDevice`
+/// and only on Windows, so other kinds and other platforms never pay for it.
+fn open_error_denied_for(port: &str, kind: &tokio_serial::ErrorKind) -> bool {
+    let listed = matches!(kind, tokio_serial::ErrorKind::NoDevice)
+        && cfg!(windows)
+        && listed_and_not_bluetooth(port, &list_serial_ports());
+    open_error_is_denied(kind, listed)
 }
 
 /// One real attempt at one baud: open, read for `window`, classify. On NMEA the
@@ -776,7 +789,7 @@ async fn attempt_port(
             }
         }
         Err(e) => {
-            if open_error_is_denied(&e.kind, port_listed_for_denied(port)) {
+            if open_error_denied_for(port, &e.kind) {
                 warn_permission_denied(port);
                 Attempt::Denied
             } else {
@@ -828,7 +841,7 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
                 }
             }
             Err(e) => {
-                if open_error_is_denied(&e.kind, port_listed_for_denied(port)) {
+                if open_error_denied_for(port, &e.kind) {
                     return PreviewResult {
                         lines: vec![],
                         verdict: "access_denied".to_string(),
@@ -1231,6 +1244,34 @@ pub async fn run_gps_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn port_info(name: &str, kind: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: kind.to_string(),
+            vid: None,
+            pid: None,
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+        }
+    }
+
+    #[test]
+    fn listed_check_excludes_bluetooth_ports() {
+        let ports = vec![port_info("COM3", "usb"), port_info("COM7", "bluetooth")];
+        assert!(listed_and_not_bluetooth("COM3", &ports));
+        assert!(!listed_and_not_bluetooth("COM7", &ports));
+        assert!(!listed_and_not_bluetooth("COM9", &ports));
+    }
+
+    #[test]
+    fn windows_port_name_forms_match_listed_port() {
+        let ports = vec![port_info("COM3", "usb")];
+        assert_eq!(canonical_listed_port("\\\\.\\COM3", &ports, true).as_deref(), Some("COM3"));
+        assert_eq!(canonical_listed_port("com3", &ports, true).as_deref(), Some("COM3"));
+        assert!(listed_and_not_bluetooth("com3", &ports));
+    }
 
     #[test]
     fn denied_io_permission_denied() {
