@@ -599,8 +599,13 @@ async fn main() -> anyhow::Result<()> {
                 cycles_without_sdr += 1;
                 // Held by a recognised running program: do not open (init writes
                 // would disturb its session); wait for it to exit.
-                let held_retry = sdr::dongle::held_by_other()
-                    && tokio::task::block_in_place(sdr::holders::holder_state) == sdr::holders::HolderState::NotRunning;
+                // A parked daemon next to peer daemons only also re-enters replace_sdr
+                // (every held cycle, <= IN_USE_RETRY) to try the owner-lock claim.
+                let held_retry = sdr::dongle::held_by_other() && {
+                    let (state, peers_only) = tokio::task::block_in_place(sdr::holders::holder_snapshot);
+                    state == sdr::holders::HolderState::NotRunning
+                        || (state == sdr::holders::HolderState::Running && peers_only)
+                };
                 if cycles_without_sdr == 1 || cycles_without_sdr % 6 == 0 || held_retry {
                     warn!(
                         cycles = cycles_without_sdr,
@@ -765,24 +770,51 @@ async fn replace_sdr(status: &Arc<RwLock<StatusState>>, sdr: &SharedSdr, p: &Sdr
     // process list unreadable) it does NO I/O on the dongle and reports in_use.
     // The process list is read here, with the SDR mutex NOT held.
     let (holder, peers_only) = tokio::task::block_in_place(sdr::holders::holder_snapshot);
-    if sdr::dongle::reopen_plan(was_owner, holder, peers_only) == sdr::dongle::ReopenPlan::Yield {
+    let mut plan = sdr::dongle::reopen_plan(was_owner, holder, peers_only);
+    // A parked non-owner next to peer daemons only: if nobody holds the owner lock,
+    // the owner's process is gone (or never existed), so claim the dongle.
+    let mut claimed = false;
+    if plan == sdr::dongle::ReopenPlan::Yield && !was_owner && holder == sdr::holders::HolderState::Running && peers_only {
+        let probe = sdr::owner_lock::acquire();
+        if sdr::dongle::parked_peer_may_claim(was_owner, holder, peers_only, probe) {
+            tracing::info!("no other daemon owns the RTL-SDR: claiming it");
+            plan = sdr::dongle::ReopenPlan::Open;
+            claimed = true;
+        }
+    }
+    if plan == sdr::dongle::ReopenPlan::Yield {
         // A former owner stays owner (sticky) so it re-opens once the third-party program exits.
         sdr::dongle::OWNER.store(was_owner, std::sync::atomic::Ordering::Relaxed);
         sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
         publish_in_use(status, sdr).await;
         return;
     }
-    // A former owner keeps OWNER during its re-open so a stall inside it never
-    // resets the bus next to a running holder.
-    if was_owner {
+    // A former owner (or a daemon that just claimed) keeps OWNER during its open so a
+    // stall inside it never resets the bus next to a running holder.
+    if was_owner || claimed {
         sdr::dongle::OWNER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
+    let mut fresh = tokio::task::block_in_place(|| SdrManager::new(p.device_index, p.sample_rate, p.gain));
     // Opened with no other program running (or re-opened by the former owner): this
     // daemon owns the dongle, so an early stall next to a daemon that appears later
     // never parks both in_use. A former owner stays owner even if refused as held
     // (HELD_BY_OTHER governs in_use), so it re-opens once the other program exits.
-    let owns = sdr::dongle::owner_after_reopen(was_owner, holder, fresh.device_count(), sdr::dongle::held_by_other());
+    let by_open = if claimed {
+        fresh.device_count() > 0
+    } else {
+        sdr::dongle::owner_after_reopen(was_owner, holder, fresh.device_count(), sdr::dongle::held_by_other())
+    };
+    // Becoming owner requires the cross-process lock when one is available.
+    let lock = if by_open { sdr::owner_lock::acquire() } else { sdr::dongle::LockProbe::Unavailable };
+    let owns = was_owner || sdr::dongle::owner_after_open_locked(by_open, lock);
+    if by_open && !owns {
+        // Another process owns the dongle: close our handle and report in_use.
+        fresh = SdrManager::empty();
+        sdr::dongle::HELD_BY_OTHER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !owns && !was_owner {
+        sdr::owner_lock::release();
+    }
     sdr::dongle::OWNER.store(owns, std::sync::atomic::Ordering::Relaxed);
     if owns {
         tracing::info!("SDR opened: this daemon owns the dongle");

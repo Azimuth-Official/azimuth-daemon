@@ -209,6 +209,28 @@ pub fn owner_after_reopen(was_owner: bool, holder_at_open: HolderState, opened_d
     }
 }
 
+/// Result of probing the cross-process owner lock (`owner_lock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockProbe {
+    /// This process holds the lock now.
+    Acquired,
+    /// Another process owns the dongle.
+    HeldElsewhere,
+    /// No lock can be used here: behave as without one.
+    Unavailable,
+}
+
+/// A parked non-owner may claim the dongle when it would otherwise yield only
+/// to peer azimuth daemons and nobody holds the owner lock: the owner is gone.
+pub fn parked_peer_may_claim(was_owner: bool, holder: HolderState, only_peer_daemons: bool, lock: LockProbe) -> bool {
+    !was_owner && holder == HolderState::Running && only_peer_daemons && lock == LockProbe::Acquired
+}
+
+/// Becoming owner requires the lock when one is available.
+pub fn owner_after_open_locked(owner_by_open: bool, lock: LockProbe) -> bool {
+    owner_by_open && lock != LockProbe::HeldElsewhere
+}
+
 /// Run a USB reset ONLY when `plan` allows it. A known holder process means no
 /// reset ever: the newcomer yields (flag set, in-use error), the owner just
 /// reopens its own handle. A known held dongle short-circuits without touching
@@ -660,6 +682,40 @@ mod tests {
         // The program exits; only the parked peer remains.
         let was_owner = owner.load(Ordering::Relaxed);
         assert_eq!(reopen_plan(was_owner, HolderState::Running, true), ReopenPlan::Open);
+    }
+
+    #[test]
+    fn parked_peer_claims_only_with_the_free_lock_next_to_peers() {
+        use HolderState::*;
+        use LockProbe::*;
+        assert!(parked_peer_may_claim(false, Running, true, Acquired));
+        assert!(!parked_peer_may_claim(false, Running, true, HeldElsewhere));
+        assert!(!parked_peer_may_claim(false, Running, true, Unavailable), "no lock: today's behavior");
+        assert!(!parked_peer_may_claim(false, Running, false, Acquired), "third party present");
+        assert!(!parked_peer_may_claim(false, Unknown, false, Acquired));
+        assert!(!parked_peer_may_claim(true, Running, true, Acquired), "owners use reopen_plan");
+        assert!(!parked_peer_may_claim(false, NotRunning, true, Acquired));
+    }
+
+    #[test]
+    fn owner_after_open_needs_the_lock_when_one_exists() {
+        use LockProbe::*;
+        assert!(owner_after_open_locked(true, Acquired));
+        assert!(owner_after_open_locked(true, Unavailable));
+        assert!(!owner_after_open_locked(true, HeldElsewhere));
+        assert!(!owner_after_open_locked(false, Acquired));
+    }
+
+    #[test]
+    fn restarted_owner_and_parked_peer_do_not_both_wait() {
+        use HolderState::*;
+        use LockProbe::*;
+        // Old owner process is gone (lock free). B (parked, non-owner) and new A (non-owner) see each other Running.
+        // Before the lock: both Yield forever.
+        assert_eq!(reopen_plan(false, Running, true), ReopenPlan::Yield);
+        // With the lock: whoever probes first acquires and claims; the other sees HeldElsewhere and yields.
+        assert!(parked_peer_may_claim(false, Running, true, Acquired), "B claims");
+        assert!(!parked_peer_may_claim(false, Running, true, HeldElsewhere), "new A yields");
     }
 
     #[test]

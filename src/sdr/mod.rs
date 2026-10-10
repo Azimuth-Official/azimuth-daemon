@@ -7,6 +7,7 @@ pub mod dtv;
 pub mod fm_demod;
 pub mod holders;
 pub mod lte;
+pub mod owner_lock;
 pub mod rds;
 pub mod stall;
 pub mod scanner;
