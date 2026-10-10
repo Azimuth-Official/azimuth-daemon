@@ -106,7 +106,13 @@ pub fn stall_plan(owner: bool, holder: HolderState) -> StallPlan {
 }
 
 fn current_stall_plan() -> StallPlan {
-    stall_plan(OWNER.load(Ordering::Relaxed), super::holders::holder_state())
+    let started = std::time::Instant::now();
+    let holder = super::holders::holder_state();
+    let elapsed = started.elapsed();
+    if elapsed > Duration::from_secs(1) {
+        warn!(elapsed_ms = elapsed.as_millis() as u64, "checking for other RTL-SDR programs took too long");
+    }
+    stall_plan(OWNER.load(Ordering::Relaxed), holder)
 }
 
 /// Stall events seen so far (tune re-issues, init resets, ladder cycles).

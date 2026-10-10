@@ -79,9 +79,11 @@ pub fn parse_tasklist_line(line: &str) -> Option<(u32, String)> {
     Some((pid, name))
 }
 
-/// Run `cmd` (no shell) with a hard 3 s bound: stdout on success, None when it
-/// cannot start, exits non-zero or has to be killed.
-#[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "android")))))]
+/// Run `cmd` (no shell) with a hard 3 s bound over the WHOLE call (child exit AND
+/// reading its output): stdout on success, None when it cannot start, exits
+/// non-zero, has to be killed, or something else keeps the pipe open past the
+/// deadline (the reader thread is then left detached).
+#[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "android"))), test))]
 fn run_bounded(cmd: &mut std::process::Command) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut child = cmd
@@ -90,10 +92,11 @@ fn run_bounded(cmd: &mut std::process::Command) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     let mut out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let status = loop {
@@ -107,7 +110,8 @@ fn run_bounded(cmd: &mut std::process::Command) -> Option<Vec<u8>> {
             }
         }
     };
-    let buf = reader.join().ok()?;
+    let left = deadline.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(250));
+    let buf = rx.recv_timeout(left).ok()?;
     status.success().then_some(buf)
 }
 
@@ -214,6 +218,20 @@ mod tests {
         let procs = [p(10, "SDRSharp.exe"), p(11, "SDR++.exe"), p(12, "explorer.exe"), p(13, "rtl_tcp.exe")];
         let h = holders_from_processes(&procs, 1);
         assert_eq!(h, vec!["SDR#/SDRSharp", "SDR++", "rtl_tcp"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_never_blocks_when_another_process_keeps_the_pipe_open() {
+        let t = std::time::Instant::now();
+        // The shell exits at once; the background sleep inherits stdout and keeps the pipe open.
+        let r = run_bounded(std::process::Command::new("sh").args(["-c", "(sleep 5) & exit 0"]));
+        let took = t.elapsed();
+        eprintln!("run_bounded returned {r:?} after {took:?}");
+        assert!(r.is_none());
+        assert!(took < std::time::Duration::from_millis(3600), "bounded: {took:?}");
+        // Control: a normal command still returns its output.
+        assert_eq!(run_bounded(std::process::Command::new("sh").args(["-c", "echo hi"])).as_deref(), Some(&b"hi\n"[..]));
     }
 
     #[test]
