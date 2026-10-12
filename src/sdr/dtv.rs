@@ -3,6 +3,7 @@
 use rustfft::{num_complex::Complex, FftPlanner};
 
 pub mod dvb;
+pub mod p1;
 #[cfg(test)]
 pub(crate) mod testgen;
 #[cfg(test)]

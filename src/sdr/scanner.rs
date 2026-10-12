@@ -50,6 +50,9 @@ pub struct BandSweep {
     pub settle_waits: u32,
     /// Re-tunes attempted after a failed PLL lock.
     pub tune_retries: u32,
+    /// DTV only: DVB channels whose cyclic prefix reads as a T2-only mode but showed no P1 over a whole
+    /// maximum T2 frame; not DVB-T, T2 unproven, so no observation is emitted for them.
+    pub t2_unconfirmed: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
 }
@@ -188,6 +191,11 @@ const MAX_CONSECUTIVE_TUNE_FAILURES: u32 = 3;
 
 /// Default IQ capture size for signal processing (128K samples = 256KB).
 const CAPTURE_BYTES: usize = 262_144;
+/// Further captures of a DVB channel dwell when the first one shows a cyclic-prefix detection but no P1.
+/// A T2 frame lasts up to 250 ms and holds one P1; a capture is 64 ms, so the first plus 5 more back-to-back
+/// captures cover 384 ms: a whole maximum frame (250 ms), one capture length (64 ms) and margin for the
+/// gaps between captures.
+const DVB_P1_EXTRA_CAPTURES: usize = 5;
 
 /// Relaxed gates for the one-shot FM sweep retry when the primary pass (using
 /// `fm_config.sweep_threshold` / `sweep_min_snr_db`) finds zero stations.
@@ -722,6 +730,9 @@ impl Scanner {
                 Some((iq, sample_rate)) => {
                     consecutive = 0;
                     if let Some(det) = dvb::detect_dvb(&iq, sample_rate, bandwidth_mhz) {
+                        if det.signal_type == dvb::T2_UNCONFIRMED {
+                            self.sweep.dtv.t2_unconfirmed += 1;
+                        }
                         info!(freq_mhz = centre as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, rho = format!("{:.2}", det.rho), contrast = format!("{:.0}", det.contrast), "DVB channel found");
                         result.dtv_channels.push(centre);
                     }
@@ -746,8 +757,18 @@ impl Scanner {
 
     /// Build the detection-only observation for a DVB capture, or nothing.
     fn scan_dvb_capture(&self, iq_bytes: &[u8], sample_rate: u32, freq: u64, dbm: f64) -> Vec<ScanResult> {
-        let DtvPlan::Dvb { bandwidth_mhz, first_channel } = self.dtv_plan.clone() else { return Vec::new() };
+        let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
         let Some(det) = dvb::detect_dvb(iq_bytes, sample_rate, bandwidth_mhz) else { return Vec::new() };
+        self.dvb_observation(&det, freq, dbm).into_iter().collect()
+    }
+
+    /// The observation for a detection, or `None` for a cyclic-prefix reading of a T2-only mode without a
+    /// P1 (neither DVB-T nor proven T2).
+    fn dvb_observation(&self, det: &dvb::DvbDetection, freq: u64, dbm: f64) -> Option<ScanResult> {
+        let DtvPlan::Dvb { bandwidth_mhz, first_channel } = self.dtv_plan.clone() else { return None };
+        if det.signal_type == dvb::T2_UNCONFIRMED {
+            return None;
+        }
         let bw_hz = u64::from(bandwidth_mhz) * 1_000_000;
         let k = (freq.saturating_sub(self.dtv_config.sweep_start) / bw_hz) as u32;
         let channel = first_channel + k;
@@ -765,14 +786,44 @@ impl Scanner {
         // In-band SNR estimate from the CP correlation: rho ~= SNR / (1 + SNR).
         let rho = det.rho.clamp(0.01, 0.999);
         let snr_db = (10.0 * (rho / (1.0 - rho)).log10()) as f32;
-        vec![ScanResult {
+        Some(ScanResult {
             signal_type: det.signal_type.to_string(),
             frequency_hz: freq,
             signal_strength_dbm: dbm as f32,
             snr_db: Some(snr_db),
             source_id: Some(format!("dvb_ch{}", channel)),
             raw_data: Some(serde_json::Value::Object(raw)),
-        }]
+        })
+    }
+
+    /// One DVB channel dwell: the observation for the first capture, extended over a whole maximum T2 frame
+    /// when that capture holds a cyclic-prefix detection but no P1. A T2 frame (and so its single P1) can last
+    /// 250 ms while a capture is 64 ms, so a P1-less capture proves nothing: `extra` yields the further
+    /// back-to-back captures of the dwell (`None` ends it) and any P1 among them makes the channel T2.
+    /// Without one, a DVB-T-compatible mode is DVB-T and a T2-only mode is counted as `t2_unconfirmed`.
+    fn scan_dvb_dwell<F>(&mut self, first_iq: &[u8], sample_rate: u32, freq: u64, dbm: f64, mut extra: F) -> Vec<ScanResult>
+    where
+        F: FnMut(&mut Scanner) -> Option<Vec<u8>>,
+    {
+        let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
+        let Some(mut det) = dvb::detect_dvb(first_iq, sample_rate, bandwidth_mhz) else { return Vec::new() };
+        if det.p1.is_none() {
+            let mut window = Vec::with_capacity(DVB_P1_EXTRA_CAPTURES);
+            for _ in 0..DVB_P1_EXTRA_CAPTURES {
+                match extra(self) {
+                    Some(iq) => window.push(iq),
+                    None => break,
+                }
+            }
+            if let Some(p1) = window.iter().find_map(|iq| dvb::find_p1(iq, sample_rate, bandwidth_mhz)) {
+                det = det.with_p1(p1);
+            } else if det.signal_type == dvb::T2_UNCONFIRMED {
+                debug!(freq_mhz = freq as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, "DVB T2-only mode without a P1 over a full T2 frame: unconfirmed, no observation");
+                self.sweep.dtv.t2_unconfirmed += 1;
+                self.publish_sweep();
+            }
+        }
+        self.dvb_observation(&det, freq, dbm).into_iter().collect()
     }
 
     /// Run one full scan cycle. Returns observations to submit.
@@ -878,7 +929,9 @@ impl Scanner {
 
         let (_dbfs, dbm) = calculate_signal_power(&iq_bytes, self.dbm_offset);
         if scan_type == ScanType::Dtv && dvb_plan {
-            return self.scan_dvb_capture(&iq_bytes, sample_rate, freq, dbm);
+            return self.scan_dvb_dwell(&iq_bytes, sample_rate, freq, dbm, |sc| {
+                sc.capture_with_auto_reset(sdr_manager, device_idx, freq)
+            });
         }
         let mut results = Vec::new();
 
@@ -1891,3 +1944,6 @@ mod tests_dsp;
 
 #[cfg(test)]
 mod tests_pll;
+
+#[cfg(test)]
+mod tests_dwell;
