@@ -317,8 +317,8 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
 pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: f64) -> Option<P1Detection> {
     let s = sample_rate * t_us * 1e-6; // capture samples per T
     let w = (P1_A_LEN * s).round() as usize;
-    // Below P1_MIN_RATE the capture cannot hold enough of the P1's carriers; above about 5.8 MS/s the A part
-    // no longer fits the transform. Either way there is nothing to search.
+    // Below P1_MIN_RATE the capture cannot hold enough of the P1's carriers; above about 18.3 MS/s (8 MHz) or
+    // 13.7 MS/s (6 MHz) the A part no longer fits the transform. Either way there is nothing to search.
     if sample_rate.is_nan() || sample_rate < P1_MIN_RATE || x.len() < 32_768 || w + 2 > NFFT || w < 64 {
         return None;
     }
@@ -605,7 +605,7 @@ mod tests {
         // Control: at the rate the capture was made for, the P1 is found and the label is T2.
         assert_eq!(detect_dvb(&t2, 2_048_000, 8).map(|d| d.signal_type), Some("dtv_dvbt2"));
         assert!(find_p1(&t2, 2_048_000, 8).is_some());
-        for rate in [1u32, 250_000, 900_001, 2_048_000, 3_200_000] {
+        for rate in [1u32, 250_000, 900_001, 1_000_000, 1_200_000, 2_048_000, 3_200_000] {
             for (name, iq) in [("noise", &noise), ("t2", &t2)] {
                 let d = detect_dvb(iq, rate, 8);
                 let w = find_p1_in_window(iq, rate, 8);
