@@ -494,9 +494,16 @@ pub fn canonical_listed_port(requested: &str, ports: &[SerialPortInfo], case_ins
     ports.iter().find(|p| norm(&p.port_name) == want).map(|p| p.port_name.clone())
 }
 
+/// USB vendor id of Samsung mobile/modem interfaces; their ports often carry no
+/// descriptive strings, so the VID alone marks them as modems.
+const USB_VID_SAMSUNG_MODEM: u16 = 0x04E8;
+
 /// Phones and cellular modems expose AT/diagnostic serial ports that can never
 /// be a GPS receiver. They are not auto-probed (still selectable by hand).
 pub fn is_modem_port(p: &SerialPortInfo) -> bool {
+    if p.vid == Some(USB_VID_SAMSUNG_MODEM) {
+        return true;
+    }
     let text = format!(
         "{} {}",
         p.product.as_deref().unwrap_or(""),
