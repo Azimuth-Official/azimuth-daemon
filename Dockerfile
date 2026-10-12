@@ -49,6 +49,9 @@ RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/azimuth \
 
 COPY --from=builder /app/target/release/azimuth-daemon /usr/local/bin/azimuth-daemon
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# Licence texts and third-party notices (libusb LGPL-2.1 is statically linked).
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/doc/azimuth-daemon/
+COPY licenses/ /usr/share/doc/azimuth-daemon/licenses/
 # Normalize potential CRLF (Windows checkout) so the shebang works in-container.
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh \
  && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/azimuth-daemon

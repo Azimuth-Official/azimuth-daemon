@@ -26,4 +26,36 @@ bind the WinUSB driver to Interface 0 of an RTL-SDR (`azimuth-daemon --install-d
 - **Microsoft SDK.** libwdi is built with the Microsoft Windows SDK; its redistributable
   components fall under the SDK license.
 
+## libusb (USB access, statically linked)
+
+The daemon reads RTL-SDR dongles through [libusb](https://libusb.info/) 1.0, statically
+linked into every `azimuth-daemon` artifact (Linux tarballs, the Docker image, the Windows
+executable) via the vendored copy in the `libusb1-sys` 0.7.0 crate.
+
+- **License.** GNU Lesser General Public License, version 2.1 or later. The full text
+  ships in `licenses/LGPL-2.1.txt`.
+- **Copyright.** Copyright (C) 2001 Johannes Erdfelt, 2007-2009 Daniel Drake, 2010-2012
+  Peter Stuge, 2008-2016 Nathan Hjelm, 2009-2013 Pete Batard, 2009-2013 Ludovic Rousseau,
+  2010-2012 Michael Plante, 2011-2013 Hans de Goede, 2012-2013 Martin Pieuchot, 2012-2013
+  Toby Gray, 2013-2018 Chris Dickens and other libusb contributors (see the `AUTHORS`
+  file in the libusb source).
+- **Modifications.** None. libusb is used unmodified. The corresponding source is the
+  public libusb release vendored by `libusb1-sys` 0.7.0 (<https://crates.io/crates/libusb1-sys>).
+- **Relinking (LGPL section 6).** The complete Azimuth daemon source is public in this
+  repository. To use a modified libusb, point `libusb1-sys` at your build (for example
+  with `cargo vendor` and a patched copy of the crate) and rebuild the daemon with
+  `cargo build --release`.
+
+## MPL-2.0 crates
+
+- `rtl-sdr-rs` 0.3.3 and `serialport` 4.9.0 are licensed under the Mozilla Public
+  License 2.0 (file-level copyleft). They are used unmodified as published on
+  crates.io; their source is available there (<https://crates.io/crates/rtl-sdr-rs>,
+  <https://crates.io/crates/serialport>).
+
+## unescaper (dual licence, MIT elected)
+
+- `unescaper` 0.1.8 (pulled in by `serialport` on Linux targets) is dual-licensed
+  "GPL-3.0/MIT". Azimuth elects the **MIT** option; no GPL-3.0 obligation applies.
+
 Azimuth itself is licensed under the Apache License, Version 2.0; see `LICENSE` and `NOTICE` at the repository root. This file lists third-party components only.

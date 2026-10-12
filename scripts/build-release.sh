@@ -113,7 +113,7 @@ build() {
   [ -f "$outdir/azimuth-daemon" ] || outdir="$REPO_DIR/target/$triple/release"
   [ -f "$outdir/azimuth-daemon" ] || { echo "  no binary for $triple"; return 1; }
   ( cd "$outdir" \
-      && tar "${TAR_META[@]}" -cf - azimuth-daemon | gzip -9n > "$OUT/azimuth-daemon-$VER-$plat.tar.gz" )
+      && tar "${TAR_META[@]}" -cf - azimuth-daemon -C "$REPO_DIR" LICENSE NOTICE THIRD_PARTY_NOTICES.md licenses | gzip -9n > "$OUT/azimuth-daemon-$VER-$plat.tar.gz" )
   ( cd "$OUT" && sha256sum "azimuth-daemon-$VER-$plat.tar.gz" > "azimuth-daemon-$VER-$plat.tar.gz.sha256" )
   echo "  OK  $plat -> $(stat -c%s "$OUT/azimuth-daemon-$VER-$plat.tar.gz") bytes"
 }
