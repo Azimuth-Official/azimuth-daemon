@@ -41,12 +41,14 @@ const CFO_STEP_HZ: f64 = 4_000.0;
 /// Points of the delay-domain correlation (one period of the A symbol, 1024 T, is covered).
 const DELAY_FFT: usize = 512;
 /// Largest |delay| (samples) of the P1 against the stage-1 estimate that is searched (the measured stage-1
-/// error is at most 34 samples at -3 dB).
-const DELAY_MAX: f64 = 56.0;
+/// error is at most 34 samples at -3 dB, 2.3x margin for multipath).
+const DELAY_MAX: f64 = 80.0;
 /// Carriers farther than this from the tuner centre are outside the capture passband.
 const VISIBLE_HZ: f64 = 0.92e6;
 const MIN_VISIBLE: usize = 40;
 const NFFT: usize = 2048;
+/// Lowest sample rate (Hz) at which the visible part of the P1 is searched.
+const P1_MIN_RATE: f64 = 1.0e6;
 
 /// Active carrier indices k_P1(0..383), EN 302 755 Table 68 (clause 9.8.2.1).
 const ACTIVE: [u16; 384] = [
@@ -311,7 +313,9 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
 pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: f64) -> Option<P1Detection> {
     let s = sample_rate * t_us * 1e-6; // capture samples per T
     let w = (P1_A_LEN * s).round() as usize;
-    if x.len() < 32_768 || w + 2 > NFFT {
+    // Below P1_MIN_RATE the capture cannot hold enough of the P1's carriers; above about 5.8 MS/s the A part
+    // no longer fits the transform. Either way there is nothing to search.
+    if !(sample_rate >= P1_MIN_RATE) || x.len() < 32_768 || w + 2 > NFFT || w < 64 {
         return None;
     }
     let tb = tables();
@@ -320,13 +324,14 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
     let slot: Vec<i64> = ACTIVE.iter().map(|&k| i64::from(k) - 426).collect();
     let nu: Vec<f64> = slot.iter().map(|&m| m as f64 / (P1_A_LEN * t_sec)).collect();
     let n_f = (CFO_MAX_HZ / CFO_STEP_HZ) as i64;
+    let visible_hz = VISIBLE_HZ.min(0.45 * sample_rate);
     let bin_hz = sample_rate / NFFT as f64;
     let fft = plan(NFFT, false);
     let ifft = plan(DELAY_FFT, true);
     // A sub-sample delay delta (samples) multiplies carrier slot m by e^{+j 2 pi m delta / (1024 s)}, so the
     // correlation for every delay on a grid of 1024 s / DELAY_FFT samples is one inverse FFT over the slots.
     let delay_step = P1_A_LEN * s / DELAY_FFT as f64;
-    let j_max = (DELAY_MAX / delay_step).ceil() as usize;
+    let j_max = ((DELAY_MAX / delay_step).ceil() as usize).min(DELAY_FFT / 2 - 1);
     let zero = Complex::new(0.0f32, 0.0f32);
     let mut scratch = vec![zero; ifft.get_inplace_scratch_len()];
     let mut z2: Vec<Vec<Complex<f32>>> = vec![Vec::new(); 16];
@@ -354,7 +359,7 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
             let mut energy = 0.0f32;
             for (i, &v) in nu.iter().enumerate() {
                 let fr = v + f;
-                if fr.abs() > VISIBLE_HZ {
+                if fr.abs() > visible_hz {
                     continue;
                 }
                 let bin = (fr / bin_hz).round() as i64;
@@ -585,5 +590,38 @@ mod tests {
             all.extend(v);
         }
         println!("RATIO worst negative {worst:.2}");
+    }
+
+    #[test]
+    fn any_sample_rate_and_buffer_length_is_handled_without_a_panic() {
+        use super::super::{detect_dvb, find_p1, find_p1_in_window};
+        let mode = T2Mode { fft: super::super::FftMode::K8, gi: super::super::GuardInterval::G1_8, extended: false };
+        let t2 = t2_capture(11, T2Params::new(mode), 12.0, 20_000.0, false);
+        let noise = negative_capture(12, Negative::Awgn);
+        // Control: at the rate the capture was made for, the P1 is found and the label is T2.
+        assert_eq!(detect_dvb(&t2, 2_048_000, 8).map(|d| d.signal_type), Some("dtv_dvbt2"));
+        assert!(find_p1(&t2, 2_048_000, 8).is_some());
+        for rate in [1u32, 250_000, 900_001, 2_048_000, 3_200_000] {
+            for (name, iq) in [("noise", &noise), ("t2", &t2)] {
+                let d = detect_dvb(iq, rate, 8);
+                let w = find_p1_in_window(iq, rate, 8);
+                let f = find_p1(iq, rate, 8);
+                if rate < 1_000_000 {
+                    assert!(w.is_none() && f.is_none(), "{name} at {rate} Hz: a P1 cannot be resolved");
+                    assert_ne!(d.map(|d| d.signal_type), Some("dtv_dvbt2"), "{name} at {rate} Hz");
+                }
+            }
+        }
+        // Empty and odd byte counts, and unknown bandwidths.
+        for len in [0usize, 1, 2, 3, 4095, 262_143, 262_145] {
+            let b = &t2[..len.min(t2.len())];
+            assert!(detect_dvb(b, 2_048_000, 8).is_none() || len >= 262_143, "len {len}");
+            let _ = find_p1_in_window(b, 2_048_000, 8);
+            let _ = find_p1(b, 2_048_000, 5);
+        }
+        for rate in [0u32, 1, u32::MAX] {
+            let _ = detect_dvb(&noise, rate, 6);
+            let _ = find_p1_in_window(&noise, rate, 7);
+        }
     }
 }

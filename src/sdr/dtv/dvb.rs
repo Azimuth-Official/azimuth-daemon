@@ -289,8 +289,8 @@ pub fn analyze_with_p1(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32,
         let l = mode.n() as f64 * t_us * 1e-6 * sample_rate;
         let li = l.round() as usize;
         let frac = l - li as f64;
-        // Need several symbol repeats of data after the lag.
-        if m < 5 * li + 128 {
+        // Need several symbol repeats of data after the lag (and a lag of at least a few samples).
+        if li < 4 || m < 5 * li + 128 {
             continue;
         }
         let delayed_owned: Vec<Complex<f32>>;
