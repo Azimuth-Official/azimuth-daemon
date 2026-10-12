@@ -1916,9 +1916,7 @@ mod dsp_plan_tests {
 
         let t2 = dvb_capture(12, FftMode::K32, GuardInterval::G19_128, 8, 12.0, -120_000.0, false);
         let r2 = scanner.scan_dvb_capture(&t2, 2_048_000, 682_000_000, -40.0);
-        assert_eq!(r2[0].signal_type, "dtv_dvbt2");
-        assert_eq!(r2[0].source_id.as_deref(), Some("dvb_ch47"));
-        assert_eq!(r2[0].raw_data.as_ref().unwrap()["t2_possible"], true);
+        assert!(r2.is_empty(), "a CP-only T2-only mode without a P1 is not DVB-T and T2 is unproven: no observation");
     }
 
     #[test]

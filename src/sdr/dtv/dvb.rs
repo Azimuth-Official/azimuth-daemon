@@ -461,12 +461,12 @@ mod tests {
     fn labeling_follows_contract_c1() {
         assert_eq!(classify(FftMode::K8, G::G1_8), ("dtv_dvbt", true));
         assert_eq!(classify(FftMode::K2, G::G1_4), ("dtv_dvbt", true));
-        assert_eq!(classify(FftMode::K8, G::G19_128), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K8, G::G1_128), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K32, G::G1_8), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K1, G::G1_16), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K4, G::G1_32), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K16, G::G1_16), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K8, G::G19_128), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K8, G::G1_128), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K32, G::G1_8), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K1, G::G1_16), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K4, G::G1_32), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K16, G::G1_16), (T2_UNCONFIRMED, true));
     }
 
     #[test]
