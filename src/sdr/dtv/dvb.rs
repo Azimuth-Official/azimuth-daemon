@@ -40,7 +40,10 @@
 //! carrier spacing 1/Tu (the 2 MHz capture sees a flat part of the spectrum), so
 //! `cfo_hz` is the fractional carrier offset in [-1/(2 Tu), +1/(2 Tu)).
 
-use super::p1::{detect_p1, P1Detection};
+// Loaded through `#[path]` so `examples/dvb_probe.rs`, which includes this file on its own, still builds.
+#[path = "p1.rs"]
+pub mod p1;
+use p1::{detect_p1, P1Detection};
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Capture length the detector is validated for (samples at 2.048 MS/s).
@@ -324,7 +327,7 @@ pub fn analyze_with_p1(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32,
         pre_c.push(ac);
         pre_e.push(ae);
         for n in 32..32 + nmax {
-            let skip = hole.map_or(false, |(lo, hi, _, _)| (n as f64) <= hi && ((n + li) as f64) >= lo);
+            let skip = hole.is_some_and(|(lo, hi, _, _)| (n as f64) <= hi && ((n + li) as f64) >= lo);
             let (a, b) = if skip { (Complex::new(0.0, 0.0), Complex::new(0.0, 0.0)) } else { (x[n], y[n + li]) };
             ac += Complex::new(f64::from(a.re), f64::from(a.im)) * Complex::new(f64::from(b.re), -f64::from(b.im));
             ae += 0.5 * f64::from(a.norm_sqr() + b.norm_sqr());

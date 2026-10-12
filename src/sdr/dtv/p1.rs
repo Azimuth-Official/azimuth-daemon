@@ -177,8 +177,8 @@ struct Tables {
 fn tables() -> Tables {
     let pr = prbs(384);
     let (mut s1a, mut s1b, mut par_s1) = (Vec::new(), Vec::new(), Vec::new());
-    for s1 in 0..8 {
-        let bits = hex_bits(S1_HEX[s1]);
+    for hex in S1_HEX {
+        let bits = hex_bits(hex);
         let (a, p) = segment_signs(&bits, &pr[..64]);
         let (b, _) = segment_signs(&bits, &pr[320..384]);
         s1a.push(a);
@@ -186,8 +186,8 @@ fn tables() -> Tables {
         par_s1.push(p);
     }
     let (mut s2, mut par_s2) = (Vec::new(), Vec::new());
-    for s in 0..16 {
-        let bits = hex_bits(S2_HEX[s]);
+    for hex in S2_HEX {
+        let bits = hex_bits(hex);
         let (t, p) = segment_signs(&bits, &pr[64..320]);
         s2.push(t);
         par_s2.push(p);
@@ -345,10 +345,10 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
                 let z1a = seg(&tb.s1a[s1], 0, 64);
                 let z1b = seg(&tb.s1b[s1], 320, 384);
                 let pa = tb.par_s1[s1];
-                for s2 in 0..16 {
+                for (s2, z2s) in z2.iter().enumerate() {
                     let pb = pa * tb.par_s2[s2];
                     for j in 0..DELAY_FFT {
-                        let rho2 = (z1a[j] + z2[s2][j] * pa + z1b[j] * pb).norm_sqr() * norm2;
+                        let rho2 = (z1a[j] + z2s[j] * pa + z1b[j] * pb).norm_sqr() * norm2;
                         if rho2 > best_rho2 {
                             best_rho2 = rho2;
                             let jj = if j <= DELAY_FFT / 2 { j as f64 } else { j as f64 - DELAY_FFT as f64 };
@@ -376,9 +376,9 @@ pub fn detect_p1(x: &[Complex<f32>], sample_rate: f64, t_us: f64) -> Option<P1De
 
 #[cfg(test)]
 mod tests {
-    use super::super::dvb::iq_u8_to_complex;
-    use super::super::testgen::{negative_capture, random_cfo, Negative, Rng};
-    use super::super::testgen_t2::*;
+    use super::super::iq_u8_to_complex;
+    use crate::sdr::dtv::testgen::{negative_capture, random_cfo, Negative, Rng};
+    use crate::sdr::dtv::testgen_t2::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -423,13 +423,13 @@ mod tests {
         rhos.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("elapsed {:?} for {} captures", t0.elapsed(), res.len());
         println!("T2 SNR {snr}: rho min {:.3} p5 {:.3} median {:.3}", rhos[0], rhos[rhos.len() / 20], rhos[rhos.len() / 2]);
-        let bad_s2 = res.iter().zip(0..).filter(|(r, j)| r.map_or(true, |d| d.2 != (s2_field1(modes[j / trials].fft, modes[j / trials].gi) << 1) & 15 || d.1 != 0)).count();
+        let bad_s2 = res.iter().zip(0..).filter(|(r, j)| r.is_none_or(|d| d.2 != (s2_field1(modes[j / trials].fft, modes[j / trials].gi) << 1) & 15 || d.1 != 0)).count();
         println!("decoded S1/S2 wrong: {bad_s2}");
         let cfo_err: Vec<f64> = res.iter().filter_map(|r| r.map(|d| d.3.abs())).collect();
         for (j, r) in res.iter().enumerate() {
             let m = modes[j / trials];
             let want = (s2_field1(m.fft, m.gi) << 1) & 15;
-            if r.map_or(true, |d| d.0 < 0.55 || d.2 != want || d.1 != 0) {
+            if r.is_none_or(|d| d.0 < 0.55 || d.2 != want || d.1 != 0) {
                 println!("  weak: {} j={j} {:?}", m.label(), r);
             }
         }
@@ -467,7 +467,7 @@ mod tests {
     fn no_p1_in_noise_cp_only_ofdm_or_a_p1_less_t2_stream() {
         let x = iq_u8_to_complex(&negative_capture(5, Negative::Awgn));
         assert!(detect_p1(&x, 2_048_000.0, 7.0 / 64.0).is_none());
-        let mode = T2Mode { fft: super::super::dvb::FftMode::K8, gi: super::super::dvb::GuardInterval::G1_8, extended: false };
+        let mode = T2Mode { fft: super::super::FftMode::K8, gi: super::super::GuardInterval::G1_8, extended: false };
         let mut p = T2Params::new(mode);
         p.with_p1 = false;
         let x = iq_u8_to_complex(&t2_capture(6, p, 12.0, 0.0, false));

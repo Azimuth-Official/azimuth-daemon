@@ -755,7 +755,9 @@ impl Scanner {
         self.finish_band(BandKind::Dtv, found, failed);
     }
 
-    /// Build the detection-only observation for a DVB capture, or nothing.
+    /// Build the detection-only observation for a single DVB capture, or nothing (the dwell's first-capture
+    /// step without the extra captures; the unit-test entry point of the detector-to-observation path).
+    #[cfg(test)]
     fn scan_dvb_capture(&self, iq_bytes: &[u8], sample_rate: u32, freq: u64, dbm: f64) -> Vec<ScanResult> {
         let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
         let Some(det) = dvb::detect_dvb(iq_bytes, sample_rate, bandwidth_mhz) else { return Vec::new() };
@@ -1154,7 +1156,9 @@ impl Scanner {
 
     /// The tune path without the pipe-error recovery ladder (which needs the device manager):
     /// settle, lock check and retries on any `TunerOps`. A final failure is counted in
-    /// `tune_fail_count`.
+    /// `tune_fail_count`. The production path runs the same `tune_and_settle` ladder inside
+    /// `tune_with_recovery_inner`; this is the entry point for an injected tuner.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn tune_with_recovery_on(&mut self, tuner: &mut dyn TunerOps, freq: u64) -> Option<()> {
         let r = match self.tune_and_settle(tuner, freq) {
             Ok(true) => Some(()),
