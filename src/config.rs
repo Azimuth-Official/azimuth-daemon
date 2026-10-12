@@ -1189,4 +1189,35 @@ gain = -1
         us.apply_region_with(fake_locate);
         assert_eq!(us.scanning.as_ref().unwrap().fm.sweep_step, 200_000);
     }
+
+    // --- G1d: AUTO resolves through the REAL boundary dataset ------------------
+
+    fn auto_plan(lat: f64, lon: f64) -> (RegionResolution, Config) {
+        let mut c = at(lat, lon, Some("AUTO"));
+        let r = c.apply_region();
+        (r, c)
+    }
+
+    #[test]
+    fn g1d_auto_new_york_is_us_with_the_6_mhz_atsc_plan() {
+        let (r, c) = auto_plan(40.7128, -74.0060);
+        assert_eq!(r, RegionResolution { effective: "US".to_string(), source: "auto:location" });
+        let dtv = &c.scanning.as_ref().unwrap().dtv;
+        assert_eq!(dtv.standard, "ATSC");
+        assert_eq!((dtv.channel_mhz, dtv.sweep_step), (6, 6_000_000));
+        assert_eq!((dtv.sweep_start, dtv.sweep_end), (470_000_000, 608_000_000));
+    }
+
+    #[test]
+    fn g1d_auto_paris_and_london_get_the_8_mhz_dvb_t2_694_plan() {
+        for (lat, lon, code) in [(48.8566, 2.3522, "FR"), (51.5074, -0.1278, "GB")] {
+            let (r, c) = auto_plan(lat, lon);
+            assert_eq!(r, RegionResolution { effective: code.to_string(), source: "auto:location" }, "{code}");
+            let dtv = &c.scanning.as_ref().unwrap().dtv;
+            assert_eq!(dtv.standard, "DVB-T2-694", "{code}");
+            assert_eq!((dtv.channel_mhz, dtv.sweep_step), (8, 8_000_000), "{code}");
+            assert_eq!((dtv.sweep_start, dtv.sweep_end), (470_000_000, 694_000_000), "{code}");
+            assert_eq!(dtv.first_channel, 21, "{code}");
+        }
+    }
 }

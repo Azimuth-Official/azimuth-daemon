@@ -1880,6 +1880,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 
+    // --- G1b: a moved node changes region without a restart -------------------
+
+    /// Wait until the registrar has finished, so a later write sees a real id.
+    async fn wait_registered(h: &Harness) {
+        for _ in 0..100 {
+            if h.state.status.read().await.registration_state == "registered" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("registration did not complete");
+    }
+
+    /// Characterization (passes today): writes with `region = AUTO` hot-apply the
+    /// region of the NEW location, in /status and in the plan handed to the scanner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn g1b_config_write_follows_the_location_region_without_a_restart() {
+        let mut h = harness("g1b").await;
+        let write = |lat: f64, lon: f64| {
+            let mut body = wizard_body(lat, lon, "k1");
+            body["region"] = serde_json::json!("AUTO");
+            body
+        };
+
+        // Paris -> FR, the 8 MHz DVB-T2-694 plan.
+        assert_eq!(post_config(&h, write(48.8566, 2.3522)).await, StatusCode::OK);
+        wait_registered(&h).await;
+        {
+            let s = h.state.status.read().await;
+            assert_eq!(s.region_effective.as_deref(), Some("FR"));
+            assert_eq!(s.region_source, "auto:location");
+        }
+        let plan = h.apply_rx.try_recv().expect("scan plan after the first write").scanning.unwrap();
+        assert_eq!((plan.dtv.standard.as_str(), plan.dtv.channel_mhz), ("DVB-T2-694", 8));
+
+        // London -> GB with no restart in between.
+        assert_eq!(post_config(&h, write(51.5074, -0.1278)).await, StatusCode::OK);
+        {
+            let s = h.state.status.read().await;
+            assert_eq!(s.region_effective.as_deref(), Some("GB"), "region must follow the new location");
+            assert_eq!(s.live_location.0, 51.5074);
+        }
+        let plan = h.apply_rx.try_recv().expect("scan plan after the second write").scanning.unwrap();
+        assert_eq!((plan.dtv.standard.as_str(), plan.dtv.sweep_step), ("DVB-T2-694", 8_000_000));
+
+        // FR and GB share a DTV plan, so prove the plan itself follows too: New York -> US / ATSC 6 MHz.
+        assert_eq!(post_config(&h, write(40.7128, -74.0060)).await, StatusCode::OK);
+        assert_eq!(h.state.status.read().await.region_effective.as_deref(), Some("US"));
+        let plan = h.apply_rx.try_recv().expect("scan plan after the third write").scanning.unwrap();
+        assert_eq!((plan.dtv.standard.as_str(), plan.dtv.channel_mhz, plan.dtv.sweep_step), ("ATSC", 6, 6_000_000));
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
     // R1.7: the Dockerfile HEALTHCHECK is healthy ONLY when config_state == "ok".
     fn healthcheck_pattern() -> String {
         let dockerfile = include_str!("../Dockerfile");
