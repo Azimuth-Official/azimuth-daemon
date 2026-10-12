@@ -1,6 +1,6 @@
 use crate::config::{DtvScanConfig, FmScanConfig, LteScanConfig, ScanningConfig};
 use crate::observation::Observation;
-use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
+use crate::sdr::{SdrDevice, SdrManager, TunerOps, calculate_signal_power};
 use crate::sdr::recovery::{RecoveryAction, RecoveryManager, reset_usb_bus_device, restart_os_device};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -44,6 +44,12 @@ pub struct BandSweep {
     pub tune_failed: u32,
     /// FM only: candidates dropped as a mirror image or adjacent-channel spill.
     pub spill_rejected: u32,
+    /// Tunes whose PLL did not report lock after the settle wait (every one, retries included).
+    pub pll_lock_failures: u32,
+    /// Post-tune settle waits performed, retries included.
+    pub settle_waits: u32,
+    /// Re-tunes attempted after a failed PLL lock.
+    pub tune_retries: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
 }
@@ -1020,16 +1026,62 @@ impl Scanner {
 
     /// PLL settle delay. Large cross-band jumps (> 100 MHz) use 250 ms;
     /// otherwise use the configured retune_delay_ms.
-    fn retune_delay(&self, device: &SdrDevice, freq: u64) -> Duration {
+    fn retune_delay(&self, last_tuned: Option<u64>, freq: u64) -> Duration {
         const LARGE_JUMP_HZ: u64 = 100_000_000;
         const LARGE_JUMP_DELAY_MS: u64 = 250;
 
-        match device.last_tuned_freq_hz() {
+        match last_tuned {
             Some(prev) if freq.abs_diff(prev) > LARGE_JUMP_HZ => {
                 Duration::from_millis(LARGE_JUMP_DELAY_MS)
             }
             _ => Duration::from_millis(self.retune_delay_ms as u64),
         }
+    }
+
+    /// The sweep record of the band currently being swept, if any.
+    fn sweeping_band_mut(&mut self) -> Option<&mut BandSweep> {
+        [&mut self.sweep.fm, &mut self.sweep.lte, &mut self.sweep.dtv].into_iter().find(|b| b.in_progress)
+    }
+
+    /// One tune with settle and PLL lock check; a lost lock is re-tuned up to `PLL_TUNE_ATTEMPTS`
+    /// times in all. `Ok(true)` = locked, `Ok(false)` = lock never obtained, `Err` = the tune
+    /// itself failed (the caller decides whether that is a pipe error to recover from).
+    /// Every settle wait, lock failure and retry is counted in the band being swept.
+    fn tune_and_settle(&mut self, tuner: &mut dyn TunerOps, freq: u64) -> anyhow::Result<bool> {
+        const PLL_TUNE_ATTEMPTS: u32 = 3;
+        for attempt in 0..PLL_TUNE_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(b) = self.sweeping_band_mut() {
+                    b.tune_retries += 1;
+                }
+                self.publish_sweep();
+            }
+            // Delay from the *previous* tuned frequency BEFORE the tune updates it: the
+            // jump size is a property of the transition, not of the target.
+            let delay = self.retune_delay(tuner.last_tuned_freq_hz(), freq);
+            tuner.set_frequency(freq)?;
+            tuner.set_last_tuned_freq_hz(freq);
+            // Settle AFTER the tune. The PLL needs this time to lock the NEW
+            // frequency. Sleeping before set_center_freq waited on the
+            // previous, already-locked frequency and left ZERO settle before
+            // the caller's capture_raw() — so every post-retune capture read
+            // a slewing PLL. That is the "only the strongest station is ever
+            // found" symptom.
+            if delay > Duration::ZERO {
+                std::thread::sleep(delay);
+            }
+            if let Some(b) = self.sweeping_band_mut() {
+                b.settle_waits += 1;
+            }
+            if tuner.has_lock() {
+                return Ok(true);
+            }
+            if let Some(b) = self.sweeping_band_mut() {
+                b.pll_lock_failures += 1;
+            }
+            self.publish_sweep();
+        }
+        Ok(false)
     }
 
     /// Tune a device, applying band-aware delay and recovering from pipe errors
@@ -1047,41 +1099,43 @@ impl Scanner {
         r
     }
 
+    /// The tune path without the pipe-error recovery ladder (which needs the device manager):
+    /// settle, lock check and retries on any `TunerOps`. A final failure is counted in
+    /// `tune_fail_count`.
+    fn tune_with_recovery_on(&mut self, tuner: &mut dyn TunerOps, freq: u64) -> Option<()> {
+        let r = match self.tune_and_settle(tuner, freq) {
+            Ok(true) => Some(()),
+            Ok(false) => {
+                warn!(freq, "Tuner PLL did not lock after retries");
+                None
+            }
+            Err(e) => {
+                warn!(freq, error = %e, "Failed to tune device");
+                None
+            }
+        };
+        if r.is_none() {
+            self.tune_fail_count += 1;
+        }
+        r
+    }
+
     fn tune_with_recovery_inner(
         &mut self,
         sdr_manager: &mut SdrManager,
         device_idx: usize,
         freq: u64,
     ) -> Option<()> {
-        // Compute the delay from the *previous* tuned frequency BEFORE the tune
-        // updates it — the jump size is a property of the transition, not of the
-        // target. (Computing it after set_last_tuned_freq_hz would make
-        // freq.abs_diff(prev) == 0 and silently delete the large-jump path.)
-        let delay = {
-            let device = sdr_manager.device_mut(device_idx)?;
-            self.retune_delay(device, freq)
-        };
-
         let result = {
             let device = sdr_manager.device_mut(device_idx)?;
-            device.set_center_freq(freq)
+            self.tune_and_settle(device, freq)
         };
 
         match result {
-            Ok(()) => {
-                if let Some(device) = sdr_manager.device_mut(device_idx) {
-                    device.set_last_tuned_freq_hz(freq);
-                }
-                // Settle AFTER the tune. The PLL needs this time to lock the NEW
-                // frequency. Sleeping before set_center_freq waited on the
-                // previous, already-locked frequency and left ZERO settle before
-                // the caller's capture_raw() — so every post-retune capture read
-                // a slewing PLL. That is the "only the strongest station is ever
-                // found" symptom.
-                if delay > Duration::ZERO {
-                    std::thread::sleep(delay);
-                }
-                Some(())
+            Ok(true) => Some(()),
+            Ok(false) => {
+                warn!(device = device_idx, freq, "Tuner PLL did not lock after retries");
+                None
             }
             Err(e) => {
                 if !is_pipe_error(&e) {
@@ -1100,19 +1154,18 @@ impl Scanner {
                 loop {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
-                            let device = sdr_manager.device_mut(device_idx)?;
-                            match device.set_center_freq(freq) {
-                                Ok(()) => {
-                                    device.set_last_tuned_freq_hz(freq);
+                            let retried = {
+                                let device = sdr_manager.device_mut(device_idx)?;
+                                self.tune_and_settle(device, freq)
+                            };
+                            match retried {
+                                Ok(locked) => {
                                     self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Tune succeeded after recovery");
-                                    // Same post-tune PLL settle as the happy path — a
-                                    // capture straight after a recovery retune is just
-                                    // as vulnerable to reading a slewing PLL.
-                                    if delay > Duration::ZERO {
-                                        std::thread::sleep(delay);
-                                    }
-                                    return Some(());
+                                    // Same post-tune PLL settle as the happy path (inside
+                                    // `tune_and_settle`): a capture straight after a recovery
+                                    // retune is just as vulnerable to reading a slewing PLL.
+                                    return locked.then_some(());
                                 }
                                 Err(e2) => {
                                     if is_pipe_error(&e2) {
