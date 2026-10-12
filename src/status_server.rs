@@ -2207,3 +2207,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 }
+
+#[cfg(test)]
+mod sweep_pll_tests;

@@ -1835,3 +1835,6 @@ mod dsp_plan_tests {
 
 #[cfg(test)]
 mod tests_dsp;
+
+#[cfg(test)]
+mod tests_pll;
