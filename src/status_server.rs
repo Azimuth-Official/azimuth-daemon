@@ -1933,6 +1933,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h.dir);
     }
 
+    // --- R1: config state, end to end, no restart -------------------------------
+
+    /// `(config_state, on_air, on_air_reason)` exactly as /status would report them.
+    async fn state_view(h: &Harness) -> (String, bool, Option<String>) {
+        let v = serde_json::to_value(h.state.status.read().await.to_info(true, false)).unwrap();
+        (
+            v["config_state"].as_str().unwrap().to_string(),
+            v["on_air"].as_bool().unwrap(),
+            v["on_air_reason"].as_str().map(str::to_string),
+        )
+    }
+
+    /// Characterization (passes today): one daemon lifetime walks awaiting_setup ->
+    /// ok -> registered -> SDR present -> accepted observation -> on_air, with a
+    /// config write as the only trigger and no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r1_awaiting_setup_to_on_air_without_a_restart() {
+        let h = harness("r1walk").await;
+        assert_eq!(state_view(&h).await, ("awaiting_setup".to_string(), false, Some("config".to_string())));
+
+        // The wizard writes the config: state flips to ok, registration follows by itself.
+        assert_eq!(post_config(&h, wizard_body(48.8566, 2.3522, "k1")).await, StatusCode::OK);
+        assert_eq!(h.state.status.read().await.config_state, ConfigState::Ok);
+        wait_registered(&h).await;
+        assert_eq!(state_view(&h).await, ("ok".to_string(), false, Some("no_sdr".to_string())));
+
+        // An SDR shows up: still not on air until the server accepts an observation.
+        h.state.status.write().await.sdr_connected = true;
+        assert_eq!(state_view(&h).await, ("ok".to_string(), false, Some("no_accepted_observations".to_string())));
+
+        // The scanner submits under the live node id and the server accepts it.
+        let obs = vec![crate::observation::Observation {
+            signal_type: "fm_rds".to_string(),
+            observed_at: chrono::Utc::now(),
+            frequency_hz: Some(98_500_000),
+            timestamp_ns: None,
+            tdoa_offset_ns: None,
+            signal_strength_dbm: None,
+            snr_db: None,
+            source_id: None,
+            raw_data: None,
+        }];
+        node_runtime::submit_batch(&h.state.status, &h.client, obs).await;
+        assert_eq!(state_view(&h).await, ("ok".to_string(), true, None));
+        {
+            let seen = h.seen.lock().unwrap();
+            let sent: Vec<_> = seen.iter().filter(|(p, _)| p == "/api/observations").collect();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].1["node_id"], "real-node-1");
+        }
+        let _ = std::fs::remove_dir_all(&h.dir);
+    }
+
     // R1.7: the Dockerfile HEALTHCHECK is healthy ONLY when config_state == "ok".
     fn healthcheck_pattern() -> String {
         let dockerfile = include_str!("../Dockerfile");
