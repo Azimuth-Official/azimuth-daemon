@@ -493,4 +493,196 @@ mod tests {
         assert_eq!(c[1]["label"], "new-label", "the second attempt uses the NEW settings");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- G3: per-item rejection handling in submit_batch -----------------------
+
+    /// Requests the fake observations API saw, in order.
+    type Bodies = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// Fake API answering every POST with `reply(request_index, body)`.
+    async fn fake_obs_api(
+        reply: impl Fn(usize, &serde_json::Value) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, Bodies) {
+        let seen: Bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (rec, reply) = (Arc::clone(&seen), Arc::new(reply));
+        let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let (rec, reply) = (Arc::clone(&rec), Arc::clone(&reply));
+            async move {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let idx = {
+                    let mut g = rec.lock().unwrap();
+                    g.push(v.clone());
+                    g.len() - 1
+                };
+                let (code, text) = reply(idx, &v);
+                (axum::http::StatusCode::from_u16(code).unwrap(), text)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn live_state() -> Arc<RwLock<StatusState>> {
+        let state = Arc::new(RwLock::new(StatusState::new("real-node-1".into(), "tier1_rtlsdr".into())));
+        state.write().await.config_state = ConfigState::Ok;
+        state
+    }
+
+    fn client_to(base: &str) -> ApiClient {
+        ApiClient::new(base, Arc::new(std::sync::RwLock::new("k".to_string())))
+    }
+
+    fn obs_at(signal_type: &str, frequency_hz: u64) -> Observation {
+        Observation {
+            signal_type: signal_type.to_string(),
+            observed_at: chrono::Utc::now(),
+            frequency_hz: Some(frequency_hz),
+            timestamp_ns: None,
+            tdoa_offset_ns: None,
+            signal_strength_dbm: None,
+            snr_db: None,
+            source_id: None,
+            raw_data: None,
+        }
+    }
+
+    fn frequencies(body: &serde_json::Value) -> Vec<u64> {
+        body["observations"].as_array().unwrap().iter().filter_map(|o| o["frequency_hz"].as_u64()).collect()
+    }
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> LogCapture {
+            self.clone()
+        }
+    }
+
+    /// Thread-local capture of everything `tracing` emits while the guard lives.
+    /// The tests using it run on the default current-thread runtime, so every
+    /// event of the awaited code lands on this thread.
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let cap = LogCapture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (cap, tracing::subscriber::set_default(sub))
+    }
+
+    fn logged(cap: &LogCapture) -> String {
+        String::from_utf8_lossy(&cap.0.lock().unwrap()).to_string()
+    }
+
+    /// G3a (characterization): a partial-acceptance response logs one line per
+    /// rejected item with its index, signal type and the server's reason.
+    #[tokio::test]
+    async fn g3a_partial_acceptance_logs_one_line_per_rejected_item() {
+        let (cap, _guard) = capture_logs();
+        let (base, _seen) = fake_obs_api(|_, _| {
+            (200, r#"{"accepted":1,"rejected":[{"index":0,"reason":"snr out of range"},{"index":2,"reason":"unknown frequency"}]}"#.to_string())
+        })
+        .await;
+        let state = live_state().await;
+        let batch = vec![obs_at("fm_rds", 98_500_000), obs_at("lte_pss", 806_000_000), obs_at("dtv_atsc", 605_000_000)];
+        submit_batch(&state, &client_to(&base), batch).await;
+        let text = logged(&cap);
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("Observation rejected by server")).collect();
+        assert_eq!(lines.len(), 2, "one line per rejected item, got: {text}");
+        assert!(
+            lines[0].contains("index=0") && lines[0].contains("signal_type=") && lines[0].contains("fm_rds") && lines[0].contains("snr out of range"),
+            "{}", lines[0]
+        );
+        assert!(
+            lines[1].contains("index=2") && lines[1].contains("signal_type=") && lines[1].contains("dtv_atsc") && lines[1].contains("unknown frequency"),
+            "{}", lines[1]
+        );
+        assert_eq!(state.read().await.observations_submitted, 1);
+    }
+
+    /// G3b (characterization): an item the server rejected is never sent again,
+    /// over several submit cycles, and a partially accepted batch is not retried.
+    #[tokio::test]
+    async fn g3b_rejected_items_are_never_resubmitted() {
+        let (base, seen) = fake_obs_api(|i, _| match i {
+            // Cycle 1: index 1 (the 99.1 MHz FM item) is rejected.
+            0 => (200, r#"{"accepted":2,"rejected":[{"index":1,"reason":"bad station"}]}"#.to_string()),
+            _ => (200, r#"{"accepted":2,"rejected":[]}"#.to_string()),
+        })
+        .await;
+        let (state, client) = (live_state().await, client_to(&base));
+        const REJECTED_HZ: u64 = 99_100_000;
+        submit_batch(&state, &client, vec![obs_at("fm_rds", 98_500_000), obs_at("fm_rds", REJECTED_HZ), obs_at("fm_rds", 100_300_000)]).await;
+        submit_batch(&state, &client, vec![obs_at("fm_rds", 101_100_000), obs_at("fm_rds", 102_700_000)]).await;
+        submit_batch(&state, &client, vec![obs_at("lte_pss", 806_000_000), obs_at("dtv_atsc", 605_000_000)]).await;
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "exactly one request per cycle: no retry of the partial batch");
+        assert!(frequencies(&bodies[0]).contains(&REJECTED_HZ), "control: cycle 1 did carry the item");
+        for (n, b) in bodies.iter().enumerate().skip(1) {
+            assert!(!frequencies(b).contains(&REJECTED_HZ), "rejected item resubmitted in request {n}");
+        }
+        assert_eq!(state.read().await.observations_submitted, 2 + 2 + 2);
+    }
+
+    /// Run one batch against an API that answers `status`/`body`; returns the
+    /// state, the requests seen and the captured log.
+    async fn one_batch_against(status: u16, body: &'static str) -> (Arc<RwLock<StatusState>>, Bodies, String) {
+        let (cap, _guard) = capture_logs();
+        let (base, seen) = fake_obs_api(move |_, _| (status, body.to_string())).await;
+        let state = live_state().await;
+        let batch = vec![obs_at("fm_rds", 98_500_000), obs_at("fm_rds", 99_100_000)];
+        submit_batch(&state, &client_to(&base), batch).await;
+        // A later cycle must not carry the first batch again.
+        submit_batch(&state, &client_to(&base), vec![obs_at("lte_pss", 806_000_000)]).await;
+        let text = logged(&cap);
+        (state, seen, text)
+    }
+
+    /// G3c (RED today): a 204 with no body is a success. `submit_observations_detailed`
+    /// json-parses the body, so today it is "submit failed; batch dropped".
+    #[tokio::test]
+    async fn g3c_204_empty_body_counts_as_accepted_and_is_not_resubmitted() {
+        let (state, seen, text) = one_batch_against(204, "").await;
+        assert!(!text.contains("batch is dropped") && !text.contains("submit failed"), "204 treated as failure: {text}");
+        let s = state.read().await;
+        assert!(s.last_accepted_at.is_some(), "a 2xx batch must count as accepted");
+        assert_eq!(s.observations_submitted, 2 + 1, "both cycles accepted in full");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "no resubmission");
+        assert_eq!(frequencies(&bodies[1]), vec![806_000_000]);
+    }
+
+    /// G3c (characterization): 202 carrying the usual body is accepted today.
+    #[tokio::test]
+    async fn g3c_202_with_the_normal_body_counts_as_accepted() {
+        let (state, seen, text) = one_batch_against(202, r#"{"accepted":2,"rejected":[]}"#).await;
+        assert!(!text.contains("batch is dropped"), "{text}");
+        assert!(state.read().await.last_accepted_at.is_some());
+        assert_eq!(seen.lock().unwrap().len(), 2, "no resubmission");
+    }
+
+    /// G3c (RED today): a 2xx whose body is not our shape (an async-queue 202)
+    /// is still a success; the batch was taken, so it is neither dropped nor retried.
+    #[tokio::test]
+    async fn g3c_202_with_an_unrecognised_body_counts_as_accepted() {
+        let (state, seen, text) = one_batch_against(202, r#"{"status":"queued"}"#).await;
+        assert!(!text.contains("batch is dropped") && !text.contains("submit failed"), "202 treated as failure: {text}");
+        assert!(state.read().await.last_accepted_at.is_some(), "a 2xx batch must count as accepted");
+        assert_eq!(seen.lock().unwrap().len(), 2, "no resubmission");
+    }
 }

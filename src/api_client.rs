@@ -235,9 +235,19 @@ impl ApiClient {
             }));
         }
 
-        let data: SubmitObservationsResponse = resp.json().await?;
-        debug!(accepted = data.accepted, "Observations submitted");
-        Ok(SubmitOutcome { accepted: data.accepted, rejected: data.rejected })
+        // Any 2xx means the server took the batch. The body is optional: a 204,
+        // an async-queue 202 or an unknown shape counts every item as accepted.
+        let text = resp.text().await.unwrap_or_default();
+        let outcome = match serde_json::from_str::<SubmitObservationsResponse>(&text) {
+            Ok(data) => SubmitOutcome { accepted: data.accepted, rejected: data.rejected },
+            Err(_) => {
+                let rejected = serde_json::from_str::<RejectedBody>(&text).map(|b| b.rejected).unwrap_or_default();
+                let accepted = (request.observations.len() as u32).saturating_sub(rejected.len() as u32);
+                SubmitOutcome { accepted, rejected }
+            }
+        };
+        debug!(accepted = outcome.accepted, "Observations submitted");
+        Ok(outcome)
     }
 }
 
