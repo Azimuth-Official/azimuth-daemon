@@ -315,7 +315,7 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
     let w = (P1_A_LEN * s).round() as usize;
     // Below P1_MIN_RATE the capture cannot hold enough of the P1's carriers; above about 5.8 MS/s the A part
     // no longer fits the transform. Either way there is nothing to search.
-    if !(sample_rate >= P1_MIN_RATE) || x.len() < 32_768 || w + 2 > NFFT || w < 64 {
+    if sample_rate.is_nan() || sample_rate < P1_MIN_RATE || x.len() < 32_768 || w + 2 > NFFT || w < 64 {
         return None;
     }
     let tb = tables();
