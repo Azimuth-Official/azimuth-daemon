@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+#[cfg(feature = "qa-test-driver")]
+use clap::ValueEnum;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -66,8 +68,41 @@ fn update_status_from_observations(state: &mut StatusState, observations: &[Obse
     state.recent_signals = recent;
 }
 
+/// TEST BUILD ONLY (`qa-test-driver`): the driver `--install-driver` binds.
+#[cfg(feature = "qa-test-driver")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QaDriver {
+    #[value(name = "winusb")]
+    WinUsb,
+    #[value(name = "libusb0")]
+    LibUsb0,
+    #[value(name = "libusbk")]
+    LibUsbK,
+}
+
+#[cfg(feature = "qa-test-driver")]
+impl QaDriver {
+    /// The Windows service name the bound driver reports.
+    pub fn service(self) -> &'static str {
+        match self {
+            QaDriver::WinUsb => "winusb",
+            QaDriver::LibUsb0 => "libusb0",
+            QaDriver::LibUsbK => "libusbk",
+        }
+    }
+}
+
+/// Set once by `main` from `--qa-driver`; read by the Windows driver installer.
+#[cfg(feature = "qa-test-driver")]
+pub static QA_DRIVER: std::sync::OnceLock<QaDriver> = std::sync::OnceLock::new();
+
+#[cfg(not(feature = "qa-test-driver"))]
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "qa-test-driver")]
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-qa-test (qa-test build)");
+
 #[derive(Parser)]
-#[command(name = "azimuth-daemon", version, about = "Azimuth positioning network daemon")]
+#[command(name = "azimuth-daemon", version = VERSION, about = "Azimuth positioning network daemon")]
 struct Cli {
     /// Path to config.toml
     #[arg(short, long, default_value = "config.toml")]
@@ -115,6 +150,11 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     interface: u8,
 
+    /// TEST BUILD ONLY: with --install-driver, bind this driver instead of WinUSB
+    #[cfg(feature = "qa-test-driver")]
+    #[arg(long, value_enum)]
+    qa_driver: Option<QaDriver>,
+
     /// Log filter, e.g. "warn,azimuth_daemon=debug". RUST_LOG still wins.
     /// Lets a support session start the sidecar verbose without editing config.
     #[arg(long)]
@@ -134,6 +174,10 @@ fn run_install_driver_mode(cli: &Cli) -> i32 {
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .init();
+    #[cfg(feature = "qa-test-driver")]
+    if let Some(d) = cli.qa_driver {
+        let _ = QA_DRIVER.set(d);
+    }
     let (result, devices) = sdr::run_install_driver(cli.vid, cli.pid, cli.interface);
     println!("{}", sdr::driver_state::install_report_json(&result, &devices));
     result.exit_code()
@@ -956,4 +1000,41 @@ async fn apply_config_msg(
         replace_sdr(&app_state.status, sdr, &msg.sdr).await;
     }
     *sdr_params = msg.sdr;
+}
+
+#[cfg(test)]
+mod qa_driver_tests {
+    use super::*;
+
+    #[cfg(feature = "qa-test-driver")]
+    #[test]
+    fn qa_driver_flag_parses_each_driver_and_defaults_to_none() {
+        let p = |a: &[&str]| Cli::try_parse_from(std::iter::once("azimuth-daemon").chain(a.iter().copied()));
+        assert_eq!(p(&["--install-driver", "--qa-driver", "libusb0"]).unwrap().qa_driver, Some(QaDriver::LibUsb0));
+        assert_eq!(p(&["--qa-driver", "libusbk"]).unwrap().qa_driver, Some(QaDriver::LibUsbK));
+        assert_eq!(p(&["--qa-driver", "winusb"]).unwrap().qa_driver, Some(QaDriver::WinUsb));
+        assert_eq!(p(&["--install-driver"]).unwrap().qa_driver, None);
+        assert!(p(&["--qa-driver", "cdc"]).is_err());
+    }
+
+    #[cfg(feature = "qa-test-driver")]
+    #[test]
+    fn qa_driver_maps_to_the_bound_service_name() {
+        assert_eq!(QaDriver::WinUsb.service(), "winusb");
+        assert_eq!(QaDriver::LibUsb0.service(), "libusb0");
+        assert_eq!(QaDriver::LibUsbK.service(), "libusbk");
+    }
+
+    #[cfg(feature = "qa-test-driver")]
+    #[test]
+    fn qa_build_version_string_is_marked() {
+        assert!(VERSION.contains("-qa-test"));
+    }
+
+    #[cfg(not(feature = "qa-test-driver"))]
+    #[test]
+    fn default_build_has_no_qa_driver_flag_and_a_plain_version() {
+        assert!(Cli::try_parse_from(["azimuth-daemon", "--qa-driver", "libusb0"]).is_err());
+        assert!(!VERSION.contains("qa"));
+    }
 }

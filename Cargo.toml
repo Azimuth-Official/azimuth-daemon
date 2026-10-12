@@ -24,6 +24,9 @@ udev = ["serialport/libudev"]
 # TEST BUILDS ONLY. Lets QA force a driver state (e.g. wrong_driver) to prove the
 # UI copy. NEVER part of `default`; release builds must not enable it.
 qa-fault-injection = []
+# TEST BUILDS ONLY. Adds `--qa-driver winusb|libusb0|libusbk` to `--install-driver`
+# so QA can bind a deliberately wrong driver (wrong_driver check). NEVER in `default`.
+qa-test-driver = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

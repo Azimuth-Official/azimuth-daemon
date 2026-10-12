@@ -78,6 +78,30 @@ fn bound_is_usable(d: &Device) -> bool {
     !super::driver_state::needs_winusb(d.driver.as_deref())
 }
 
+/// The driver `--install-driver` binds: WinUSB, unless a TEST build forces another.
+fn requested_driver_type() -> DriverType {
+    #[cfg(feature = "qa-test-driver")]
+    if let Some(q) = crate::QA_DRIVER.get() {
+        return match q {
+            crate::QaDriver::WinUsb => DriverType::WinUsb,
+            crate::QaDriver::LibUsb0 => DriverType::LibUsb0,
+            crate::QaDriver::LibUsbK => DriverType::LibUsbK,
+        };
+    }
+    DriverType::WinUsb
+}
+
+/// A node counts as done when it carries the driver this run asked for. TEST
+/// builds with a forced driver accept exactly that service (even libusb0, which
+/// `bound_is_usable` rejects); otherwise it is the normal usable-driver check.
+fn bound_as_requested(d: &Device) -> bool {
+    #[cfg(feature = "qa-test-driver")]
+    if let Some(q) = crate::QA_DRIVER.get() {
+        return d.driver.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(q.service()));
+    }
+    bound_is_usable(d)
+}
+
 /// A fresh, unpredictable directory for the generated INF and catalog. It is
 /// created exclusively (`create_dir`, never `create_dir_all`), so a directory
 /// pre-made by another process makes the install fail instead of being reused.
@@ -93,7 +117,7 @@ fn install_one(device: &Device) -> Result<(), String> {
     let dir = work_dir()?;
     let dir_s = dir.to_string_lossy().to_string();
     let inf = format!("rtl2832u_if{}.inf", device.mi);
-    let prep = PrepareDriverOptions { driver_type: DriverType::WinUsb, ..Default::default() };
+    let prep = PrepareDriverOptions { driver_type: requested_driver_type(), ..Default::default() };
     let result = prepare_driver(device, &dir_s, &inf, &prep)
         .and_then(|()| install_driver(device, &dir_s, &inf, &InstallDriverOptions::default()))
         .map_err(|e| format!("{e:?}"));
@@ -115,7 +139,12 @@ pub fn install_cli(
     if wanted.is_empty() {
         return (InstallResult::NoDevice, vec![]);
     }
-    let pending: Vec<&Device> = wanted.iter().filter(|d| !bound_is_usable(d)).collect();
+    // A forced TEST driver bypasses the filter: a bound WinUSB is usable, yet must be replaced.
+    #[cfg(feature = "qa-test-driver")]
+    let force = crate::QA_DRIVER.get().is_some();
+    #[cfg(not(feature = "qa-test-driver"))]
+    let force = false;
+    let pending: Vec<&Device> = wanted.iter().filter(|d| force || !bound_is_usable(d)).collect();
     let before_info = classify_nodes(&to_nodes(&devices));
     if pending.is_empty() {
         let reports = wanted
@@ -130,7 +159,7 @@ pub fn install_cli(
 
     let mut first_error: Option<String> = None;
     for d in &pending {
-        info!(vid = d.vid, pid = d.pid, mi = d.mi, "Binding WinUSB");
+        info!(vid = d.vid, pid = d.pid, mi = d.mi, driver = ?requested_driver_type(), "Binding driver");
         if let Err(e) = install_one(d) {
             warn!(error = %e, "WinUSB install failed for a device");
             if e.contains("NeedsAdmin") || e.contains("Access") {
@@ -147,7 +176,7 @@ pub fn install_cli(
         if let Ok(now) = list_devices() {
             after = now;
         }
-        let done = targets(&after, vid, pid, interface).iter().all(bound_is_usable);
+        let done = targets(&after, vid, pid, interface).iter().all(bound_as_requested);
         if done || Instant::now() >= deadline {
             break;
         }
@@ -158,7 +187,7 @@ pub fn install_cli(
         .iter()
         .map(|d| InstallDeviceReport::new(d.vid, d.pid, interface, &before_info, &after_info))
         .collect();
-    let all_ok = targets(&after, vid, pid, interface).iter().all(bound_is_usable);
+    let all_ok = targets(&after, vid, pid, interface).iter().all(bound_as_requested);
     if all_ok {
         (InstallResult::Ok, reports)
     } else {
@@ -168,5 +197,16 @@ pub fn install_cli(
             ),
             reports,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "qa-test-driver"))]
+    #[test]
+    fn default_requested_driver_is_winusb() {
+        assert!(matches!(requested_driver_type(), DriverType::WinUsb));
     }
 }
