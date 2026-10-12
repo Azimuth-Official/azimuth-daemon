@@ -25,3 +25,5 @@ bind the WinUSB driver to Interface 0 of an RTL-SDR (`azimuth-daemon --install-d
   trusted publishers store until an administrator deletes it.
 - **Microsoft SDK.** libwdi is built with the Microsoft Windows SDK; its redistributable
   components fall under the SDK license.
+
+Azimuth itself is licensed under the Apache License, Version 2.0; see `LICENSE` and `NOTICE` at the repository root. This file lists third-party components only.
