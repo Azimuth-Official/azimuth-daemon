@@ -531,6 +531,10 @@ fn run_sdr_test(
     lock_wait: std::time::Duration,
 ) -> (driver_state::SdrTestVerdict, DriverInfo) {
     let driver = crate::sdr::current_driver_info();
+    #[cfg(feature = "qa-fault-injection")]
+    if let Some(v) = driver_state::usb_error_fault_from_env() {
+        return (v, driver);
+    }
     let access_means_in_use = cfg!(windows);
     // Another program holds the dongle (refused reset/open seen by the scanner):
     // never `ok`, whatever a fresh open of a shared handle appears to do.

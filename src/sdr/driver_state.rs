@@ -437,6 +437,29 @@ pub fn parse_driver_fault(spec: &str) -> Option<DriverInfo> {
     Some(info)
 }
 
+/// `usb_error` / `usb_error:<detail>` fault spec: the verdict `run_sdr_test`
+/// returns instead of touching the device. Not a driver state, so
+/// `parse_driver_fault` ignores it.
+#[cfg(any(test, feature = "qa-fault-injection"))]
+pub fn usb_error_fault_verdict(spec: &str) -> Option<SdrTestVerdict> {
+    let detail = match spec.split_once(':') {
+        Some(("usb_error", d)) if !d.is_empty() => d,
+        None if spec == "usb_error" => "LIBUSB_ERROR_IO",
+        _ => return None,
+    };
+    Some(SdrTestVerdict {
+        state: SdrTestState::UsbError,
+        detail: format!("usb_error: [QA fault injection] {detail}"),
+        tuner: None,
+    })
+}
+
+#[cfg(feature = "qa-fault-injection")]
+pub fn usb_error_fault_from_env() -> Option<SdrTestVerdict> {
+    std::hint::black_box(QA_FAULT_MARKER);
+    std::env::var("AZIMUTH_QA_DRIVER_FAULT").ok().and_then(|s| usb_error_fault_verdict(&s))
+}
+
 #[cfg(feature = "qa-fault-injection")]
 pub fn driver_fault_from_env() -> Option<DriverInfo> {
     std::hint::black_box(QA_FAULT_MARKER);
@@ -633,6 +656,20 @@ mod tests {
         assert_eq!(w.bound_driver.as_deref(), Some("usbser"));
         assert_eq!(parse_driver_fault("driver_missing").unwrap().state, DriverStateKind::DriverMissing);
         assert!(parse_driver_fault("bogus").is_none());
+    }
+
+    #[test]
+    fn usb_error_fault_yields_a_usb_error_verdict_and_is_not_a_driver_fault() {
+        let v = usb_error_fault_verdict("usb_error").unwrap();
+        assert_eq!(v.state, SdrTestState::UsbError);
+        assert!(v.detail.starts_with("usb_error: "), "{}", v.detail);
+        assert!(v.tuner.is_none());
+        let v = usb_error_fault_verdict("usb_error:LIBUSB_ERROR_PIPE").unwrap();
+        assert!(v.detail.contains("LIBUSB_ERROR_PIPE"), "{}", v.detail);
+        assert!(usb_error_fault_verdict("wrong_driver:usbser").is_none());
+        assert!(usb_error_fault_verdict("usb_error:").is_none());
+        assert!(usb_error_fault_verdict("bogus").is_none());
+        assert!(parse_driver_fault("usb_error").is_none());
     }
 
     #[test]
