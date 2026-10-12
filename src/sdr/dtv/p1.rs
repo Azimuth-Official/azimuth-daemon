@@ -232,8 +232,8 @@ fn advance(x: &[Complex<f32>], spec: &[Complex<f32>], frac: f64) -> Vec<Complex<
     s
 }
 
-/// Stage 1: candidate P1 start positions (sample index of the start of C) with their peak-to-median
-/// ratio of the self-correlation metric, best first.
+/// Stage 1: candidate P1 start positions (sample index of the start of C), best first, each with the
+/// peak-to-median ratio of the self-correlation metric (computed in test builds only, else the raw peak).
 fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
     let m = x.len();
     let (lc, lb) = (P1_C_LEN * s, P1_B_LEN * s);
@@ -279,6 +279,8 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
         }
         *v = (pc[t + kc] - pc[t]).norm() + (pb[tb + kb] - pb[tb]).norm();
     }
+    // The ratio is only read by the test survey; production does not pay for the extra pass.
+    #[cfg(test)]
     let median = {
         let mut v: Vec<f64> = metric.iter().copied().filter(|&v| v > 0.0).collect();
         if v.is_empty() {
@@ -287,6 +289,8 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
         let mid = v.len() / 2;
         *v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1
     };
+    #[cfg(not(test))]
+    let median = 1.0f64;
     let mut out = Vec::new();
     for _ in 0..CANDIDATES {
         let (mut best, mut bi) = (0.0f64, usize::MAX);

@@ -50,11 +50,13 @@ pub struct BandSweep {
     pub settle_waits: u32,
     /// Re-tunes attempted after a failed PLL lock.
     pub tune_retries: u32,
-    /// DTV only: DVB channels whose cyclic prefix reads as a T2-only mode but showed no P1 over a whole
-    /// maximum T2 frame; not DVB-T, T2 unproven, so no observation is emitted for them.
+    /// DTV only: DWELLS (channel visits, not distinct channels; the same channel counts again on every
+    /// visit) since the last discovery whose cyclic prefix read as a T2-only mode but showed no P1 over a
+    /// whole maximum T2 frame; not DVB-T, T2 unproven, so no observation is emitted for them.
     pub t2_unconfirmed: u32,
-    /// DTV only: dwells that could not cover a whole T2 frame (short or failed read, or a device recovery
-    /// ran meanwhile) and found no P1: no label was given, and nothing was counted as `t2_unconfirmed`.
+    /// DTV only: DWELLS (channel visits, not distinct channels) since the last discovery that could not
+    /// cover a whole T2 frame (short or failed read, or a device recovery ran meanwhile) and found no P1:
+    /// no label was given, and nothing was counted as `t2_unconfirmed`.
     pub dvb_dwell_incomplete: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
