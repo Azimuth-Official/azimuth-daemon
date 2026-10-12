@@ -427,7 +427,7 @@ pub const WINDOW_SLICE_OVERLAP: usize = 2048;
 /// slice.
 pub fn window_slices(total: usize) -> Vec<std::ops::Range<usize>> {
     if total <= CAPTURE_SAMPLES {
-        return vec![0..total];
+        return std::iter::once(0..total).collect();
     }
     let stride = CAPTURE_SAMPLES - WINDOW_SLICE_OVERLAP;
     let mut v = Vec::new();
