@@ -53,6 +53,9 @@ pub struct BandSweep {
     /// DTV only: DVB channels whose cyclic prefix reads as a T2-only mode but showed no P1 over a whole
     /// maximum T2 frame; not DVB-T, T2 unproven, so no observation is emitted for them.
     pub t2_unconfirmed: u32,
+    /// DTV only: dwells that could not cover a whole T2 frame (short or failed read, or a device recovery
+    /// ran meanwhile) and found no P1: no label was given, and nothing was counted as `t2_unconfirmed`.
+    pub dvb_dwell_incomplete: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
 }
@@ -164,6 +167,8 @@ pub struct Scanner {
     capture_retries: u32,
     max_observations_per_cycle: u32,
     recovery_manager: RecoveryManager,
+    /// Recovery actions (reopen, bus reset, ...) executed so far; a dwell is void if this moved during it.
+    recoveries_run: u32,
     dtv_plan: DtvPlan,
     sweep: SweepReport,
     /// Live copy of `sweep` for other tasks (/status), updated during sweeps.
@@ -191,11 +196,13 @@ const MAX_CONSECUTIVE_TUNE_FAILURES: u32 = 3;
 
 /// Default IQ capture size for signal processing (128K samples = 256KB).
 const CAPTURE_BYTES: usize = 262_144;
-/// Further captures of a DVB channel dwell when the first one shows a cyclic-prefix detection but no P1.
-/// A T2 frame lasts up to 250 ms and holds one P1; a capture is 64 ms, so the first plus 5 more back-to-back
-/// captures cover 384 ms: a whole maximum frame (250 ms), one capture length (64 ms) and margin for the
-/// gaps between captures.
-const DVB_P1_EXTRA_CAPTURES: usize = 5;
+/// Length of the DVB channel dwell read when the first capture holds a cyclic-prefix detection but no P1:
+/// 6 capture lengths = 384 ms at 2.048 MS/s. A T2 frame (and so its single P1) lasts up to 250 ms; the
+/// window adds one capture length (64 ms, so a P1 cut by the window start still leaves a whole one) and margin.
+/// It is ONE `read_sync` after ONE `reset_buffer` (`SdrDevice::capture_raw` does exactly that for any size), so
+/// the samples are a single uninterrupted stream: no gap where a P1 could hide.
+const DVB_WINDOW_CAPTURES: usize = 6;
+const DVB_WINDOW_BYTES: usize = DVB_WINDOW_CAPTURES * CAPTURE_BYTES;
 
 /// Relaxed gates for the one-shot FM sweep retry when the primary pass (using
 /// `fm_config.sweep_threshold` / `sweep_min_snr_db`) finds zero stations.
@@ -311,6 +318,7 @@ impl Scanner {
             capture_retries: config.capture_retries,
             max_observations_per_cycle: config.max_observations_per_cycle,
             recovery_manager: RecoveryManager::new(),
+            recoveries_run: 0,
             dtv_plan: DtvPlan::from_config(&config.dtv),
             sweep: SweepReport::default(),
             sweep_shared: Arc::new(Mutex::new(SweepReport::default())),
@@ -730,9 +738,6 @@ impl Scanner {
                 Some((iq, sample_rate)) => {
                     consecutive = 0;
                     if let Some(det) = dvb::detect_dvb(&iq, sample_rate, bandwidth_mhz) {
-                        if det.signal_type == dvb::T2_UNCONFIRMED {
-                            self.sweep.dtv.t2_unconfirmed += 1;
-                        }
                         info!(freq_mhz = centre as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, rho = format!("{:.2}", det.rho), contrast = format!("{:.0}", det.contrast), "DVB channel found");
                         result.dtv_channels.push(centre);
                     }
@@ -800,25 +805,32 @@ impl Scanner {
 
     /// One DVB channel dwell: the observation for the first capture, extended over a whole maximum T2 frame
     /// when that capture holds a cyclic-prefix detection but no P1. A T2 frame (and so its single P1) can last
-    /// 250 ms while a capture is 64 ms, so a P1-less capture proves nothing: `extra` yields the further
-    /// back-to-back captures of the dwell (`None` ends it) and any P1 among them makes the channel T2.
-    /// Without one, a DVB-T-compatible mode is DVB-T and a T2-only mode is counted as `t2_unconfirmed`.
-    fn scan_dvb_dwell<F>(&mut self, first_iq: &[u8], sample_rate: u32, freq: u64, dbm: f64, mut extra: F) -> Vec<ScanResult>
+    /// 250 ms while a capture is 64 ms, so a P1-less capture proves nothing. `window` reads ONE contiguous
+    /// `DVB_WINDOW_BYTES` stream (`None` = the read failed); it is searched in overlapping slices and a P1
+    /// anywhere in it makes the channel T2. With no P1, a complete window means a DVB-T-compatible mode is
+    /// DVB-T and a T2-only mode is counted as `t2_unconfirmed` (no observation). An incomplete window (failed
+    /// or short read, or a recovery action ran during it) proves nothing: no observation, counted in
+    /// `dvb_dwell_incomplete`.
+    fn scan_dvb_dwell<F>(&mut self, first_iq: &[u8], sample_rate: u32, freq: u64, dbm: f64, window: F) -> Vec<ScanResult>
     where
-        F: FnMut(&mut Scanner) -> Option<Vec<u8>>,
+        F: FnOnce(&mut Scanner) -> Option<Vec<u8>>,
     {
         let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
         let Some(mut det) = dvb::detect_dvb(first_iq, sample_rate, bandwidth_mhz) else { return Vec::new() };
         if det.p1.is_none() {
-            let mut window = Vec::with_capacity(DVB_P1_EXTRA_CAPTURES);
-            for _ in 0..DVB_P1_EXTRA_CAPTURES {
-                match extra(self) {
-                    Some(iq) => window.push(iq),
-                    None => break,
-                }
-            }
-            if let Some(p1) = window.iter().find_map(|iq| dvb::find_p1(iq, sample_rate, bandwidth_mhz)) {
+            let recoveries = self.recoveries_run;
+            let read = window(self);
+            let disturbed = self.recoveries_run != recoveries;
+            let complete = !disturbed && read.as_ref().is_some_and(|w| w.len() >= DVB_WINDOW_BYTES);
+            // A recovery (reopen or bus reset) breaks the stream: what was read around it is not contiguous.
+            let found = if disturbed { None } else { read.as_ref().and_then(|w| dvb::find_p1_in_window(w, sample_rate, bandwidth_mhz)) };
+            if let Some(p1) = found {
                 det = det.with_p1(p1);
+            } else if !complete {
+                debug!(freq_mhz = freq as f64 / 1e6, "DVB dwell incomplete: no label without a full T2 frame of air time");
+                self.sweep.dtv.dvb_dwell_incomplete += 1;
+                self.publish_sweep();
+                return Vec::new();
             } else if det.signal_type == dvb::T2_UNCONFIRMED {
                 debug!(freq_mhz = freq as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, "DVB T2-only mode without a P1 over a full T2 frame: unconfirmed, no observation");
                 self.sweep.dtv.t2_unconfirmed += 1;
@@ -932,7 +944,7 @@ impl Scanner {
         let (_dbfs, dbm) = calculate_signal_power(&iq_bytes, self.dbm_offset);
         if scan_type == ScanType::Dtv && dvb_plan {
             return self.scan_dvb_dwell(&iq_bytes, sample_rate, freq, dbm, |sc| {
-                sc.capture_with_auto_reset(sdr_manager, device_idx, freq)
+                sc.capture_bytes_with_auto_reset(sdr_manager, device_idx, freq, DVB_WINDOW_BYTES)
             });
         }
         let mut results = Vec::new();
@@ -1278,6 +1290,7 @@ impl Scanner {
         device_idx: usize,
         action: RecoveryAction,
     ) -> anyhow::Result<()> {
+        self.recoveries_run += 1;
         match action {
             RecoveryAction::ReopenHandle => {
                 info!(device = device_idx, "Executing Level 1 recovery: reopen handle");
@@ -1376,9 +1389,20 @@ impl Scanner {
         device_idx: usize,
         freq: u64,
     ) -> Option<Vec<u8>> {
+        self.capture_bytes_with_auto_reset(sdr_manager, device_idx, freq, CAPTURE_BYTES)
+    }
+
+    /// `capture_with_auto_reset` for an arbitrary read size (one uninterrupted read).
+    fn capture_bytes_with_auto_reset(
+        &mut self,
+        sdr_manager: &mut SdrManager,
+        device_idx: usize,
+        freq: u64,
+        num_bytes: usize,
+    ) -> Option<Vec<u8>> {
         let result = {
             let device = sdr_manager.device_mut(device_idx)?;
-            capture_with_retry(device, CAPTURE_BYTES, self.capture_retries)
+            capture_with_retry(device, num_bytes, self.capture_retries)
         };
 
         match result {
@@ -1402,7 +1426,7 @@ impl Scanner {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
                             let device = sdr_manager.device_mut(device_idx)?;
-                            match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
+                            match capture_with_retry(device, num_bytes, self.capture_retries) {
                                 Ok(buf) if buf.len() >= 4 => {
                                     self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Capture succeeded after recovery");

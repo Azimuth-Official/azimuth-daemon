@@ -40,6 +40,9 @@ const CFO_MAX_HZ: f64 = 252_000.0;
 const CFO_STEP_HZ: f64 = 4_000.0;
 /// Points of the delay-domain correlation (one period of the A symbol, 1024 T, is covered).
 const DELAY_FFT: usize = 512;
+/// Largest |delay| (samples) of the P1 against the stage-1 estimate that is searched (the measured stage-1
+/// error is at most 34 samples at -3 dB).
+const DELAY_MAX: f64 = 56.0;
 /// Carriers farther than this from the tuner centre are outside the capture passband.
 const VISIBLE_HZ: f64 = 0.92e6;
 const MIN_VISIBLE: usize = 40;
@@ -195,45 +198,66 @@ fn tables() -> Tables {
     Tables { s1a, s1b, s2, par_s1, par_s2 }
 }
 
-/// `x` advanced by a fractional number of samples (FFT-domain delay), for a sub-sample correlation lag.
-fn advance(x: &[Complex<f32>], frac: f64) -> Vec<Complex<f32>> {
+thread_local! {
+    static PLANNER: std::cell::RefCell<FftPlanner<f32>> = std::cell::RefCell::new(FftPlanner::new());
+}
+
+/// A cached FFT plan of `len` points (one planner per thread, so a 131072-point plan is built once, not per
+/// capture). Also used by the cyclic-prefix analysis in `dvb`.
+pub(super) fn plan(len: usize, inverse: bool) -> std::sync::Arc<dyn rustfft::Fft<f32>> {
+    PLANNER.with(|p| {
+        let mut p = p.borrow_mut();
+        if inverse { p.plan_fft_inverse(len) } else { p.plan_fft_forward(len) }
+    })
+}
+
+/// `x` advanced by a fractional number of samples (FFT-domain delay), given its spectrum, for a
+/// sub-sample correlation lag.
+fn advance(x: &[Complex<f32>], spec: &[Complex<f32>], frac: f64) -> Vec<Complex<f32>> {
     if frac.abs() < 0.02 {
         return x.to_vec();
     }
     let m = x.len();
-    let mut planner = FftPlanner::<f32>::new();
-    let mut s = x.to_vec();
-    planner.plan_fft_forward(m).process(&mut s);
+    let mut s = spec.to_vec();
     for (k, v) in s.iter_mut().enumerate() {
         let kk = if k <= m / 2 { k as f64 } else { k as f64 - m as f64 };
         let ph = 2.0 * std::f64::consts::PI * kk * frac / m as f64;
         *v *= Complex::new(ph.cos() as f32, ph.sin() as f32);
     }
-    planner.plan_fft_inverse(m).process(&mut s);
+    plan(m, true).process(&mut s);
     let sc = 1.0 / m as f32;
     s.iter_mut().for_each(|v| *v *= sc);
     s
 }
 
-/// Stage 1: candidate P1 start positions (sample index of the start of C), best first.
-fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<usize> {
+/// Stage 1: candidate P1 start positions (sample index of the start of C) with their peak-to-median
+/// ratio of the self-correlation metric, best first.
+fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<(usize, f64)> {
     let m = x.len();
     let (lc, lb) = (P1_C_LEN * s, P1_B_LEN * s);
     let (li_c, li_b) = (lc.round() as usize, lb.round() as usize);
     let (kc, kb) = (li_c, li_b);
     let ramp = 2.0 * std::f64::consts::PI / (P1_A_LEN * s);
+    let mut spec = x.to_vec();
+    plan(m, false).process(&mut spec);
     let build = |li: usize, frac: f64, sign: f64| -> Vec<Complex<f64>> {
-        let y = advance(x, frac);
+        let y = advance(x, &spec, frac);
         let mut pre = Vec::with_capacity(m - li + 1);
         let mut acc = Complex::new(0.0f64, 0.0f64);
         pre.push(acc);
+        // Rotation e^{sign j ramp n} by recurrence, renormalised every 1024 samples.
+        let step = Complex::new(ramp.cos(), sign * ramp.sin());
+        let mut rot = Complex::new(1.0f64, 0.0f64);
         for n in 0..m - li {
             let a = x[n];
             let b = y[n + li];
             let prod = Complex::new(f64::from(b.re), f64::from(b.im)) * Complex::new(f64::from(a.re), -f64::from(a.im));
-            let ph = sign * ramp * n as f64;
-            acc += prod * Complex::new(ph.cos(), ph.sin());
+            acc += prod * rot;
             pre.push(acc);
+            rot *= step;
+            if n & 1023 == 1023 {
+                rot /= rot.norm();
+            }
         }
         pre
     };
@@ -253,6 +277,14 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<usize> {
         }
         *v = (pc[t + kc] - pc[t]).norm() + (pb[tb + kb] - pb[tb]).norm();
     }
+    let median = {
+        let mut v: Vec<f64> = metric.iter().copied().filter(|&v| v > 0.0).collect();
+        if v.is_empty() {
+            return Vec::new();
+        }
+        let mid = v.len() / 2;
+        *v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1
+    };
     let mut out = Vec::new();
     for _ in 0..CANDIDATES {
         let (mut best, mut bi) = (0.0f64, usize::MAX);
@@ -265,7 +297,7 @@ fn timing_candidates(x: &[Complex<f32>], s: f64) -> Vec<usize> {
         if bi == usize::MAX {
             break;
         }
-        out.push(bi);
+        out.push((bi, best / median.max(1e-12)));
         let lo = bi.saturating_sub(NMS_RADIUS);
         let hi = (bi + NMS_RADIUS).min(metric.len());
         metric[lo..hi].iter_mut().for_each(|v| *v = 0.0);
@@ -289,17 +321,20 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
     let nu: Vec<f64> = slot.iter().map(|&m| m as f64 / (P1_A_LEN * t_sec)).collect();
     let n_f = (CFO_MAX_HZ / CFO_STEP_HZ) as i64;
     let bin_hz = sample_rate / NFFT as f64;
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(NFFT);
-    let ifft = planner.plan_fft_inverse(DELAY_FFT);
+    let fft = plan(NFFT, false);
+    let ifft = plan(DELAY_FFT, true);
     // A sub-sample delay delta (samples) multiplies carrier slot m by e^{+j 2 pi m delta / (1024 s)}, so the
     // correlation for every delay on a grid of 1024 s / DELAY_FFT samples is one inverse FFT over the slots.
     let delay_step = P1_A_LEN * s / DELAY_FFT as f64;
+    let j_max = (DELAY_MAX / delay_step).ceil() as usize;
     let zero = Complex::new(0.0f32, 0.0f32);
+    let mut scratch = vec![zero; ifft.get_inplace_scratch_len()];
+    let mut z2: Vec<Vec<Complex<f32>>> = vec![Vec::new(); 16];
+    let (mut z1a, mut z1b) = (Vec::new(), Vec::new());
 
     let mut best: Option<P1Detection> = None;
     let mut best_rho2 = 0.0f32;
-    for t0 in timing_candidates(x, s) {
+    for (t0, _) in timing_candidates(x, s) {
         // Candidates come best first; once one decodes clearly the rest cannot matter.
         if best_rho2.sqrt() as f64 >= P1_RHO_ACCEPT {
             break;
@@ -332,35 +367,43 @@ pub fn detect_p1_with(x: &[Complex<f32>], sample_rate: f64, t_us: f64, rho_min: 
             }
             let norm2 = 1.0 / (vis.len() as f32 * energy);
             // Delay-domain correlation of one signalling segment (carriers lo..hi) against one sign pattern.
-            let seg = |signs: &[f32], lo: usize, hi: usize| -> Vec<Complex<f32>> {
-                let mut v = vec![zero; DELAY_FFT];
+            let mut seg = |signs: &[f32], lo: usize, hi: usize, out: &mut Vec<Complex<f32>>| {
+                out.clear();
+                out.resize(DELAY_FFT, zero);
                 for &(i, c) in vis.iter().filter(|(i, _)| *i >= lo && *i < hi) {
-                    v[slot[i].rem_euclid(DELAY_FFT as i64) as usize] += c * signs[i - lo];
+                    out[slot[i].rem_euclid(DELAY_FFT as i64) as usize] += c * signs[i - lo];
                 }
-                ifft.process(&mut v);
-                v
+                ifft.process_with_scratch(out, &mut scratch);
             };
-            let z2: Vec<Vec<Complex<f32>>> = (0..16).map(|s2| seg(&tb.s2[s2], 64, 320)).collect();
+            for (s2, out) in z2.iter_mut().enumerate() {
+                seg(&tb.s2[s2], 64, 320, out);
+            }
             for &s1 in &S1_VALID {
-                let z1a = seg(&tb.s1a[s1], 0, 64);
-                let z1b = seg(&tb.s1b[s1], 320, 384);
+                seg(&tb.s1a[s1], 0, 64, &mut z1a);
+                seg(&tb.s1b[s1], 320, 384, &mut z1b);
                 let pa = tb.par_s1[s1];
                 for (s2, z2s) in z2.iter().enumerate() {
                     let pb = pa * tb.par_s2[s2];
-                    for j in 0..DELAY_FFT {
-                        let rho2 = (z1a[j] + z2s[j] * pa + z1b[j] * pb).norm_sqr() * norm2;
-                        if rho2 > best_rho2 {
-                            best_rho2 = rho2;
-                            let jj = if j <= DELAY_FFT / 2 { j as f64 } else { j as f64 - DELAY_FFT as f64 };
-                            best = Some(P1Detection {
-                                s1: s1 as u8,
-                                s2: s2 as u8,
-                                rho: f64::from(rho2.sqrt()),
-                                cfo_hz: f,
-                                start: n0 as f64 + jj * delay_step - P1_C_LEN * s,
-                                len: P1_LEN * s,
-                            });
+                    let (mut m2, mut jm) = (0.0f32, 0usize);
+                    for j in (0..=j_max).chain(DELAY_FFT - j_max..DELAY_FFT) {
+                        let r = (z1a[j] + z2s[j] * pa + z1b[j] * pb).norm_sqr();
+                        if r > m2 {
+                            m2 = r;
+                            jm = j;
                         }
+                    }
+                    let rho2 = m2 * norm2;
+                    if rho2 > best_rho2 {
+                        best_rho2 = rho2;
+                        let jj = if jm <= DELAY_FFT / 2 { jm as f64 } else { jm as f64 - DELAY_FFT as f64 };
+                        best = Some(P1Detection {
+                            s1: s1 as u8,
+                            s2: s2 as u8,
+                            rho: f64::from(rho2.sqrt()),
+                            cfo_hz: f,
+                            start: n0 as f64 + jj * delay_step - P1_C_LEN * s,
+                            len: P1_LEN * s,
+                        });
                     }
                 }
             }
@@ -481,5 +524,66 @@ mod tests {
     fn short_or_unknown_input_yields_none() {
         assert!(detect_p1(&[], 2_048_000.0, 7.0 / 64.0).is_none());
         assert!(detect_p1(&vec![Complex::new(0.5f32, 0.1); 20_000], 2_048_000.0, 7.0 / 64.0).is_none());
+    }
+
+    /// Timing survey (release): `cargo test --release --bin azimuth-daemon p1_timing -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn p1_timing() {
+        use super::super::detect_dvb;
+        let mode = T2Mode { fft: super::super::FftMode::K8, gi: super::super::GuardInterval::G1_8, extended: false };
+        let noise = negative_capture(5, Negative::Awgn);
+        let with = t2_capture(6, T2Params::new(mode), 3.0, 20_000.0, false);
+        let mut p = T2Params::new(mode);
+        p.with_p1 = false;
+        let without = t2_capture(7, p, 3.0, 20_000.0, false);
+        for (name, iq) in [("noise-only", &noise), ("t2-with-p1", &with), ("t2-without-p1", &without)] {
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                std::hint::black_box(detect_dvb(iq, 2_048_000, 8));
+            }
+            let full = t.elapsed() / 5;
+            let x = iq_u8_to_complex(iq);
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                std::hint::black_box(detect_p1(&x, 2_048_000.0, 7.0 / 64.0));
+            }
+            println!("TIMING {name}: detect_dvb {:?} per capture, of which detect_p1 {:?}", full, t.elapsed() / 5);
+        }
+    }
+
+    /// Survey of the stage-1 peak-to-median ratio: the true P1 candidate at -3 dB against the best
+    /// candidate of noise-only and interferer captures.
+    #[test]
+    #[ignore]
+    fn p1_ratio_survey() {
+        let modes = t2_all_modes();
+        let pos = parallel(modes.len() * 20, |j| {
+            let m = modes[j / 20];
+            let seed = 5000 + j as u64 * 17;
+            let mut rng = Rng::new(seed ^ 0xABCD);
+            let cfo = random_cfo(&mut rng);
+            let iq = t2_capture(seed, T2Params::new(m), -3.0, cfo, rng.uniform() < 0.25);
+            let x = iq_u8_to_complex(&iq);
+            let d = detect_p1_with(&x, 2_048_000.0, 7.0 / 64.0, 0.0)?;
+            let c = timing_candidates(&x, 2_048_000.0 * 7.0 / 64.0 * 1e-6);
+            c.iter().find(|(t, _)| (*t as f64 - d.start).abs() < 80.0).map(|c| c.1)
+        });
+        let mut r: Vec<f64> = pos.iter().flatten().copied().collect();
+        r.sort_by(|a, b| a.total_cmp(b));
+        println!("RATIO true candidate at -3 dB: n {} of {} min {:.2} p1% {:.2} median {:.2}", r.len(), pos.len(), r[0], r[r.len() / 100], r[r.len() / 2]);
+        let mut worst = 0.0f64;
+        let mut all = Vec::new();
+        for kind in [Negative::Awgn, Negative::Cw, Negative::Fm, Negative::Atsc] {
+            let v = parallel(200, |t| {
+                let x = iq_u8_to_complex(&negative_capture(0xB188 ^ (t as u64 * 104_729) ^ ((kind as u64) << 50), kind));
+                timing_candidates(&x, 2_048_000.0 * 7.0 / 64.0 * 1e-6).first().map_or(0.0, |c| c.1)
+            });
+            let mx = v.iter().cloned().fold(0.0, f64::max);
+            println!("RATIO negatives {kind:?}: best-candidate max {mx:.2}");
+            worst = worst.max(mx);
+            all.extend(v);
+        }
+        println!("RATIO worst negative {worst:.2}");
     }
 }

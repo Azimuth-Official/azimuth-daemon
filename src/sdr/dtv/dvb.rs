@@ -44,7 +44,7 @@
 #[path = "p1.rs"]
 pub mod p1;
 use p1::{detect_p1, P1Detection};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::num_complex::Complex;
 
 /// Capture length the detector is validated for (samples at 2.048 MS/s).
 pub const CAPTURE_SAMPLES: usize = 131_072;
@@ -280,9 +280,8 @@ pub fn analyze_with_p1(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32,
     if m < 32_768 {
         return Vec::new();
     }
-    let mut planner = FftPlanner::<f32>::new();
-    let fwd = planner.plan_fft_forward(m);
-    let inv = planner.plan_fft_inverse(m);
+    let fwd = p1::plan(m, false);
+    let inv = p1::plan(m, true);
     let mut spectrum: Option<Vec<Complex<f32>>> = None;
     let mut out = Vec::new();
 
@@ -417,6 +416,36 @@ pub fn decide_with_p1(scores: &[HypothesisScore], bandwidth_mhz: u32, p1: Option
 pub fn find_p1(iq_bytes: &[u8], sample_rate: u32, bandwidth_mhz: u32) -> Option<P1Detection> {
     let t = elementary_period_us(bandwidth_mhz)?;
     detect_p1(&iq_u8_to_complex(iq_bytes), f64::from(sample_rate), t)
+}
+
+/// Samples shared by consecutive slices of a dwell window: far more than a whole P1 (2048 T = 459 samples at
+/// 2.048 MS/s) plus the detector's edge margins, so a P1 straddling a slice boundary lies whole inside one slice.
+pub const WINDOW_SLICE_OVERLAP: usize = 2048;
+
+/// Sample ranges of the overlapping slices (each `CAPTURE_SAMPLES` long, the length the P1 search is
+/// validated for) that cover a contiguous window of `total` samples. A window shorter than one slice is one
+/// slice.
+pub fn window_slices(total: usize) -> Vec<std::ops::Range<usize>> {
+    if total <= CAPTURE_SAMPLES {
+        return vec![0..total];
+    }
+    let stride = CAPTURE_SAMPLES - WINDOW_SLICE_OVERLAP;
+    let mut v = Vec::new();
+    let mut start = 0;
+    while start + CAPTURE_SAMPLES < total {
+        v.push(start..start + CAPTURE_SAMPLES);
+        start += stride;
+    }
+    v.push(total - CAPTURE_SAMPLES..total);
+    v
+}
+
+/// Look for a P1 anywhere in a contiguous multi-capture window (interleaved u8 IQ from ONE uninterrupted
+/// read), searching overlapping slices.
+pub fn find_p1_in_window(iq_bytes: &[u8], sample_rate: u32, bandwidth_mhz: u32) -> Option<P1Detection> {
+    window_slices(iq_bytes.len() / 2)
+        .into_iter()
+        .find_map(|r| find_p1(&iq_bytes[2 * r.start..2 * r.end], sample_rate, bandwidth_mhz))
 }
 
 /// Detect DVB-T / DVB-T2 in a raw RTL-SDR capture (interleaved u8 I/Q).
