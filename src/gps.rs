@@ -1900,3 +1900,185 @@ mod tests {
         }
     }
 }
+
+/// M2c: GPS baud and port tests against a REAL serial open path.
+///
+/// This crate is binary-only (lib.rs is empty off Android), so `tests/` cannot
+/// reach `attempt_port` / `rank_candidates`: these live in a `#[cfg(test)]`
+/// module. The fake receiver is a Linux pty pair from `serialport::TTYPort::pair`
+/// (no new dependency). The emitter reads the baud the daemon configured on the
+/// slave termios (visible from the master) and sends valid NMEA only at the
+/// receiver's baud, garbage at any other.
+#[cfg(all(test, unix))]
+mod baud_port_tests {
+    use super::*;
+    use serialport::{SerialPort, TTYPort};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const NMEA: &[u8] = b"$GNGGA,123519.00,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+    const GARBAGE: &[u8] = &[0xE0, 0x80, 0xFC, 0x00, 0xFF, 0x13, 0x9A, b'\n'];
+    const BAUDS: [u32; 4] = [9600, 4800, 38400, 115200];
+    const WINDOW: Duration = Duration::from_millis(800);
+
+    struct FakeReceiver {
+        path: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _slave: TTYPort,
+    }
+
+    impl FakeReceiver {
+        /// A receiver that streams NMEA only while the port is set to `baud`.
+        fn at(baud: u32) -> Self {
+            let (mut master, slave) = TTYPort::pair().expect("open a pty pair");
+            let path = slave.name().expect("slave path");
+            master.set_timeout(Duration::from_millis(50)).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let data = if master.baud_rate().ok() == Some(baud) { NMEA } else { GARBAGE };
+                    let _ = master.write_all(data);
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            });
+            Self { path, stop, thread: Some(thread), _slave: slave }
+        }
+    }
+
+    impl Drop for FakeReceiver {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn no_vid(name: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: "unknown".to_string(),
+            vid: None,
+            pid: None,
+            manufacturer: None,
+            product: None,
+            serial_number: None,
+        }
+    }
+
+    fn usb_port(name: &str, vid: u16, product: Option<&str>) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: "usb".to_string(),
+            vid: Some(vid),
+            pid: Some(0x1234),
+            manufacturer: None,
+            product: product.map(str::to_string),
+            serial_number: None,
+        }
+    }
+
+    fn policy() -> GpsProbePolicy {
+        GpsProbePolicy {
+            enabled: true,
+            probe_unknown_ports: true,
+            retry_base: Duration::from_secs(60),
+            retry_max: Duration::from_secs(1800),
+            ..Default::default()
+        }
+    }
+
+    fn rank(ports: &[SerialPortInfo]) -> Vec<GpsCandidate> {
+        rank_candidates(ports, &policy(), &ProbeCache::new(), Instant::now())
+    }
+
+    /// Rank, then probe the single candidate through the real open path.
+    async fn detect(info: SerialPortInfo) -> Option<u32> {
+        let cands = rank(std::slice::from_ref(&info));
+        assert_eq!(cands.len(), 1, "{} must be probed", info.port_name);
+        let speculative = cands[0].tier >= Tier::Unidentified;
+        let mut contact = PortContact::default();
+        let path = info.port_name.clone();
+        match probe_with(speculative, &mut contact, &BAUDS, |b| attempt_port(&path, b, WINDOW)).await {
+            BaudSearch::Found(_reader, baud) => Some(baud),
+            BaudSearch::NotFound { .. } => None,
+        }
+    }
+
+    /// The fake itself: right baud -> NMEA, wrong baud -> bytes that are not NMEA.
+    /// (A fresh fake per attempt: bytes buffered at one baud must not leak into the next.)
+    #[tokio::test]
+    async fn m2c_fake_port_is_baud_sensitive() {
+        for (receiver, tried, want_nmea) in [(4800, 4800, true), (4800, 9600, false), (9600, 9600, true), (9600, 4800, false)] {
+            let fake = FakeReceiver::at(receiver);
+            let got = attempt_port(&fake.path, tried, WINDOW).await;
+            if want_nmea {
+                assert!(matches!(got, Attempt::Nmea(_)), "receiver {receiver} opened at {tried} must give NMEA");
+            } else {
+                assert!(matches!(got, Attempt::Bytes), "receiver {receiver} opened at {tried} must give non-NMEA bytes");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn m2c_no_vid_port_is_detected_at_4800_and_at_9600() {
+        for baud in [4800, 9600] {
+            let fake = FakeReceiver::at(baud);
+            assert_eq!(detect(no_vid(&fake.path)).await, Some(baud), "no-VID port, receiver at {baud}");
+        }
+    }
+
+    #[tokio::test]
+    async fn m2c_unknown_vid_usb_port_is_detected_at_4800_and_at_9600() {
+        for baud in [4800, 9600] {
+            let fake = FakeReceiver::at(baud);
+            let info = usb_port(&fake.path, 0x1234, Some("Generic Serial"));
+            assert_eq!(detect(info).await, Some(baud), "unknown-VID USB port, receiver at {baud}");
+        }
+    }
+
+    #[test]
+    fn m2c_ports_are_probed_in_numeric_order_within_each_tier() {
+        let ports = vec![
+            no_vid("COM11"),
+            usb_port("COM20", 0x1234, Some("Generic Serial")),
+            no_vid("COM5"),
+            usb_port("COM3", 0x1234, Some("Generic Serial")),
+            no_vid("COM100"),
+        ];
+        let order: Vec<String> = rank(&ports).into_iter().map(|c| c.port_name).collect();
+        assert_eq!(order, ["COM5", "COM11", "COM100", "COM3", "COM20"]);
+        let com5 = order.iter().position(|n| n == "COM5").unwrap();
+        let com11 = order.iter().position(|n| n == "COM11").unwrap();
+        assert!(com5 < com11, "COM5 is probed before COM11");
+    }
+
+    /// RED today: `is_modem_port` is text-based, so a Samsung (VID 0x04E8) port whose
+    /// strings do not say "modem" is probed. The VID alone must mark it a phone/modem
+    /// port: still listed for manual choice, never auto-probed.
+    #[test]
+    fn m2c_samsung_vid_alone_marks_a_port_as_modem_listed_but_never_probed() {
+        for product in [Some("Serial Port"), None] {
+            let ports = vec![usb_port("COM11", 0x04E8, product), no_vid("COM5")];
+            let probed = rank(&ports);
+            let names: Vec<&str> = probed.iter().map(|c| c.port_name.as_str()).collect();
+            assert_eq!(names, vec!["COM5"], "VID 0x04E8 port (product {product:?}) must not be probed");
+            let ui = ui_candidates(&ports, &probed, &HashMap::new());
+            let com11 = ui.iter().find(|c| c.port_name == "COM11").expect("modem port stays listed");
+            assert!(!com11.probed);
+            assert_eq!(com11.vid, Some(0x04E8));
+            assert!(com11.last_result.contains("modem"), "{}", com11.last_result);
+        }
+    }
+
+    /// Control for the test above: the same strings under another VID are probed,
+    /// so the VID is what excludes the Samsung port.
+    #[test]
+    fn m2c_control_same_strings_under_another_vid_are_probed() {
+        let ports = vec![usb_port("COM11", 0x1234, Some("Serial Port"))];
+        let names: Vec<String> = rank(&ports).into_iter().map(|c| c.port_name).collect();
+        assert_eq!(names, ["COM11"]);
+    }
+}
