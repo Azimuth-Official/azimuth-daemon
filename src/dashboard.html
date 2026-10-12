@@ -116,6 +116,33 @@
     <div class="row"><span class="k">Active</span><span class="v" id="scan_active">–</span></div>
     <div class="signals" id="recent_signals"></div>
   </div>
+  <div class="card"><h2>Sweep · FM</h2>
+    <div class="row"><span class="k">Last sweep start</span><span class="v" id="sweep_fm_started_at">–</span></div>
+    <div class="row"><span class="k">Last sweep end</span><span class="v" id="sweep_fm_completed_at">–</span></div>
+    <div class="row"><span class="k">Channels evaluated</span><span class="v" id="sweep_fm_evaluated">–</span></div>
+    <div class="row"><span class="k">Channels total</span><span class="v" id="sweep_fm_total">–</span></div>
+    <div class="row"><span class="k">Stations found</span><span class="v" id="sweep_fm_found">–</span></div>
+    <div class="row"><span class="k">In progress</span><span class="v" id="sweep_fm_in_progress">–</span></div>
+    <div class="row"><span class="k">Completed</span><span class="v" id="sweep_fm_completed">–</span></div>
+  </div>
+  <div class="card"><h2>Sweep · LTE</h2>
+    <div class="row"><span class="k">Last sweep start</span><span class="v" id="sweep_lte_started_at">–</span></div>
+    <div class="row"><span class="k">Last sweep end</span><span class="v" id="sweep_lte_completed_at">–</span></div>
+    <div class="row"><span class="k">Channels evaluated</span><span class="v" id="sweep_lte_evaluated">–</span></div>
+    <div class="row"><span class="k">Channels total</span><span class="v" id="sweep_lte_total">–</span></div>
+    <div class="row"><span class="k">Stations found</span><span class="v" id="sweep_lte_found">–</span></div>
+    <div class="row"><span class="k">In progress</span><span class="v" id="sweep_lte_in_progress">–</span></div>
+    <div class="row"><span class="k">Completed</span><span class="v" id="sweep_lte_completed">–</span></div>
+  </div>
+  <div class="card"><h2>Sweep · DTV</h2>
+    <div class="row"><span class="k">Last sweep start</span><span class="v" id="sweep_dtv_started_at">–</span></div>
+    <div class="row"><span class="k">Last sweep end</span><span class="v" id="sweep_dtv_completed_at">–</span></div>
+    <div class="row"><span class="k">Channels evaluated</span><span class="v" id="sweep_dtv_evaluated">–</span></div>
+    <div class="row"><span class="k">Channels total</span><span class="v" id="sweep_dtv_total">–</span></div>
+    <div class="row"><span class="k">Stations found</span><span class="v" id="sweep_dtv_found">–</span></div>
+    <div class="row"><span class="k">In progress</span><span class="v" id="sweep_dtv_in_progress">–</span></div>
+    <div class="row"><span class="k">Completed</span><span class="v" id="sweep_dtv_completed">–</span></div>
+  </div>
 </div>
 <footer>Refreshes every 5 seconds from 127.0.0.1 · no external resources</footer>
 <script>
@@ -183,6 +210,19 @@
 
     txt("scan_enabled", s.scanning_enabled ? "yes" : "no", s.scanning_enabled ? "ok" : "warn");
     txt("scan_active", s.scanner_active ? "yes" : "no", s.scanner_active ? "ok" : "warn");
+    var sw = s.sweep || {};
+    ["fm", "lte", "dtv"].forEach(function (band) {
+      var b = sw[band] || {};
+      var run = !!b.in_progress;
+      var done = !!b.completed_at && !run;
+      txt("sweep_" + band + "_started_at", fmtTime(b.started_at));
+      txt("sweep_" + band + "_completed_at", fmtTime(b.completed_at));
+      txt("sweep_" + band + "_evaluated", String(b.evaluated != null ? b.evaluated : "–"));
+      txt("sweep_" + band + "_total", String(b.total != null ? b.total : "–"));
+      txt("sweep_" + band + "_found", String(b.found != null ? b.found : "–"));
+      txt("sweep_" + band + "_in_progress", run ? "yes" : "no", run ? "warn" : "");
+      txt("sweep_" + band + "_completed", done ? "Completed: yes" : "Completed: no", done ? "ok" : "warn");
+    });
     var list = $("recent_signals");
     list.textContent = "";
     (s.recent_signals || []).slice(0, 10).forEach(function (sig) {
