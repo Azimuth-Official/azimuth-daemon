@@ -171,6 +171,40 @@ pub struct SdrDevice {
     serial: String,
     config: SdrDeviceConfig,
     last_tuned_freq_hz: Option<u64>,
+    /// `PLL_LOCK_FAILS` as it stood when the last `set_center_freq` began (see `TunerOps::has_lock`).
+    pll_fails_at_tune: u64,
+}
+
+/// What the scanner's real tune path needs from a tuner. `SdrDevice` is the production
+/// implementation; tests inject a double that reports a scripted PLL lock state.
+pub trait TunerOps {
+    fn set_frequency(&mut self, freq_hz: u64) -> anyhow::Result<()>;
+    /// Whether the tuner PLL locked on the frequency set last.
+    fn has_lock(&mut self) -> bool;
+    fn last_tuned_freq_hz(&self) -> Option<u64>;
+    fn set_last_tuned_freq_hz(&mut self, freq_hz: u64);
+}
+
+impl TunerOps for SdrDevice {
+    fn set_frequency(&mut self, freq_hz: u64) -> anyhow::Result<()> {
+        self.set_center_freq(freq_hz)
+    }
+
+    /// rtl-sdr-rs keeps the R82xx lock flag private and exposes no register read, so the
+    /// lock state is the absence of a "[R82xx] PLL not locked!" record since the last
+    /// `set_center_freq` began (counted by the tuner_log layer in `PLL_LOCK_FAILS`).
+    /// Without that layer installed the counter never moves and this reports locked.
+    fn has_lock(&mut self) -> bool {
+        PLL_LOCK_FAILS.load(std::sync::atomic::Ordering::Relaxed) == self.pll_fails_at_tune
+    }
+
+    fn last_tuned_freq_hz(&self) -> Option<u64> {
+        self.last_tuned_freq_hz
+    }
+
+    fn set_last_tuned_freq_hz(&mut self, freq_hz: u64) {
+        self.last_tuned_freq_hz = Some(freq_hz);
+    }
 }
 
 impl SdrDevice {
@@ -201,14 +235,6 @@ impl SdrDevice {
         &self.config
     }
 
-    pub fn last_tuned_freq_hz(&self) -> Option<u64> {
-        self.last_tuned_freq_hz
-    }
-
-    pub fn set_last_tuned_freq_hz(&mut self, freq_hz: u64) {
-        self.last_tuned_freq_hz = Some(freq_hz);
-    }
-
     /// Set center frequency with u64→u32 range check.
     /// RTL-SDR max frequency is ~1.766 GHz (u32::MAX).
     pub fn set_center_freq(&mut self, freq_hz: u64) -> anyhow::Result<()> {
@@ -219,6 +245,7 @@ impl SdrDevice {
             );
         }
         CURRENT_TUNE_HZ.store(freq_hz, std::sync::atomic::Ordering::Relaxed);
+        self.pll_fails_at_tune = PLL_LOCK_FAILS.load(std::sync::atomic::Ordering::Relaxed);
         // Stall-tolerant tune (see `dongle`): one cheap in-place retry, then up to
         // two USB-reset + full-init cycles that retry the SAME tune. Only then is
         // the stall handed to the scanner's recovery ladder.
@@ -392,6 +419,7 @@ impl SdrManager {
                 freq_correction_ppm,
             },
             last_tuned_freq_hz: None,
+            pll_fails_at_tune: 0,
         })
     }
 
@@ -447,6 +475,7 @@ impl SdrManager {
                     freq_correction_ppm: 0,
                 },
                 last_tuned_freq_hz: None,
+                pll_fails_at_tune: 0,
             }],
         })
     }

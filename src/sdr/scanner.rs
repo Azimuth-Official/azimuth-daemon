@@ -1,6 +1,6 @@
 use crate::config::{DtvScanConfig, FmScanConfig, LteScanConfig, ScanningConfig};
 use crate::observation::Observation;
-use crate::sdr::{SdrDevice, SdrManager, calculate_signal_power};
+use crate::sdr::{SdrDevice, SdrManager, TunerOps, calculate_signal_power};
 use crate::sdr::recovery::{RecoveryAction, RecoveryManager, reset_usb_bus_device, restart_os_device};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -44,6 +44,20 @@ pub struct BandSweep {
     pub tune_failed: u32,
     /// FM only: candidates dropped as a mirror image or adjacent-channel spill.
     pub spill_rejected: u32,
+    /// Tunes whose PLL did not report lock after the settle wait (every one, retries included).
+    pub pll_lock_failures: u32,
+    /// Post-tune settle waits performed, retries included.
+    pub settle_waits: u32,
+    /// Re-tunes attempted after a failed PLL lock.
+    pub tune_retries: u32,
+    /// DTV only: DWELLS (channel visits, not distinct channels; the same channel counts again on every
+    /// visit) since the last discovery whose cyclic prefix read as a T2-only mode but showed no P1 over a
+    /// whole maximum T2 frame; not DVB-T, T2 unproven, so no observation is emitted for them.
+    pub t2_unconfirmed: u32,
+    /// DTV only: DWELLS (channel visits, not distinct channels) since the last discovery that could not
+    /// cover a whole T2 frame (short or failed read, or a device recovery ran meanwhile) and found no P1:
+    /// no label was given, and nothing was counted as `t2_unconfirmed`.
+    pub dvb_dwell_incomplete: u32,
     pub in_progress: bool,
     pub next_rediscovery_at: Option<DateTime<Utc>>,
 }
@@ -155,6 +169,8 @@ pub struct Scanner {
     capture_retries: u32,
     max_observations_per_cycle: u32,
     recovery_manager: RecoveryManager,
+    /// Recovery actions (reopen, bus reset, ...) executed so far; a dwell is void if this moved during it.
+    recoveries_run: u32,
     dtv_plan: DtvPlan,
     sweep: SweepReport,
     /// Live copy of `sweep` for other tasks (/status), updated during sweeps.
@@ -182,6 +198,13 @@ const MAX_CONSECUTIVE_TUNE_FAILURES: u32 = 3;
 
 /// Default IQ capture size for signal processing (128K samples = 256KB).
 const CAPTURE_BYTES: usize = 262_144;
+/// Length of the DVB channel dwell read when the first capture holds a cyclic-prefix detection but no P1:
+/// 6 capture lengths = 384 ms at 2.048 MS/s. A T2 frame (and so its single P1) lasts up to 250 ms; the
+/// window adds one capture length (64 ms, so a P1 cut by the window start still leaves a whole one) and margin.
+/// It is ONE `read_sync` after ONE `reset_buffer` (`SdrDevice::capture_raw` does exactly that for any size), so
+/// the samples are a single uninterrupted stream: no gap where a P1 could hide.
+const DVB_WINDOW_CAPTURES: usize = 6;
+const DVB_WINDOW_BYTES: usize = DVB_WINDOW_CAPTURES * CAPTURE_BYTES;
 
 /// Relaxed gates for the one-shot FM sweep retry when the primary pass (using
 /// `fm_config.sweep_threshold` / `sweep_min_snr_db`) finds zero stations.
@@ -297,6 +320,7 @@ impl Scanner {
             capture_retries: config.capture_retries,
             max_observations_per_cycle: config.max_observations_per_cycle,
             recovery_manager: RecoveryManager::new(),
+            recoveries_run: 0,
             dtv_plan: DtvPlan::from_config(&config.dtv),
             sweep: SweepReport::default(),
             sweep_shared: Arc::new(Mutex::new(SweepReport::default())),
@@ -738,10 +762,22 @@ impl Scanner {
         self.finish_band(BandKind::Dtv, found, failed);
     }
 
-    /// Build the detection-only observation for a DVB capture, or nothing.
+    /// Build the detection-only observation for a single DVB capture, or nothing (the dwell's first-capture
+    /// step without the extra captures; the unit-test entry point of the detector-to-observation path).
+    #[cfg(test)]
     fn scan_dvb_capture(&self, iq_bytes: &[u8], sample_rate: u32, freq: u64, dbm: f64) -> Vec<ScanResult> {
-        let DtvPlan::Dvb { bandwidth_mhz, first_channel } = self.dtv_plan.clone() else { return Vec::new() };
+        let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
         let Some(det) = dvb::detect_dvb(iq_bytes, sample_rate, bandwidth_mhz) else { return Vec::new() };
+        self.dvb_observation(&det, freq, dbm).into_iter().collect()
+    }
+
+    /// The observation for a detection, or `None` for a cyclic-prefix reading of a T2-only mode without a
+    /// P1 (neither DVB-T nor proven T2).
+    fn dvb_observation(&self, det: &dvb::DvbDetection, freq: u64, dbm: f64) -> Option<ScanResult> {
+        let DtvPlan::Dvb { bandwidth_mhz, first_channel } = self.dtv_plan.clone() else { return None };
+        if det.signal_type == dvb::T2_UNCONFIRMED {
+            return None;
+        }
         let bw_hz = u64::from(bandwidth_mhz) * 1_000_000;
         let k = (freq.saturating_sub(self.dtv_config.sweep_start) / bw_hz) as u32;
         let channel = first_channel + k;
@@ -759,14 +795,51 @@ impl Scanner {
         // In-band SNR estimate from the CP correlation: rho ~= SNR / (1 + SNR).
         let rho = det.rho.clamp(0.01, 0.999);
         let snr_db = (10.0 * (rho / (1.0 - rho)).log10()) as f32;
-        vec![ScanResult {
+        Some(ScanResult {
             signal_type: det.signal_type.to_string(),
             frequency_hz: freq,
             signal_strength_dbm: dbm as f32,
             snr_db: Some(snr_db),
             source_id: Some(format!("dvb_ch{}", channel)),
             raw_data: Some(serde_json::Value::Object(raw)),
-        }]
+        })
+    }
+
+    /// One DVB channel dwell: the observation for the first capture, extended over a whole maximum T2 frame
+    /// when that capture holds a cyclic-prefix detection but no P1. A T2 frame (and so its single P1) can last
+    /// 250 ms while a capture is 64 ms, so a P1-less capture proves nothing. `window` reads ONE contiguous
+    /// `DVB_WINDOW_BYTES` stream (`None` = the read failed); it is searched in overlapping slices and a P1
+    /// anywhere in it makes the channel T2. With no P1, a complete window means a DVB-T-compatible mode is
+    /// DVB-T and a T2-only mode is counted as `t2_unconfirmed` (no observation). An incomplete window (failed
+    /// or short read, or a recovery action ran during it) proves nothing: no observation, counted in
+    /// `dvb_dwell_incomplete`.
+    fn scan_dvb_dwell<F>(&mut self, first_iq: &[u8], sample_rate: u32, freq: u64, dbm: f64, window: F) -> Vec<ScanResult>
+    where
+        F: FnOnce(&mut Scanner) -> Option<Vec<u8>>,
+    {
+        let DtvPlan::Dvb { bandwidth_mhz, .. } = self.dtv_plan else { return Vec::new() };
+        let Some(mut det) = dvb::detect_dvb(first_iq, sample_rate, bandwidth_mhz) else { return Vec::new() };
+        if det.p1.is_none() {
+            let recoveries = self.recoveries_run;
+            let read = window(self);
+            let disturbed = self.recoveries_run != recoveries;
+            let complete = !disturbed && read.as_ref().is_some_and(|w| w.len() >= DVB_WINDOW_BYTES);
+            // A recovery (reopen or bus reset) breaks the stream: what was read around it is not contiguous.
+            let found = if disturbed { None } else { read.as_ref().and_then(|w| dvb::find_p1_in_window(w, sample_rate, bandwidth_mhz)) };
+            if let Some(p1) = found {
+                det = det.with_p1(p1);
+            } else if !complete {
+                debug!(freq_mhz = freq as f64 / 1e6, "DVB dwell incomplete: no label without a full T2 frame of air time");
+                self.sweep.dtv.dvb_dwell_incomplete += 1;
+                self.publish_sweep();
+                return Vec::new();
+            } else if det.signal_type == dvb::T2_UNCONFIRMED {
+                debug!(freq_mhz = freq as f64 / 1e6, mode = det.fft_mode, gi = det.guard_interval, "DVB T2-only mode without a P1 over a full T2 frame: unconfirmed, no observation");
+                self.sweep.dtv.t2_unconfirmed += 1;
+                self.publish_sweep();
+            }
+        }
+        self.dvb_observation(&det, freq, dbm).into_iter().collect()
     }
 
     /// Run one full scan cycle. Returns observations to submit.
@@ -872,7 +945,9 @@ impl Scanner {
 
         let (_dbfs, dbm) = calculate_signal_power(&iq_bytes, self.dbm_offset);
         if scan_type == ScanType::Dtv && dvb_plan {
-            return self.scan_dvb_capture(&iq_bytes, sample_rate, freq, dbm);
+            return self.scan_dvb_dwell(&iq_bytes, sample_rate, freq, dbm, |sc| {
+                sc.capture_bytes_with_auto_reset(sdr_manager, device_idx, freq, DVB_WINDOW_BYTES)
+            });
         }
         let mut results = Vec::new();
 
@@ -1020,16 +1095,62 @@ impl Scanner {
 
     /// PLL settle delay. Large cross-band jumps (> 100 MHz) use 250 ms;
     /// otherwise use the configured retune_delay_ms.
-    fn retune_delay(&self, device: &SdrDevice, freq: u64) -> Duration {
+    fn retune_delay(&self, last_tuned: Option<u64>, freq: u64) -> Duration {
         const LARGE_JUMP_HZ: u64 = 100_000_000;
         const LARGE_JUMP_DELAY_MS: u64 = 250;
 
-        match device.last_tuned_freq_hz() {
+        match last_tuned {
             Some(prev) if freq.abs_diff(prev) > LARGE_JUMP_HZ => {
                 Duration::from_millis(LARGE_JUMP_DELAY_MS)
             }
             _ => Duration::from_millis(self.retune_delay_ms as u64),
         }
+    }
+
+    /// The sweep record of the band currently being swept, if any.
+    fn sweeping_band_mut(&mut self) -> Option<&mut BandSweep> {
+        [&mut self.sweep.fm, &mut self.sweep.lte, &mut self.sweep.dtv].into_iter().find(|b| b.in_progress)
+    }
+
+    /// One tune with settle and PLL lock check; a lost lock is re-tuned up to `PLL_TUNE_ATTEMPTS`
+    /// times in all. `Ok(true)` = locked, `Ok(false)` = lock never obtained, `Err` = the tune
+    /// itself failed (the caller decides whether that is a pipe error to recover from).
+    /// Every settle wait, lock failure and retry is counted in the band being swept.
+    fn tune_and_settle(&mut self, tuner: &mut dyn TunerOps, freq: u64) -> anyhow::Result<bool> {
+        const PLL_TUNE_ATTEMPTS: u32 = 3;
+        for attempt in 0..PLL_TUNE_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(b) = self.sweeping_band_mut() {
+                    b.tune_retries += 1;
+                }
+                self.publish_sweep();
+            }
+            // Delay from the *previous* tuned frequency BEFORE the tune updates it: the
+            // jump size is a property of the transition, not of the target.
+            let delay = self.retune_delay(tuner.last_tuned_freq_hz(), freq);
+            tuner.set_frequency(freq)?;
+            tuner.set_last_tuned_freq_hz(freq);
+            // Settle AFTER the tune. The PLL needs this time to lock the NEW
+            // frequency. Sleeping before set_center_freq waited on the
+            // previous, already-locked frequency and left ZERO settle before
+            // the caller's capture_raw() — so every post-retune capture read
+            // a slewing PLL. That is the "only the strongest station is ever
+            // found" symptom.
+            if delay > Duration::ZERO {
+                std::thread::sleep(delay);
+            }
+            if let Some(b) = self.sweeping_band_mut() {
+                b.settle_waits += 1;
+            }
+            if tuner.has_lock() {
+                return Ok(true);
+            }
+            if let Some(b) = self.sweeping_band_mut() {
+                b.pll_lock_failures += 1;
+            }
+            self.publish_sweep();
+        }
+        Ok(false)
     }
 
     /// Tune a device, applying band-aware delay and recovering from pipe errors
@@ -1047,41 +1168,45 @@ impl Scanner {
         r
     }
 
+    /// The tune path without the pipe-error recovery ladder (which needs the device manager):
+    /// settle, lock check and retries on any `TunerOps`. A final failure is counted in
+    /// `tune_fail_count`. The production path runs the same `tune_and_settle` ladder inside
+    /// `tune_with_recovery_inner`; this is the entry point for an injected tuner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn tune_with_recovery_on(&mut self, tuner: &mut dyn TunerOps, freq: u64) -> Option<()> {
+        let r = match self.tune_and_settle(tuner, freq) {
+            Ok(true) => Some(()),
+            Ok(false) => {
+                warn!(freq, "Tuner PLL did not lock after retries");
+                None
+            }
+            Err(e) => {
+                warn!(freq, error = %e, "Failed to tune device");
+                None
+            }
+        };
+        if r.is_none() {
+            self.tune_fail_count += 1;
+        }
+        r
+    }
+
     fn tune_with_recovery_inner(
         &mut self,
         sdr_manager: &mut SdrManager,
         device_idx: usize,
         freq: u64,
     ) -> Option<()> {
-        // Compute the delay from the *previous* tuned frequency BEFORE the tune
-        // updates it — the jump size is a property of the transition, not of the
-        // target. (Computing it after set_last_tuned_freq_hz would make
-        // freq.abs_diff(prev) == 0 and silently delete the large-jump path.)
-        let delay = {
-            let device = sdr_manager.device_mut(device_idx)?;
-            self.retune_delay(device, freq)
-        };
-
         let result = {
             let device = sdr_manager.device_mut(device_idx)?;
-            device.set_center_freq(freq)
+            self.tune_and_settle(device, freq)
         };
 
         match result {
-            Ok(()) => {
-                if let Some(device) = sdr_manager.device_mut(device_idx) {
-                    device.set_last_tuned_freq_hz(freq);
-                }
-                // Settle AFTER the tune. The PLL needs this time to lock the NEW
-                // frequency. Sleeping before set_center_freq waited on the
-                // previous, already-locked frequency and left ZERO settle before
-                // the caller's capture_raw() — so every post-retune capture read
-                // a slewing PLL. That is the "only the strongest station is ever
-                // found" symptom.
-                if delay > Duration::ZERO {
-                    std::thread::sleep(delay);
-                }
-                Some(())
+            Ok(true) => Some(()),
+            Ok(false) => {
+                warn!(device = device_idx, freq, "Tuner PLL did not lock after retries");
+                None
             }
             Err(e) => {
                 if !is_pipe_error(&e) {
@@ -1100,19 +1225,18 @@ impl Scanner {
                 loop {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
-                            let device = sdr_manager.device_mut(device_idx)?;
-                            match device.set_center_freq(freq) {
-                                Ok(()) => {
-                                    device.set_last_tuned_freq_hz(freq);
+                            let retried = {
+                                let device = sdr_manager.device_mut(device_idx)?;
+                                self.tune_and_settle(device, freq)
+                            };
+                            match retried {
+                                Ok(locked) => {
                                     self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Tune succeeded after recovery");
-                                    // Same post-tune PLL settle as the happy path — a
-                                    // capture straight after a recovery retune is just
-                                    // as vulnerable to reading a slewing PLL.
-                                    if delay > Duration::ZERO {
-                                        std::thread::sleep(delay);
-                                    }
-                                    return Some(());
+                                    // Same post-tune PLL settle as the happy path (inside
+                                    // `tune_and_settle`): a capture straight after a recovery
+                                    // retune is just as vulnerable to reading a slewing PLL.
+                                    return locked.then_some(());
                                 }
                                 Err(e2) => {
                                     if is_pipe_error(&e2) {
@@ -1168,6 +1292,7 @@ impl Scanner {
         device_idx: usize,
         action: RecoveryAction,
     ) -> anyhow::Result<()> {
+        self.recoveries_run += 1;
         match action {
             RecoveryAction::ReopenHandle => {
                 info!(device = device_idx, "Executing Level 1 recovery: reopen handle");
@@ -1266,9 +1391,20 @@ impl Scanner {
         device_idx: usize,
         freq: u64,
     ) -> Option<Vec<u8>> {
+        self.capture_bytes_with_auto_reset(sdr_manager, device_idx, freq, CAPTURE_BYTES)
+    }
+
+    /// `capture_with_auto_reset` for an arbitrary read size (one uninterrupted read).
+    fn capture_bytes_with_auto_reset(
+        &mut self,
+        sdr_manager: &mut SdrManager,
+        device_idx: usize,
+        freq: u64,
+        num_bytes: usize,
+    ) -> Option<Vec<u8>> {
         let result = {
             let device = sdr_manager.device_mut(device_idx)?;
-            capture_with_retry(device, CAPTURE_BYTES, self.capture_retries)
+            capture_with_retry(device, num_bytes, self.capture_retries)
         };
 
         match result {
@@ -1292,7 +1428,7 @@ impl Scanner {
                     match self.execute_recovery_action(sdr_manager, device_idx, action) {
                         Ok(()) => {
                             let device = sdr_manager.device_mut(device_idx)?;
-                            match capture_with_retry(device, CAPTURE_BYTES, self.capture_retries) {
+                            match capture_with_retry(device, num_bytes, self.capture_retries) {
                                 Ok(buf) if buf.len() >= 4 => {
                                     self.recovery_manager.record_recovery_success();
                                     info!(device = device_idx, freq, "Capture succeeded after recovery");
@@ -1810,9 +1946,7 @@ mod dsp_plan_tests {
 
         let t2 = dvb_capture(12, FftMode::K32, GuardInterval::G19_128, 8, 12.0, -120_000.0, false);
         let r2 = scanner.scan_dvb_capture(&t2, 2_048_000, 682_000_000, -40.0);
-        assert_eq!(r2[0].signal_type, "dtv_dvbt2");
-        assert_eq!(r2[0].source_id.as_deref(), Some("dvb_ch47"));
-        assert_eq!(r2[0].raw_data.as_ref().unwrap()["t2_possible"], true);
+        assert!(r2.is_empty(), "a CP-only T2-only mode without a P1 is not DVB-T and T2 is unproven: no observation");
     }
 
     #[test]
@@ -1832,3 +1966,12 @@ mod dsp_plan_tests {
     }
 }
 
+
+#[cfg(test)]
+mod tests_dsp;
+
+#[cfg(test)]
+mod tests_pll;
+
+#[cfg(test)]
+mod tests_dwell;

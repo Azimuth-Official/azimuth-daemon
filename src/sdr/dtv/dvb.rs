@@ -30,11 +30,21 @@
 //!   bandwidth), Table 66 (Tu = N T for 1K..32K), clause 9.7 Table 67 (allowed
 //!   guard interval per FFT size; "NA" combinations are not tested).
 //!
+//! DVB-T2 is told apart from DVB-T only by its P1 preamble (`p1`, EN 302 755 clause 9.8): FFT size and
+//! guard interval never decide it, because a T2 frame can use any DVB-T mode and a mode seen without a P1
+//! may simply have its P1 outside the capture (a T2 frame lasts up to 250 ms, a capture 64 ms). A detected P1
+//! also splits the symbol grid (the next frame's symbols restart after it), so its samples are excised
+//! from the cyclic-prefix fold and the fold continues on the shifted grid.
+//!
 //! The cyclic-prefix absolute carrier offset is only observable modulo the
 //! carrier spacing 1/Tu (the 2 MHz capture sees a flat part of the spectrum), so
 //! `cfo_hz` is the fractional carrier offset in [-1/(2 Tu), +1/(2 Tu)).
 
-use rustfft::{num_complex::Complex, FftPlanner};
+// Loaded through `#[path]` so `examples/dvb_probe.rs`, which includes this file on its own, still builds.
+#[path = "p1.rs"]
+pub mod p1;
+use p1::{detect_p1, P1Detection};
+use rustfft::num_complex::Complex;
 
 /// Capture length the detector is validated for (samples at 2.048 MS/s).
 pub const CAPTURE_SAMPLES: usize = 131_072;
@@ -62,6 +72,11 @@ pub const CAPTURE_SAMPLES: usize = 131_072;
 /// `RHO_MIN` is 1.8x the worst AWGN value.
 pub const RHO_MIN: f64 = 0.25;
 pub const CONTRAST_MIN: f64 = 10.0;
+/// Relaxed cyclic-prefix thresholds when the same capture also holds a P1 (see `decide_with_p1`): the best
+/// hypothesis of the -3 dB 1/128 modes reads rho 0.28..0.30, contrast 9.3..9.9 against at most 0.095 / 3.6
+/// for the runners-up.
+pub const RHO_MIN_WITH_P1: f64 = 0.15;
+pub const CONTRAST_MIN_WITH_P1: f64 = 6.0;
 /// Required ratio between the best hypothesis and the best hypothesis that
 /// would give a different (FFT size, guard interval) answer.
 pub const MARGIN_MIN: f64 = 1.25;
@@ -162,16 +177,30 @@ pub fn elementary_period_us(bandwidth_mhz: u32) -> Option<f64> {
     }
 }
 
-/// Signal type per contract C1 and `t2_possible`: true for every `dtv_dvbt2`
-/// result (definitely T2) and for a `dtv_dvbt` reading that could also be T2
-/// (2K/8K with guard interval 1/4..1/32).
+/// Signal type of a P1-less detection that is only a cyclic-prefix reading of a T2-only mode: it is not
+/// DVB-T and T2 is unproven, so no observation is emitted for it (the scanner counts it as `t2_unconfirmed`).
+pub const T2_UNCONFIRMED: &str = "dtv_t2_unconfirmed";
+
+/// Signal type of a cyclic-prefix reading WITHOUT a P1 in the capture, and `t2_possible`.
+/// 2K/8K with a DVB-T guard interval (1/4..1/32) is `dtv_dvbt` (it could still be a T2 frame whose P1 lies
+/// outside this capture, hence `t2_possible`); every other mode exists only in T2 and without a P1 is
+/// `T2_UNCONFIRMED`. Never `dtv_dvbt2`: that label needs a detected P1 (`classify_with_p1`).
 pub fn classify(mode: FftMode, gi: GuardInterval) -> (&'static str, bool) {
     let t2_only_mode = matches!(mode, FftMode::K1 | FftMode::K4 | FftMode::K16 | FftMode::K32);
     let t2_only_gi = matches!(gi, GuardInterval::G1_128 | GuardInterval::G19_256 | GuardInterval::G19_128);
     if t2_only_mode || t2_only_gi {
-        ("dtv_dvbt2", true)
+        (T2_UNCONFIRMED, true)
     } else {
         ("dtv_dvbt", true)
+    }
+}
+
+/// The only route to `dtv_dvbt2`: a P1 was detected in the capture.
+pub fn classify_with_p1(mode: FftMode, gi: GuardInterval, p1: bool) -> (&'static str, bool) {
+    if p1 {
+        ("dtv_dvbt2", true)
+    } else {
+        classify(mode, gi)
     }
 }
 
@@ -198,6 +227,19 @@ pub struct DvbDetection {
     pub signal_type: &'static str,
     pub mode: FftMode,
     pub gi: GuardInterval,
+    /// The P1 preamble found in the capture, if any (the only evidence of DVB-T2).
+    pub p1: Option<P1Detection>,
+}
+
+impl DvbDetection {
+    /// The same reading with a P1 found in ANOTHER capture of the same channel: the label becomes the T2 one.
+    pub fn with_p1(mut self, p1: P1Detection) -> Self {
+        let (signal_type, t2_possible) = classify_with_p1(self.mode, self.gi, true);
+        self.signal_type = signal_type;
+        self.t2_possible = t2_possible;
+        self.p1 = Some(p1);
+        self
+    }
 }
 
 /// Convert RTL-SDR interleaved u8 IQ to centred complex samples (DC removed).
@@ -223,6 +265,13 @@ pub fn iq_u8_to_complex(iq_bytes: &[u8]) -> Vec<Complex<f32>> {
 
 /// Score every allowed hypothesis for `bandwidth_mhz` on a prepared capture.
 pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<HypothesisScore> {
+    analyze_with_p1(x, sample_rate, bandwidth_mhz, None)
+}
+
+/// `analyze` for a capture with a detected P1: the P1 samples (and the products that reach into them) are
+/// left out of the correlation, and the symbol grid after the P1 is shifted back by the P1 length so the
+/// fold stays coherent across it.
+pub fn analyze_with_p1(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32, p1: Option<&P1Detection>) -> Vec<HypothesisScore> {
     let t_us = match elementary_period_us(bandwidth_mhz) {
         Some(t) => t,
         None => return Vec::new(),
@@ -231,9 +280,8 @@ pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<
     if m < 32_768 {
         return Vec::new();
     }
-    let mut planner = FftPlanner::<f32>::new();
-    let fwd = planner.plan_fft_forward(m);
-    let inv = planner.plan_fft_inverse(m);
+    let fwd = p1::plan(m, false);
+    let inv = p1::plan(m, true);
     let mut spectrum: Option<Vec<Complex<f32>>> = None;
     let mut out = Vec::new();
 
@@ -241,8 +289,8 @@ pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<
         let l = mode.n() as f64 * t_us * 1e-6 * sample_rate;
         let li = l.round() as usize;
         let frac = l - li as f64;
-        // Need several symbol repeats of data after the lag.
-        if m < 5 * li + 128 {
+        // Need several symbol repeats of data after the lag (and a lag of at least a few samples).
+        if li < 4 || m < 5 * li + 128 {
             continue;
         }
         let delayed_owned: Vec<Complex<f32>>;
@@ -269,14 +317,17 @@ pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<
             &delayed_owned
         };
         let nmax = m - li - 64;
+        // Products x[n] x*[n+li] with n+32 in [lo, hi] touch the P1 (a few samples of margin for the
+        // fractional delay filter); the grid after it restarts `len` samples later.
+        let hole = p1.map(|d| (d.start - 8.0, d.start + d.len + 8.0, d.start + d.len, d.len));
         let mut pre_c = Vec::with_capacity(nmax + 1);
         let mut pre_e = Vec::with_capacity(nmax + 1);
         let (mut ac, mut ae) = (Complex::new(0.0f64, 0.0f64), 0.0f64);
         pre_c.push(ac);
         pre_e.push(ae);
         for n in 32..32 + nmax {
-            let a = x[n];
-            let b = y[n + li];
+            let skip = hole.is_some_and(|(lo, hi, _, _)| (n as f64) <= hi && ((n + li) as f64) >= lo);
+            let (a, b) = if skip { (Complex::new(0.0, 0.0), Complex::new(0.0, 0.0)) } else { (x[n], y[n + li]) };
             ac += Complex::new(f64::from(a.re), f64::from(a.im)) * Complex::new(f64::from(b.re), -f64::from(b.im));
             ae += 0.5 * f64::from(a.norm_sqr() + b.norm_sqr());
             pre_c.push(ac);
@@ -294,7 +345,11 @@ pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<
             let mut ef = vec![0.0f64; nb];
             let inv_ts = 1.0 / ts;
             for n in 0..(nmax - g_len) {
-                let ph = (n as f64 * inv_ts).fract();
+                let pos = match hole {
+                    Some((_, _, after, len)) if (n + 32) as f64 >= after => (n + 32) as f64 - len,
+                    _ => (n + 32) as f64,
+                };
+                let ph = (pos * inv_ts).rem_euclid(1.0);
                 let idx = ((ph * nb as f64) as usize).min(nb - 1);
                 cf[idx] += pre_c[n + g_len] - pre_c[n];
                 ef[idx] += pre_e[n + g_len] - pre_e[n];
@@ -319,10 +374,18 @@ pub fn analyze(x: &[Complex<f32>], sample_rate: f64, bandwidth_mhz: u32) -> Vec<
     out
 }
 
-/// Apply the decision rule to a set of scores.
+/// Apply the decision rule to a set of scores (no P1).
 pub fn decide(scores: &[HypothesisScore], bandwidth_mhz: u32) -> Option<DvbDetection> {
+    decide_with_p1(scores, bandwidth_mhz, None)
+}
+
+/// Apply the decision rule to a set of scores; `p1` is the preamble found in the same capture, if any.
+pub fn decide_with_p1(scores: &[HypothesisScore], bandwidth_mhz: u32, p1: Option<P1Detection>) -> Option<DvbDetection> {
     let best = scores.iter().copied().max_by(|a, b| a.rho.partial_cmp(&b.rho).unwrap_or(std::cmp::Ordering::Equal))?;
-    if best.rho < RHO_MIN || best.contrast < CONTRAST_MIN {
+    // A detected P1 already proves a DVB signal is there, so the cyclic-prefix reading only has to pick the
+    // mode: the continuous-wave look-alikes `CONTRAST_MIN` guards against cannot carry a P1.
+    let (rho_min, contrast_min) = if p1.is_some() { (RHO_MIN_WITH_P1, CONTRAST_MIN_WITH_P1) } else { (RHO_MIN, CONTRAST_MIN) };
+    if best.rho < rho_min || best.contrast < contrast_min {
         return None;
     }
     let second = scores
@@ -333,7 +396,7 @@ pub fn decide(scores: &[HypothesisScore], bandwidth_mhz: u32) -> Option<DvbDetec
     if second > 0.0 && best.rho / second < MARGIN_MIN {
         return None;
     }
-    let (signal_type, t2_possible) = classify(best.mode, best.gi);
+    let (signal_type, t2_possible) = classify_with_p1(best.mode, best.gi, p1.is_some());
     Some(DvbDetection {
         fft_mode: best.mode.label(),
         guard_interval: best.gi.label(),
@@ -345,17 +408,57 @@ pub fn decide(scores: &[HypothesisScore], bandwidth_mhz: u32) -> Option<DvbDetec
         signal_type,
         mode: best.mode,
         gi: best.gi,
+        p1,
     })
+}
+
+/// Look for a P1 preamble alone (the cheap check for the further captures of a channel dwell).
+pub fn find_p1(iq_bytes: &[u8], sample_rate: u32, bandwidth_mhz: u32) -> Option<P1Detection> {
+    let t = elementary_period_us(bandwidth_mhz)?;
+    detect_p1(&iq_u8_to_complex(iq_bytes), f64::from(sample_rate), t)
+}
+
+/// Samples shared by consecutive slices of a dwell window: far more than a whole P1 (2048 T = 459 samples at
+/// 2.048 MS/s) plus the detector's edge margins, so a P1 straddling a slice boundary lies whole inside one slice.
+pub const WINDOW_SLICE_OVERLAP: usize = 2048;
+
+/// Sample ranges of the overlapping slices (each `CAPTURE_SAMPLES` long, the length the P1 search is
+/// validated for) that cover a contiguous window of `total` samples. A window shorter than one slice is one
+/// slice.
+pub fn window_slices(total: usize) -> Vec<std::ops::Range<usize>> {
+    if total <= CAPTURE_SAMPLES {
+        return std::iter::once(0..total).collect();
+    }
+    let stride = CAPTURE_SAMPLES - WINDOW_SLICE_OVERLAP;
+    let mut v = Vec::new();
+    let mut start = 0;
+    while start + CAPTURE_SAMPLES < total {
+        v.push(start..start + CAPTURE_SAMPLES);
+        start += stride;
+    }
+    v.push(total - CAPTURE_SAMPLES..total);
+    v
+}
+
+/// Look for a P1 anywhere in a contiguous multi-capture window (interleaved u8 IQ from ONE uninterrupted
+/// read), searching overlapping slices.
+pub fn find_p1_in_window(iq_bytes: &[u8], sample_rate: u32, bandwidth_mhz: u32) -> Option<P1Detection> {
+    window_slices(iq_bytes.len() / 2)
+        .into_iter()
+        .find_map(|r| find_p1(&iq_bytes[2 * r.start..2 * r.end], sample_rate, bandwidth_mhz))
 }
 
 /// Detect DVB-T / DVB-T2 in a raw RTL-SDR capture (interleaved u8 I/Q).
 ///
 /// `bandwidth_mhz` is the channel width on the region's raster (6, 7 or 8).
-/// Returns `None` when no cyclic-prefix structure is found.
+/// Returns `None` when no cyclic-prefix structure is found. `signal_type` is `dtv_dvbt2` only when a P1
+/// preamble was detected in this capture (`p1`); see `classify` for the P1-less labels.
 pub fn detect_dvb(iq_bytes: &[u8], sample_rate: u32, bandwidth_mhz: u32) -> Option<DvbDetection> {
     let x = iq_u8_to_complex(iq_bytes);
-    let scores = analyze(&x, f64::from(sample_rate), bandwidth_mhz);
-    decide(&scores, bandwidth_mhz)
+    let fs = f64::from(sample_rate);
+    let p1 = elementary_period_us(bandwidth_mhz).and_then(|t| detect_p1(&x, fs, t));
+    let scores = analyze_with_p1(&x, fs, bandwidth_mhz, p1.as_ref());
+    decide_with_p1(&scores, bandwidth_mhz, p1)
 }
 
 #[cfg(test)]
@@ -390,12 +493,12 @@ mod tests {
     fn labeling_follows_contract_c1() {
         assert_eq!(classify(FftMode::K8, G::G1_8), ("dtv_dvbt", true));
         assert_eq!(classify(FftMode::K2, G::G1_4), ("dtv_dvbt", true));
-        assert_eq!(classify(FftMode::K8, G::G19_128), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K8, G::G1_128), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K32, G::G1_8), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K1, G::G1_16), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K4, G::G1_32), ("dtv_dvbt2", true));
-        assert_eq!(classify(FftMode::K16, G::G1_16), ("dtv_dvbt2", true));
+        assert_eq!(classify(FftMode::K8, G::G19_128), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K8, G::G1_128), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K32, G::G1_8), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K1, G::G1_16), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K4, G::G1_32), (T2_UNCONFIRMED, true));
+        assert_eq!(classify(FftMode::K16, G::G1_16), (T2_UNCONFIRMED, true));
     }
 
     #[test]

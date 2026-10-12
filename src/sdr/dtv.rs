@@ -8,6 +8,10 @@ pub(crate) mod testgen;
 #[cfg(test)]
 mod validation;
 #[cfg(test)]
+pub(crate) mod testgen_t2;
+#[cfg(test)]
+mod validation_t2;
+#[cfg(test)]
 mod atsc_regression;
 
 /// Result from ATSC DTV pilot tone detection.
