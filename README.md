@@ -143,7 +143,7 @@ With no P1 in a complete window, a 2K/8K signal with a DVB-T guard interval is r
 as `dtv_dvbt` with `t2_possible: true`; a mode that exists only in T2 (1K, 4K, 16K, 32K
 or a T2-only guard interval) is not reported at all and is counted in
 `sweep.dtv.t2_unconfirmed`; an incomplete window (short or failed read, or a device
-recovery during it) gives no label and is counted in `sweep.dtv.dvb_dwell_incomplete`.
+recovery during it) with no P1 found gives no label and is counted in `sweep.dtv.dvb_dwell_incomplete`.
 Detection is validated on synthetic captures only, not on air. An observation is emitted
 only when a signal is detected, with `source_id` `dvb_ch<N>` and `raw_data` holding
 `fft_mode`, `guard_interval`, `rho`, `contrast`, `cfo_hz`, `channel`, `bandwidth_mhz` and
@@ -183,7 +183,7 @@ includes `sweep` (per band: when the last sweep started and finished, channels
 evaluated of total, stations found, tune failures, next rediscovery), `gps` (state, port,
 baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
 `[R82xx] PLL not locked!` message from the tuner driver is counted in
-`sdr_diagnostics.pll_lock_failures` instead of being printed (per band, tunes whose PLL did not lock after the settle wait are in `sweep.<band>.pll_lock_failures`, with `settle_waits` and `tune_retries` beside them): the "PLL not locked" tuner chatter users used to see on the console no longer appears. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
+`sdr_diagnostics.pll_lock_failures` instead of being printed (per band, failed PLL lock checks after the settle wait, retries included, so one tune can add up to 3, are in `sweep.<band>.pll_lock_failures`, with `settle_waits` and `tune_retries` beside them): the "PLL not locked" tuner chatter users used to see on the console no longer appears. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
 
 ### Local control API safety
 

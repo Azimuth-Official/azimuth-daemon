@@ -113,8 +113,9 @@ shows the resolved region at startup, and `GET /status` reports `region_effectiv
 
 DTV detection covers ATSC (pilot tone, `dtv_atsc`) and DVB-T (cyclic prefix,
 `dtv_dvbt`) and DVB-T2 (`dtv_dvbt2`, only when its P1 preamble is detected; not decoded;
-T2-only modes without a P1 are counted in `sweep.dtv.t2_unconfirmed`, not reported). FM discovery is channel-relative with no station cap; progress per band is in
-`GET /status` under `sweep`. The old "PLL not locked" tuner chatter is no longer printed
+T2-only modes without a P1 are counted in `sweep.dtv.t2_unconfirmed`, not reported). FM
+discovery is channel-relative with no station cap; progress per band is in `GET /status`
+under `sweep`. The old "PLL not locked" tuner chatter is no longer printed
 (it is counted in `sdr_diagnostics`), and a dongle that stalls USB transfers is reset and
 re-initialised automatically (`device_error` in `/status` if it cannot be recovered).
 Image 0.4.0 and later; the HEALTHCHECK (section 6) is healthy only when `config_state`
