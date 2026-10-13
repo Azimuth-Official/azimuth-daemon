@@ -18,7 +18,7 @@ Full getting-started guide: [azimuth.day/docs/getting-started](https://azimuth.d
 |--------|--------|----------------|
 | FM broadcast | Channel-relative survey (spectrum vs. the capture's own noise floor, FM-demodulation check), RDS PI code | 65–108 MHz (incl. OIRT and Japan bands); 200 kHz raster in the Americas and Korea, 100 kHz elsewhere |
 | LTE | PSS/SSS cell ID detection | regional bands up to the tuner limit |
-| DTV | ATSC pilot tone (`dtv_atsc`); DVB-T (`dtv_dvbt`) and DVB-T2 (`dtv_dvbt2`) cyclic-prefix detection | UHF 470 MHz up to the region's upper edge (most of Europe: 694 MHz) |
+| DTV | ATSC pilot tone (`dtv_atsc`); DVB-T (`dtv_dvbt`) cyclic-prefix detection and DVB-T2 (`dtv_dvbt2`) P1-preamble detection | UHF 470 MHz up to the region's upper edge (most of Europe: 694 MHz) |
 | GPS (optional) | NMEA over serial | reference timing and position truth |
 | RTK (optional) | NTRIP client (GEODNET, Onocoy, RTK2GO, custom casters) | centimeter-level corrections |
 
@@ -135,12 +135,19 @@ The region plan chooses the standard, channel width and channel numbering (ATSC 
 North America; DVB-T/T2 on the 7 or 8 MHz raster in Europe and elsewhere, ending at that
 country's upper DTT edge; channel centres are tuned, not channel edges). DVB detection
 correlates the cyclic prefix for every FFT size and guard interval the standards allow.
-DVB-T2 is recognised from its FFT size (1K, 4K, 16K, 32K) or guard interval (1/128,
-19/256, 19/128), not decoded; a 2K/8K signal with a DVB-T guard interval is reported as
-`dtv_dvbt` with `t2_possible: true`. An observation is emitted only when a signal is
-detected, with `source_id` `dvb_ch<N>` and `raw_data` holding `fft_mode`,
-`guard_interval`, `rho`, `contrast`, `cfo_hz`, `channel`, `bandwidth_mhz` and
-`t2_possible`.
+DVB-T2 is detected, not decoded, and only from its P1 preamble (EN 302 755 clause 9.8):
+`dtv_dvbt2` is emitted only when a P1 symbol is found, whatever the FFT size and guard
+interval. A capture is 64 ms but a T2 frame lasts up to 250 ms, so a cyclic-prefix hit
+without a P1 in the first capture is re-read over a 384 ms window and searched for a P1.
+With no P1 in a complete window, a 2K/8K signal with a DVB-T guard interval is reported
+as `dtv_dvbt` with `t2_possible: true`; a mode that exists only in T2 (1K, 4K, 16K, 32K
+or a T2-only guard interval) is not reported at all and is counted in
+`sweep.dtv.t2_unconfirmed`; an incomplete window (short or failed read, or a device
+recovery during it) with no P1 found gives no label and is counted in `sweep.dtv.dvb_dwell_incomplete`.
+Detection is validated on synthetic captures only, not on air. An observation is emitted
+only when a signal is detected, with `source_id` `dvb_ch<N>` and `raw_data` holding
+`fft_mode`, `guard_interval`, `rho`, `contrast`, `cfo_hz`, `channel`, `bandwidth_mhz` and
+`t2_possible` (true for every `dtv_dvbt2` result).
 
 ### FM survey
 
@@ -176,7 +183,7 @@ includes `sweep` (per band: when the last sweep started and finished, channels
 evaluated of total, stations found, tune failures, next rediscovery), `gps` (state, port,
 baud, why detection failed and the port candidates) and `sdr_diagnostics`. A
 `[R82xx] PLL not locked!` message from the tuner driver is counted in
-`sdr_diagnostics.pll_lock_failures` instead of being printed: the "PLL not locked" tuner chatter users used to see on the console no longer appears. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
+`sdr_diagnostics.pll_lock_failures` instead of being printed (per band, failed PLL lock checks after the settle wait, retries included, so one tune can add up to 3, are in `sweep.<band>.pll_lock_failures`, with `settle_waits` and `tune_retries` beside them): the "PLL not locked" tuner chatter users used to see on the console no longer appears. Everything the tuner driver (`rtl_sdr_rs::tuners::r82xx`) logs is withheld from the console and the log file at every level, debug included.
 
 ### Local control API safety
 
