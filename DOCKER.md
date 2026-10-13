@@ -111,9 +111,9 @@ explicit code, e.g. `AZIMUTH_REGION=FR`, always wins over the location. The cont
 shows the resolved region at startup, and `GET /status` reports `region_effective` and
 `region_source` (`explicit`, `auto:location` or `default`).
 
-DTV detection covers ATSC (pilot tone, `dtv_atsc`) and DVB-T / DVB-T2 (cyclic prefix,
-`dtv_dvbt` / `dtv_dvbt2`); DVB-T2 is recognised from its FFT size and guard interval, not
-decoded. FM discovery is channel-relative with no station cap; progress per band is in
+DTV detection covers ATSC (pilot tone, `dtv_atsc`) and DVB-T (cyclic prefix,
+`dtv_dvbt`) and DVB-T2 (`dtv_dvbt2`, only when its P1 preamble is detected; not decoded;
+T2-only modes without a P1 are counted in `sweep.dtv.t2_unconfirmed`, not reported). FM discovery is channel-relative with no station cap; progress per band is in
 `GET /status` under `sweep`. The old "PLL not locked" tuner chatter is no longer printed
 (it is counted in `sdr_diagnostics`), and a dongle that stalls USB transfers is reset and
 re-initialised automatically (`device_error` in `/status` if it cannot be recovered).
