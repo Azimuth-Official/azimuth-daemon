@@ -2305,4 +2305,93 @@ mod baud_port_tests {
         let none = window_exit_label(&WindowExit::ReadError { kind: std::io::ErrorKind::Other, raw_os_error: None });
         assert_eq!(none, "read_error(kind=Other,os=none)");
     }
+
+    // --- zero-length reads are not end-of-stream (Windows overlapped serial) --
+
+    /// Returns `zeros` zero-length reads, then `data` once, then stays pending.
+    struct ZerosThen {
+        zeros: u32,
+        data: Option<Vec<u8>>,
+    }
+    impl AsyncRead for ZerosThen {
+        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.zeros > 0 {
+                self.zeros -= 1;
+                return Poll::Ready(Ok(()));
+            }
+            match self.data.take() {
+                Some(d) => {
+                    buf.put_slice(&d);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Returns `data` once, then a read error.
+    struct DataThenErr(Option<Vec<u8>>);
+    impl AsyncRead for DataThenErr {
+        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            match self.0.take() {
+                Some(d) => {
+                    buf.put_slice(&d);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Ready(Err(std::io::Error::from_raw_os_error(5))),
+            }
+        }
+    }
+
+    /// Endless non-NMEA bytes.
+    struct Endless;
+    impl AsyncRead for Endless {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let n = buf.remaining();
+            buf.put_slice(&vec![b'x'; n]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn window_zero_reads_then_nmea_is_nmea() {
+        let mut r = ZerosThen { zeros: 3, data: Some(GGA.as_bytes().to_vec()) };
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(1000), &mut keep).await;
+        assert!(matches!(a, Attempt::Nmea(())));
+        assert_eq!(rep.exit, WindowExit::Nmea);
+        assert_eq!(keep.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn window_only_zero_reads_ends_at_deadline_without_spinning() {
+        let mut r = ZerosThen { zeros: u32::MAX, data: None };
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(300), &mut keep).await;
+        assert!(matches!(a, Attempt::Silent));
+        assert_eq!(rep.exit, WindowExit::Deadline);
+        assert_eq!(rep.bytes, 0);
+        assert!(rep.elapsed_ms >= 280, "elapsed {}", rep.elapsed_ms);
+        assert!(rep.reads < 300 / 10 + 2, "reads {}", rep.reads);
+    }
+
+    #[tokio::test]
+    async fn window_bytes_then_read_error_is_read_error_with_bytes() {
+        let mut r = DataThenErr(Some(b"garbage".to_vec()));
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(500), &mut keep).await;
+        assert!(matches!(a, Attempt::Bytes));
+        assert!(matches!(rep.exit, WindowExit::ReadError { raw_os_error: Some(5), .. }));
+        assert_eq!(rep.bytes, 7);
+    }
+
+    #[tokio::test]
+    async fn window_bytes_past_cap_without_nmea_is_bytes() {
+        let mut r = Endless;
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(2000), &mut keep).await;
+        assert!(matches!(a, Attempt::Bytes));
+        assert_eq!(rep.exit, WindowExit::Bytes);
+        assert!(rep.bytes > 4096);
+    }
 }
