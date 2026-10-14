@@ -458,8 +458,12 @@ pub fn usb_error_fault_verdict(spec: &str) -> Option<SdrTestVerdict> {
 /// driver or a USB I/O error does. Returns the refusal reason.
 #[cfg(any(test, feature = "qa-fault-injection"))]
 pub fn open_fault_for_spec(spec: &str) -> Option<String> {
-    let _ = spec;
-    None
+    let wrong_driver = parse_driver_fault(spec).is_some_and(|i| i.state == DriverStateKind::WrongDriver);
+    if wrong_driver || usb_error_fault_verdict(spec).is_some() {
+        Some(format!("[QA fault injection] open refused ({spec})"))
+    } else {
+        None
+    }
 }
 
 /// `open_fault_for_spec` for `AZIMUTH_QA_DRIVER_FAULT`.
