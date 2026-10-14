@@ -454,6 +454,21 @@ pub fn usb_error_fault_verdict(spec: &str) -> Option<SdrTestVerdict> {
     })
 }
 
+/// Whether the fault spec makes the dongle impossible to open, as a real wrong
+/// driver or a USB I/O error does. Returns the refusal reason.
+#[cfg(any(test, feature = "qa-fault-injection"))]
+pub fn open_fault_for_spec(spec: &str) -> Option<String> {
+    let _ = spec;
+    None
+}
+
+/// `open_fault_for_spec` for `AZIMUTH_QA_DRIVER_FAULT`.
+#[cfg(feature = "qa-fault-injection")]
+pub fn open_fault_from_env() -> Option<String> {
+    std::hint::black_box(QA_FAULT_MARKER);
+    std::env::var("AZIMUTH_QA_DRIVER_FAULT").ok().and_then(|s| open_fault_for_spec(&s))
+}
+
 #[cfg(feature = "qa-fault-injection")]
 pub fn usb_error_fault_from_env() -> Option<SdrTestVerdict> {
     std::hint::black_box(QA_FAULT_MARKER);
@@ -681,5 +696,16 @@ mod tests {
             .expect("default features line");
         assert!(!default_line.contains("qa-fault-injection"), "{default_line}");
         assert!(manifest.contains("qa-fault-injection = []"));
+    }
+
+    #[test]
+    fn open_fault_spec_refuses_wrong_driver_and_usb_error_only() {
+        for spec in ["wrong_driver", "wrong_driver:libusb0", "usb_error", "usb_error:LIBUSB_ERROR_IO"] {
+            let r = open_fault_for_spec(spec).unwrap_or_else(|| panic!("{spec} must refuse the open"));
+            assert!(r.contains("QA fault injection"), "{r}");
+        }
+        for spec in ["", "driver_missing", "nonsense", "usb_error:", "wrong"] {
+            assert_eq!(open_fault_for_spec(spec), None, "{spec}");
+        }
     }
 }

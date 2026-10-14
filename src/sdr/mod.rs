@@ -395,6 +395,12 @@ impl SdrManager {
         gain: &GainSetting,
         freq_correction_ppm: i32,
     ) -> anyhow::Result<SdrDevice> {
+        // QA builds only: an injected wrong driver / USB error makes the open
+        // fail like the real condition, so the daemon reports no SDR.
+        #[cfg(feature = "qa-fault-injection")]
+        if let Some(reason) = driver_state::open_fault_from_env() {
+            return Err(anyhow::anyhow!(reason));
+        }
         // Open + full init under the stall ladder (reset, wait, redo; 5 tries).
         let params = dongle::InitParams {
             index,
@@ -688,5 +694,34 @@ mod tests {
             TunerGain::Auto => {}
             other => panic!("expected TunerGain::Auto, got {:?}", other),
         }
+    }
+
+    /// QA fault injection: with the env fault active the open fails like the real
+    /// condition, so the manager would hold no device. Serialised: it sets a
+    /// process-wide env var.
+    #[cfg(feature = "qa-fault-injection")]
+    #[test]
+    fn injected_driver_fault_fails_the_device_open() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let gain = GainSetting::Auto;
+        for spec in ["wrong_driver:libusb0", "usb_error"] {
+            std::env::set_var("AZIMUTH_QA_DRIVER_FAULT", spec);
+            let r = SdrManager::open_device(0, 2_048_000, &gain, 0);
+            std::env::remove_var("AZIMUTH_QA_DRIVER_FAULT");
+            let e = r.err().unwrap_or_else(|| panic!("{spec}: open must fail"));
+            assert!(format!("{e}").contains("QA fault injection"), "{spec}: {e}");
+        }
+        assert!(!SdrManager::empty().is_connected());
+    }
+
+    /// Without the env var the hook is silent.
+    #[cfg(feature = "qa-fault-injection")]
+    #[test]
+    fn no_env_fault_means_no_open_refusal() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("AZIMUTH_QA_DRIVER_FAULT");
+        assert_eq!(driver_state::open_fault_from_env(), None);
     }
 }
