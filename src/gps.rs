@@ -744,43 +744,116 @@ pub fn ui_candidates(
     v
 }
 
+/// Why `read_window` stopped. Diagnostic only: it never changes a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowExit {
+    /// A valid NMEA line arrived.
+    Nmea,
+    /// Bytes arrived, but no valid NMEA line before the window or size cap ended it.
+    Bytes,
+    /// A read returned 0 (the stream ended).
+    Eof,
+    /// A read failed.
+    ReadError { kind: std::io::ErrorKind, raw_os_error: Option<i32> },
+    /// No bytes arrived before the deadline.
+    Deadline,
+}
+
+/// Counters from one `read_window` call. Counts only, never content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowReport {
+    pub exit: WindowExit,
+    pub bytes: usize,
+    pub reads: u32,
+    pub elapsed_ms: u128,
+}
+
 /// Read from an opened port for up to `window`, classifying what arrives.
-async fn read_window(
-    reader: &mut BufReader<tokio_serial::SerialStream>,
+async fn read_window<R>(
+    reader: &mut R,
     window: Duration,
     keep: &mut Vec<String>,
-) -> Attempt<()> {
+) -> (Attempt<()>, WindowReport)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
-    let deadline = tokio::time::Instant::now() + window;
+    let start = tokio::time::Instant::now();
+    let deadline = start + window;
     let mut data: Vec<u8> = Vec::new();
     let mut buf = [0u8; 256];
+    let mut reads: u32 = 0;
+    // Set when a read ends the loop (EOF or error); otherwise the window or
+    // the size cap did.
+    let mut terminal: Option<WindowExit> = None;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             break;
         }
         match tokio::time::timeout(left, reader.read(&mut buf)).await {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0)) => {
+                reads += 1;
+                terminal = Some(WindowExit::Eof);
+                break;
+            }
             Ok(Ok(n)) => {
+                reads += 1;
                 data.extend_from_slice(&buf[..n]);
                 let text = String::from_utf8_lossy(&data);
                 if text.lines().any(nmea_line_valid) && text.contains('\n') {
                     for l in text.lines().filter(|l| nmea_line_valid(l)).take(20) {
                         keep.push(l.trim().to_string());
                     }
-                    return Attempt::Nmea(());
+                    let report = WindowReport {
+                        exit: WindowExit::Nmea,
+                        bytes: data.len(),
+                        reads,
+                        elapsed_ms: start.elapsed().as_millis(),
+                    };
+                    return (Attempt::Nmea(()), report);
                 }
                 if data.len() > 4096 {
                     break;
                 }
             }
-            Ok(Err(_)) | Err(_) => break,
+            Ok(Err(e)) => {
+                reads += 1;
+                terminal = Some(WindowExit::ReadError { kind: e.kind(), raw_os_error: e.raw_os_error() });
+                break;
+            }
+            Err(_) => break,
         }
     }
+    let exit = terminal.unwrap_or(if data.is_empty() { WindowExit::Deadline } else { WindowExit::Bytes });
+    let report = WindowReport { exit, bytes: data.len(), reads, elapsed_ms: start.elapsed().as_millis() };
     if data.is_empty() {
-        Attempt::Silent
+        (Attempt::Silent, report)
     } else {
-        Attempt::Bytes
+        (Attempt::Bytes, report)
+    }
+}
+
+/// Short, content-free label for an exit reason, for log lines.
+fn window_exit_label(exit: &WindowExit) -> String {
+    match exit {
+        WindowExit::Nmea => "nmea".to_string(),
+        WindowExit::Bytes => "bytes".to_string(),
+        WindowExit::Eof => "eof".to_string(),
+        WindowExit::Deadline => "deadline".to_string(),
+        WindowExit::ReadError { kind, raw_os_error } => match raw_os_error {
+            Some(c) => format!("read_error(kind={kind:?},os={c})"),
+            None => format!("read_error(kind={kind:?},os=none)"),
+        },
+    }
+}
+
+/// Short label for a serial open failure: the error kind only (serialport's
+/// error carries no raw OS code).
+fn open_error_label(kind: &tokio_serial::ErrorKind) -> String {
+    match kind {
+        tokio_serial::ErrorKind::Io(k) => format!("error(io:{k:?})"),
+        other => format!("error({other:?})"),
     }
 }
 
@@ -828,7 +901,17 @@ async fn attempt_port(
             debug!(port = %port, baud, "Serial port opened, validating NMEA");
             let mut reader = BufReader::new(stream);
             let mut lines = Vec::new();
-            match read_window(&mut reader, window, &mut lines).await {
+            let (outcome, report) = read_window(&mut reader, window, &mut lines).await;
+            debug!(
+                port = %port,
+                baud,
+                exit = %window_exit_label(&report.exit),
+                bytes = report.bytes,
+                reads = report.reads,
+                elapsed_ms = report.elapsed_ms as u64,
+                "Serial attempt window ended"
+            );
+            match outcome {
                 Attempt::Nmea(()) => {
                     info!(port = %port, baud, "NMEA validated on serial port");
                     Attempt::Nmea(reader)
@@ -873,11 +956,33 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
     let per = total / bauds.len() as u32;
     let (mut saw_bytes, mut error) = (false, None::<String>);
     for &b in &bauds {
-        match tokio_serial::new(port, b).open_native_async() {
+        let open_start = Instant::now();
+        let opened = tokio_serial::new(port, b).open_native_async();
+        let open_ms = open_start.elapsed().as_millis() as u64;
+        match opened {
             Ok(stream) => {
                 let mut reader = BufReader::new(stream);
                 let mut lines = Vec::new();
-                match read_window(&mut reader, per, &mut lines).await {
+                let (outcome, report) = read_window(&mut reader, per, &mut lines).await;
+                let verdict = match outcome {
+                    Attempt::Nmea(()) => "nmea",
+                    Attempt::Bytes => "bytes",
+                    _ => "silent",
+                };
+                info!(
+                    port = %port,
+                    baud = b,
+                    window_ms = per.as_millis() as u64,
+                    open_ms,
+                    open = "ok",
+                    exit = %window_exit_label(&report.exit),
+                    bytes = report.bytes,
+                    reads = report.reads,
+                    elapsed_ms = report.elapsed_ms as u64,
+                    verdict,
+                    "GPS preview attempt"
+                );
+                match outcome {
                     Attempt::Nmea(()) => {
                         return PreviewResult {
                             lines,
@@ -892,7 +997,21 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
                 }
             }
             Err(e) => {
-                if open_error_denied_for(port, &e.kind) {
+                let denied = open_error_denied_for(port, &e.kind);
+                info!(
+                    port = %port,
+                    baud = b,
+                    window_ms = per.as_millis() as u64,
+                    open_ms,
+                    open = %open_error_label(&e.kind),
+                    exit = "none",
+                    bytes = 0,
+                    reads = 0,
+                    elapsed_ms = 0,
+                    verdict = if denied { "access_denied" } else { "open_failed" },
+                    "GPS preview attempt"
+                );
+                if denied {
                     return PreviewResult {
                         lines: vec![],
                         verdict: "access_denied".to_string(),
@@ -2087,5 +2206,103 @@ mod baud_port_tests {
         let ports = vec![usb_port("COM11", 0x1234, Some("Serial Port"))];
         let names: Vec<String> = rank(&ports).into_iter().map(|c| c.port_name).collect();
         assert_eq!(names, ["COM11"]);
+    }
+
+    // --- read_window exit classification -----------------------------------
+
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    /// Reader whose first read fails with a raw OS error.
+    struct ErrReader;
+    impl AsyncRead for ErrReader {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::from_raw_os_error(5)))
+        }
+    }
+
+    /// Yields `data` once, then stays pending forever.
+    struct ThenPending(Option<Vec<u8>>);
+    impl AsyncRead for ThenPending {
+        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            match self.0.take() {
+                Some(d) => {
+                    buf.put_slice(&d);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    const GGA: &str = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+
+    #[tokio::test]
+    async fn window_immediate_eof_is_eof() {
+        let mut r = tokio::io::empty();
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(500), &mut keep).await;
+        assert!(matches!(a, Attempt::Silent));
+        assert_eq!(rep.exit, WindowExit::Eof);
+        assert_eq!((rep.bytes, rep.reads), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn window_io_error_carries_kind_and_code() {
+        let mut r = ErrReader;
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(500), &mut keep).await;
+        assert!(matches!(a, Attempt::Silent));
+        let kind = std::io::Error::from_raw_os_error(5).kind();
+        assert_eq!(rep.exit, WindowExit::ReadError { kind, raw_os_error: Some(5) });
+        assert_eq!(rep.reads, 1);
+    }
+
+    #[tokio::test]
+    async fn window_pending_reader_is_deadline() {
+        let mut r = ThenPending(None);
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(150), &mut keep).await;
+        assert!(matches!(a, Attempt::Silent));
+        assert_eq!(rep.exit, WindowExit::Deadline);
+        assert_eq!(rep.bytes, 0);
+        assert!(rep.elapsed_ms >= 140 && rep.elapsed_ms < 1000, "elapsed {}", rep.elapsed_ms);
+    }
+
+    #[tokio::test]
+    async fn window_garbage_is_bytes() {
+        let mut r = ThenPending(Some(b"\x00\xffnot nmea at all".to_vec()));
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(150), &mut keep).await;
+        assert!(matches!(a, Attempt::Bytes));
+        assert_eq!(rep.exit, WindowExit::Bytes);
+        assert_eq!((rep.bytes, rep.reads), (17, 1));
+    }
+
+    #[tokio::test]
+    async fn window_valid_line_is_nmea() {
+        let mut r = ThenPending(Some(GGA.as_bytes().to_vec()));
+        let mut keep = Vec::new();
+        let (a, rep) = read_window(&mut r, Duration::from_millis(500), &mut keep).await;
+        assert!(matches!(a, Attempt::Nmea(())));
+        assert_eq!(rep.exit, WindowExit::Nmea);
+        assert_eq!(rep.bytes, GGA.len());
+        assert_eq!(keep.len(), 1);
+    }
+
+    #[test]
+    fn window_exit_label_has_no_content() {
+        assert_eq!(window_exit_label(&WindowExit::Nmea), "nmea");
+        assert_eq!(window_exit_label(&WindowExit::Bytes), "bytes");
+        assert_eq!(window_exit_label(&WindowExit::Eof), "eof");
+        assert_eq!(window_exit_label(&WindowExit::Deadline), "deadline");
+        let l = window_exit_label(&WindowExit::ReadError {
+            kind: std::io::ErrorKind::BrokenPipe,
+            raw_os_error: Some(5),
+        });
+        assert_eq!(l, "read_error(kind=BrokenPipe,os=5)");
+        let none = window_exit_label(&WindowExit::ReadError { kind: std::io::ErrorKind::Other, raw_os_error: None });
+        assert_eq!(none, "read_error(kind=Other,os=none)");
     }
 }
