@@ -751,7 +751,9 @@ pub enum WindowExit {
     Nmea,
     /// Bytes arrived, but no valid NMEA line before the window or size cap ended it.
     Bytes,
-    /// A read returned 0 (the stream ended).
+    /// A read returned 0 (the stream ended). No longer produced by `read_window`
+    /// (a zero read is counted, not terminal); kept for the log vocabulary.
+    #[allow(dead_code)]
     Eof,
     /// A read failed.
     ReadError { kind: std::io::ErrorKind, raw_os_error: Option<i32> },
@@ -765,6 +767,8 @@ pub struct WindowReport {
     pub exit: WindowExit,
     pub bytes: usize,
     pub reads: u32,
+    /// Reads that returned 0 bytes. Not end-of-stream on Windows serial.
+    pub zero_reads: u32,
     pub elapsed_ms: u128,
 }
 
@@ -783,6 +787,7 @@ where
     let mut data: Vec<u8> = Vec::new();
     let mut buf = [0u8; 256];
     let mut reads: u32 = 0;
+    let mut zero_reads: u32 = 0;
     // Set when a read ends the loop (EOF or error); otherwise the window or
     // the size cap did.
     let mut terminal: Option<WindowExit> = None;
@@ -793,9 +798,13 @@ where
         }
         match tokio::time::timeout(left, reader.read(&mut buf)).await {
             Ok(Ok(0)) => {
+                // A zero-length completion right after open is not
+                // end-of-stream on Windows overlapped serial: pause briefly
+                // (bounded by the deadline) and keep reading.
                 reads += 1;
-                terminal = Some(WindowExit::Eof);
-                break;
+                zero_reads += 1;
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(left.min(Duration::from_millis(25))).await;
             }
             Ok(Ok(n)) => {
                 reads += 1;
@@ -809,6 +818,7 @@ where
                         exit: WindowExit::Nmea,
                         bytes: data.len(),
                         reads,
+                        zero_reads,
                         elapsed_ms: start.elapsed().as_millis(),
                     };
                     return (Attempt::Nmea(()), report);
@@ -826,7 +836,7 @@ where
         }
     }
     let exit = terminal.unwrap_or(if data.is_empty() { WindowExit::Deadline } else { WindowExit::Bytes });
-    let report = WindowReport { exit, bytes: data.len(), reads, elapsed_ms: start.elapsed().as_millis() };
+    let report = WindowReport { exit, bytes: data.len(), reads, zero_reads, elapsed_ms: start.elapsed().as_millis() };
     if data.is_empty() {
         (Attempt::Silent, report)
     } else {
@@ -908,6 +918,7 @@ async fn attempt_port(
                 exit = %window_exit_label(&report.exit),
                 bytes = report.bytes,
                 reads = report.reads,
+                zero_reads = report.zero_reads,
                 elapsed_ms = report.elapsed_ms as u64,
                 "Serial attempt window ended"
             );
@@ -978,6 +989,7 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
                     exit = %window_exit_label(&report.exit),
                     bytes = report.bytes,
                     reads = report.reads,
+                    zero_reads = report.zero_reads,
                     elapsed_ms = report.elapsed_ms as u64,
                     verdict,
                     "GPS preview attempt"
@@ -1007,6 +1019,7 @@ pub async fn preview_port(port: &str, baud: Option<u32>, seconds: f32) -> Previe
                     exit = "none",
                     bytes = 0,
                     reads = 0,
+                    zero_reads = 0,
                     elapsed_ms = 0,
                     verdict = if denied { "access_denied" } else { "open_failed" },
                     "GPS preview attempt"
@@ -2239,13 +2252,14 @@ mod baud_port_tests {
     const GGA: &str = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
 
     #[tokio::test]
-    async fn window_immediate_eof_is_eof() {
+    async fn window_immediate_eof_is_a_zero_read_not_eof() {
         let mut r = tokio::io::empty();
         let mut keep = Vec::new();
         let (a, rep) = read_window(&mut r, Duration::from_millis(500), &mut keep).await;
         assert!(matches!(a, Attempt::Silent));
-        assert_eq!(rep.exit, WindowExit::Eof);
-        assert_eq!((rep.bytes, rep.reads), (0, 1));
+        assert_eq!(rep.exit, WindowExit::Deadline);
+        assert_eq!(rep.bytes, 0);
+        assert_eq!(rep.zero_reads, rep.reads);
     }
 
     #[tokio::test]
