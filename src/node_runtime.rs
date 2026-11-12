@@ -17,7 +17,8 @@ use tracing::{debug, error, info, warn};
 use crate::api_client::{self, ApiClient};
 use crate::config::{Config, ConfigProblem, LoadError, NodeConfig, ScanningConfig};
 use crate::identity;
-use crate::observation::{Observation, SubmitObservationsRequest};
+use crate::observation::Observation;
+use crate::pending;
 use crate::status_server::{self, StatusState};
 
 /// Overall health of the node's configuration, as reported by `/status`.
@@ -304,13 +305,23 @@ pub async fn submit_batch(
     client: &ApiClient,
     observations: Vec<Observation>,
 ) {
-    if observations.is_empty() {
+    submit_batch_at(state, client, observations, std::time::Instant::now()).await
+}
+
+/// `submit_batch` with the clock injected (tests drive the retry timing).
+pub(crate) async fn submit_batch_at(
+    state: &Arc<RwLock<StatusState>>,
+    client: &ApiClient,
+    observations: Vec<Observation>,
+    now: std::time::Instant,
+) {
+    let (node_id, auth_rejected, config_ok, buffer) = {
+        let s = state.read().await;
+        (s.node_id.clone(), s.auth_error.is_some(), s.config_state == ConfigState::Ok, Arc::clone(&s.pending))
+    };
+    if observations.is_empty() && buffer.len() == 0 {
         return;
     }
-    let (node_id, auth_rejected, config_ok) = {
-        let s = state.read().await;
-        (s.node_id.clone(), s.auth_error.is_some(), s.config_state == ConfigState::Ok)
-    };
     if !config_ok {
         debug!("Skipping observation submit — configuration not applied");
         return;
@@ -326,10 +337,14 @@ pub async fn submit_batch(
         return;
     }
 
-    let count = observations.len();
-    let types: Vec<String> = observations.iter().map(|o| o.signal_type.clone()).collect();
-    let request = SubmitObservationsRequest { node_id, observations };
-    match client.submit_observations_detailed(&request).await {
+    // New observations join the pending ones (oldest first); a failed upload
+    // that is worth retrying stays in the buffer for a later cycle.
+    let Some(sent) = pending::flush(&buffer, client, &node_id, observations, now).await else {
+        debug!("Observation submit waiting — retry delay in force");
+        return;
+    };
+    let (count, types) = (sent.count, sent.types);
+    match sent.result {
         Ok(outcome) => {
             log_rejected(&outcome.rejected, &types);
             let mut s = state.write().await;
@@ -348,7 +363,7 @@ pub async fn submit_batch(
                     error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
                     s.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
                 }
-            } else {
+            } else if !sent.kept {
                 log_rejected(&api_client::rejected_from_error(&e), &types);
                 warn!(error = %e, "Observation submit failed; this batch is dropped");
             }
@@ -684,5 +699,150 @@ mod tests {
         assert!(!text.contains("batch is dropped") && !text.contains("submit failed"), "202 treated as failure: {text}");
         assert!(state.read().await.last_accepted_at.is_some(), "a 2xx batch must count as accepted");
         assert_eq!(seen.lock().unwrap().len(), 2, "no resubmission");
+    }
+
+    // --- Retry buffer: failed uploads are kept and resent ------------------------
+
+    /// Like `fake_obs_api`, but a reply may also carry a `Retry-After` header.
+    async fn fake_api_ra(
+        reply: impl Fn(usize) -> (u16, Option<u64>, String) + Send + Sync + 'static,
+    ) -> (String, Bodies) {
+        let seen: Bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (rec, reply) = (Arc::clone(&seen), Arc::new(reply));
+        let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let (rec, reply) = (Arc::clone(&rec), Arc::clone(&reply));
+            async move {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let idx = {
+                    let mut g = rec.lock().unwrap();
+                    g.push(v);
+                    g.len() - 1
+                };
+                let (code, ra, text) = reply(idx);
+                let mut h = axum::http::HeaderMap::new();
+                if let Some(s) = ra {
+                    h.insert("retry-after", s.to_string().parse().unwrap());
+                }
+                (axum::http::StatusCode::from_u16(code).unwrap(), h, text)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    const OK_BODY: &str = r#"{"accepted":1,"rejected":[]}"#;
+
+    fn at(base: std::time::Instant, secs: u64) -> std::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    fn keys(body: &serde_json::Value) -> Vec<String> {
+        body["observations"].as_array().unwrap().iter().map(|o| o["client_dedupe_key"].as_str().unwrap_or("").to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn retry_500_then_200_delivers_both_batches_oldest_first_with_stable_keys() {
+        let (base_url, seen) = fake_api_ra(|i| if i == 0 { (500, None, "boom".into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1), obs_at("fm_rds", 2)], t0).await;
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 3)], at(t0, 31)).await;
+        let b = seen.lock().unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(frequencies(&b[1]), vec![1, 2, 3], "pending first, oldest first, then the new one");
+        let (k0, k1) = (keys(&b[0]), keys(&b[1]));
+        assert!(k0.iter().all(|k| !k.is_empty()), "every observation carries a client_dedupe_key");
+        assert_eq!(k0[..], k1[..2], "a resent observation keeps its key");
+        assert_ne!(k1[1], k1[2], "keys are unique per observation");
+    }
+
+    #[tokio::test]
+    async fn retry_after_503_sends_nothing_until_it_elapses() {
+        let (base_url, seen) = fake_api_ra(|i| if i == 0 { (503, Some(7), r#"{"retryable":true}"#.into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1)], t0).await;
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 2)], at(t0, 3)).await;
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 3)], at(t0, 6)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "no request while Retry-After is in the future");
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 4)], at(t0, 8)).await;
+        let b = seen.lock().unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(frequencies(&b[1]), vec![1, 2, 3, 4], "observations that arrived during the wait were kept");
+    }
+
+    #[tokio::test]
+    async fn retry_429_uses_exponential_backoff_without_retry_after() {
+        let (base_url, seen) = fake_api_ra(|i| if i < 2 { (429, None, "slow down".into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1)], t0).await;
+        submit_batch_at(&state, &client, vec![], at(t0, 20)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "first wait is the 30 s base interval");
+        submit_batch_at(&state, &client, vec![], at(t0, 31)).await; // second failure -> 60 s
+        submit_batch_at(&state, &client, vec![], at(t0, 31 + 40)).await;
+        assert_eq!(seen.lock().unwrap().len(), 2, "second wait doubled");
+        submit_batch_at(&state, &client, vec![], at(t0, 31 + 62)).await;
+        let b = seen.lock().unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(frequencies(&b[2]), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn network_error_keeps_the_batch_and_delivers_it_later() {
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        }; // listener dropped: connection refused
+        let (live, seen) = fake_api_ra(|_| (200, None, OK_BODY.into())).await;
+        let (state, t0) = (live_state().await, std::time::Instant::now());
+        submit_batch_at(&state, &client_to(&dead), vec![obs_at("fm_rds", 1), obs_at("fm_rds", 2)], t0).await;
+        submit_batch_at(&state, &client_to(&live), vec![obs_at("fm_rds", 3)], at(t0, 31)).await;
+        assert_eq!(frequencies(&seen.lock().unwrap()[0]), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn validation_rejection_400_is_not_resent() {
+        let (base_url, seen) = fake_api_ra(|i| if i == 0 { (400, None, r#"{"error":"invalid","rejected":[{"index":0,"reason":"bad"}]}"#.into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1)], t0).await;
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 2)], at(t0, 1)).await;
+        let b = seen.lock().unwrap();
+        assert_eq!(b.len(), 2, "the next cycle is not delayed by a 400");
+        assert_eq!(frequencies(&b[1]), vec![2], "the rejected batch is never resent");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_401_still_pauses_and_drops_the_batch() {
+        let (base_url, seen) = fake_api_ra(|i| if i == 0 { (401, None, "no".into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1)], t0).await;
+        assert!(state.read().await.auth_error.is_some());
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 2)], at(t0, 1)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "paused: no request while the key is rejected");
+        state.write().await.auth_error = None; // what the heartbeat does on recovery
+        submit_batch_at(&state, &client, vec![obs_at("fm_rds", 3)], at(t0, 2)).await;
+        assert_eq!(frequencies(&seen.lock().unwrap()[1]), vec![3], "the 401 batch is not resent");
+    }
+
+    #[tokio::test]
+    async fn over_the_cap_the_oldest_are_dropped_and_the_count_is_logged() {
+        let (cap, _guard) = capture_logs();
+        let (base_url, seen) = fake_api_ra(|i| if i == 0 { (500, None, "boom".into()) } else { (200, None, OK_BODY.into()) }).await;
+        let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
+        let big: Vec<Observation> = (1..=5100u64).map(|i| obs_at("fm_rds", i)).collect();
+        submit_batch_at(&state, &client, big, t0).await;
+        assert!(logged(&cap).contains("dropped=100"), "one warn with the count: {}", logged(&cap));
+        for n in 0..80 {
+            submit_batch_at(&state, &client, vec![], at(t0, 31 + n)).await;
+        }
+        let b = seen.lock().unwrap();
+        let all: Vec<u64> = b.iter().skip(1).flat_map(frequencies).collect();
+        assert_eq!(all.len(), 5000, "exactly the cap was delivered");
+        assert_eq!(all.first(), Some(&101), "the oldest 100 were dropped");
+        assert_eq!(all.last(), Some(&5100), "the newest were kept");
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "order preserved");
+        assert!(b.iter().all(|r| r["observations"].as_array().unwrap().len() <= 100), "server batch cap respected");
     }
 }

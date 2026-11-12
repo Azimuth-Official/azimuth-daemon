@@ -13,6 +13,8 @@ use crate::observation::{
 pub struct HttpStatusError {
     pub status: u16,
     pub body: String,
+    /// `Retry-After` (delta-seconds form) when the server sent one.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl std::fmt::Display for HttpStatusError {
@@ -134,6 +136,7 @@ impl ApiClient {
             return Err(anyhow::Error::new(HttpStatusError {
                 status,
                 body: format!("Node registration failed: {}", text),
+                retry_after_secs: None,
             }));
         }
 
@@ -197,6 +200,7 @@ impl ApiClient {
             Err(anyhow::Error::new(HttpStatusError {
                 status: status.as_u16(),
                 body: "Heartbeat failed".to_string(),
+                retry_after_secs: None,
             }))
         }
     }
@@ -217,21 +221,33 @@ impl ApiClient {
         &self,
         request: &SubmitObservationsRequest,
     ) -> anyhow::Result<SubmitOutcome> {
+        self.submit_body(request, request.observations.len()).await
+    }
+
+    /// POST an observations body holding `count` items (the shape of
+    /// `SubmitObservationsRequest`, possibly with extra per-item fields).
+    pub async fn submit_body<T: Serialize>(&self, body: &T, count: usize) -> anyhow::Result<SubmitOutcome> {
         let url = format!("{}/api/observations", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("Authorization", self.bearer())
-            .json(request)
+            .json(body)
             .send()
             .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow::Error::new(HttpStatusError {
                 status,
                 body: format!("Observation submit failed: {}", text),
+                retry_after_secs,
             }));
         }
 
@@ -242,7 +258,7 @@ impl ApiClient {
             Ok(data) => SubmitOutcome { accepted: data.accepted, rejected: data.rejected },
             Err(_) => {
                 let rejected = serde_json::from_str::<RejectedBody>(&text).map(|b| b.rejected).unwrap_or_default();
-                let accepted = (request.observations.len() as u32).saturating_sub(rejected.len() as u32);
+                let accepted = (count as u32).saturating_sub(rejected.len() as u32);
                 SubmitOutcome { accepted, rejected }
             }
         };

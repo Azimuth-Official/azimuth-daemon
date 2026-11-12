@@ -11,6 +11,7 @@ mod api_client;
 mod config;
 mod identity;
 mod observation;
+mod pending;
 mod regions;
 mod sdr;
 
