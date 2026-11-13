@@ -27,7 +27,7 @@ use tracing::{error, info, warn};
 
 use crate::api_client::{self, ApiClient};
 use crate::config::Config;
-use crate::observation::SubmitObservationsRequest;
+use crate::pending;
 use crate::sdr::scanner::Scanner;
 use crate::sdr::SdrManager;
 
@@ -342,6 +342,7 @@ fn pipeline_thread(fd: i32, android_config: AndroidConfig) {
 
     let scan_interval = Duration::from_secs(scanner.interval_seconds() as u64);
     let heartbeat_interval = Duration::from_secs(config.daemon.heartbeat_interval_secs.max(15));
+    let retry_buf = pending::PendingBuffer::default();
     let mut last_heartbeat = Instant::now()
         .checked_sub(heartbeat_interval)
         .unwrap_or_else(Instant::now);
@@ -383,15 +384,14 @@ fn pipeline_thread(fd: i32, android_config: AndroidConfig) {
             set_status(|s| s.signals_found += observations.len() as u64);
         }
 
-        if !observations.is_empty() {
-            if let Some(id) = node_id.clone() {
-                let count = observations.len();
-                let request = SubmitObservationsRequest {
-                    node_id: id,
-                    observations,
-                };
-                match rt.block_on(client.submit_observations(&request)) {
-                    Ok(accepted) => {
+        // Pending observations from failed uploads are resent even on a cycle
+        // that captured nothing.
+        if let Some(id) = node_id.clone() {
+            for sent in rt.block_on(pending::flush(&retry_buf, &client, &id, observations, Instant::now())) {
+                let count = sent.count;
+                match sent.result {
+                    Ok(outcome) => {
+                        let accepted = outcome.accepted;
                         info!(submitted = count, accepted, "batch submitted");
                         set_status(|s| {
                             s.observations_submitted += accepted as u64;
@@ -404,8 +404,8 @@ fn pipeline_thread(fd: i32, android_config: AndroidConfig) {
                             set_status(|s| {
                                 s.last_error = Some("API key rejected (401)".to_string())
                             });
-                        } else {
-                            warn!(error = %e, "observation submit failed — retrying next cycle");
+                        } else if sent.parked > 0 {
+                            warn!(error = %e, parked = sent.parked, "observation submit rejected — batch parked, not resent");
                         }
                     }
                 }

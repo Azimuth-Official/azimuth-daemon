@@ -6,6 +6,7 @@ mod identity;
 mod logging;
 mod node_runtime;
 mod observation;
+mod pending;
 mod regions;
 mod sdr;
 mod setup;

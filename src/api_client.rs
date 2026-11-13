@@ -13,15 +13,66 @@ use crate::observation::{
 pub struct HttpStatusError {
     pub status: u16,
     pub body: String,
+    /// `Retry-After` in seconds from now (delta-seconds or HTTP-date form) when the server sent one.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl std::fmt::Display for HttpStatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HTTP {}: {}", self.status, self.body)
+        write!(f, "HTTP {}: {}", self.status, truncated(&self.body, MAX_ERROR_DISPLAY_BYTES))
     }
 }
 
+/// Most bytes of a server response body kept in an error's text.
+const MAX_ERROR_DISPLAY_BYTES: usize = 512;
+/// Most bytes read from an error response body (the rest is never read).
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+/// Most bytes read from a success response body.
+const MAX_OK_BODY_BYTES: usize = 64 * 1024;
+
+fn truncated(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+/// Reads at most `max` bytes of the body (lossy UTF-8) and stops; a hostile
+/// server cannot make the daemon buffer an unbounded body.
+async fn read_limited(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < max {
+        match resp.chunk().await {
+            Ok(Some(c)) => buf.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    buf.truncate(max);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Control characters (newlines, escape sequences, NUL ...) become spaces, so a
+/// response body cannot forge log lines or drive a terminal.
+fn clean_for_log(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 impl std::error::Error for HttpStatusError {}
+
+/// `Retry-After` value in seconds from now: delta-seconds or an HTTP-date.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(secs);
+    }
+    // IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT"); a date in the past means "now".
+    let when = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some(when.with_timezone(&chrono::Utc).signed_duration_since(now).num_seconds().max(0) as u64)
+}
 
 /// True when the error chain carries an HTTP 401 from the API.
 pub fn is_unauthorized(e: &anyhow::Error) -> bool {
@@ -80,8 +131,17 @@ struct HeartbeatMetadata {
 
 impl ApiClient {
     pub fn new(base_url: &str, api_key: std::sync::Arc<std::sync::RwLock<String>>) -> Self {
+        // Every request carries the daemon's own version, nothing else.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!(
+            "daemon/{}",
+            env!("CARGO_PKG_VERSION")
+        )) {
+            default_headers.insert("x-azimuth-client", v);
+        }
         Self {
             client: Client::builder()
+                .default_headers(default_headers)
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -134,6 +194,7 @@ impl ApiClient {
             return Err(anyhow::Error::new(HttpStatusError {
                 status,
                 body: format!("Node registration failed: {}", text),
+                retry_after_secs: None,
             }));
         }
 
@@ -197,6 +258,7 @@ impl ApiClient {
             Err(anyhow::Error::new(HttpStatusError {
                 status: status.as_u16(),
                 body: "Heartbeat failed".to_string(),
+                retry_after_secs: None,
             }))
         }
     }
@@ -217,32 +279,44 @@ impl ApiClient {
         &self,
         request: &SubmitObservationsRequest,
     ) -> anyhow::Result<SubmitOutcome> {
+        self.submit_body(request, request.observations.len()).await
+    }
+
+    /// POST an observations body holding `count` items (the shape of
+    /// `SubmitObservationsRequest`, possibly with extra per-item fields).
+    pub async fn submit_body<T: Serialize>(&self, body: &T, count: usize) -> anyhow::Result<SubmitOutcome> {
         let url = format!("{}/api/observations", self.base_url);
         let resp = self
             .client
             .post(&url)
             .header("Authorization", self.bearer())
-            .json(request)
+            .json(body)
             .send()
             .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
-            let text = resp.text().await.unwrap_or_default();
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+            let text = clean_for_log(&read_limited(resp, MAX_ERROR_BODY_BYTES).await);
             return Err(anyhow::Error::new(HttpStatusError {
                 status,
                 body: format!("Observation submit failed: {}", text),
+                retry_after_secs,
             }));
         }
 
         // Any 2xx means the server took the batch. The body is optional: a 204,
         // an async-queue 202 or an unknown shape counts every item as accepted.
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_limited(resp, MAX_OK_BODY_BYTES).await;
         let outcome = match serde_json::from_str::<SubmitObservationsResponse>(&text) {
             Ok(data) => SubmitOutcome { accepted: data.accepted, rejected: data.rejected },
             Err(_) => {
                 let rejected = serde_json::from_str::<RejectedBody>(&text).map(|b| b.rejected).unwrap_or_default();
-                let accepted = (request.observations.len() as u32).saturating_sub(rejected.len() as u32);
+                let accepted = (count as u32).saturating_sub(rejected.len() as u32);
                 SubmitOutcome { accepted, rejected }
             }
         };
@@ -431,5 +505,61 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].index, 0);
         assert_eq!(rejected[0].reason, "invalid signal_type");
+    }
+
+    /// Local axum server that records the `X-Azimuth-Client` header of every request.
+    async fn spawn_header_recorder() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let seen = std::sync::Arc::clone(&seen_in);
+            async move {
+                let v = headers
+                    .get("x-azimuth-client")
+                    .map(|v| v.to_str().unwrap_or("<non-ascii>").to_string());
+                seen.lock().unwrap().push(v);
+                r#"{"node_id":"n","accepted":0}"#.to_string()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    /// `^(daemon|android)/[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$`
+    fn is_valid_client_header(v: &str) -> bool {
+        let Some(version) = v.strip_prefix("daemon/").or_else(|| v.strip_prefix("android/")) else {
+            return false;
+        };
+        let mut chars = version.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+        first_ok && version.len() <= 32 && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_request_carries_the_client_version_header() {
+        let (base, seen) = spawn_header_recorder().await;
+        let c = client_for(&base);
+        c.heartbeat("node-1", 1, vec![], false, false, None)
+            .await
+            .expect("heartbeat ok");
+        c.submit_observations(&SubmitObservationsRequest {
+            node_id: "node-1".to_string(),
+            observations: vec![],
+        })
+        .await
+        .expect("submit ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both requests must reach the server");
+        let want = format!("daemon/{}", env!("CARGO_PKG_VERSION"));
+        for v in seen.iter() {
+            let v = v.as_deref().expect("X-Azimuth-Client header must be present");
+            assert_eq!(v, want);
+            assert!(is_valid_client_header(v), "header value must match the contract: {v}");
+        }
     }
 }

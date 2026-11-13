@@ -231,6 +231,8 @@ SHA-256; the script never sets `XWIN_ACCEPT_LICENSE` for you.
 
 ## Current version
 
+**v0.4.1** — observation upload fix. Failed uploads (network errors, HTTP 5xx, 408, 425, 429) are now kept and sent again with a backoff that honours `Retry-After`; in 0.4.0 such a batch was dropped. The daemon has no self-update: reinstall to get the fix. The notes below are the 0.4.0 release, which 0.4.1 builds on.
+
 **v0.4.0** — setup, detection and reliability release.
 
 - **DVB-T and DVB-T2 detection.** New cyclic-prefix detector and signal types `dtv_dvbt` and `dtv_dvbt2`; DVB regions now tune channel centres on the correct 7/8 MHz raster up to each country's DTT edge. This follows community reports from France and the UK that DVB-T muxes were being missed.

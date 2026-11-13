@@ -160,6 +160,8 @@ pub struct StatusState {
     pub gps_probing: Option<String>,
     pub config_error: Option<String>,
     pub auth_error: Option<String>,
+    /// Observations whose upload failed retryably, resent on later cycles.
+    pub pending: std::sync::Arc<crate::pending::PendingBuffer>,
     pub config_state: ConfigState,
     pub config_problems: Vec<ConfigProblem>,
     pub config_path_abs: String,
@@ -277,6 +279,7 @@ impl StatusState {
             gps_probing: None,
             config_error: None,
             auth_error: None,
+            pending: Default::default(),
             config_state: ConfigState::AwaitingSetup,
             config_problems: Vec::new(),
             config_path_abs: String::new(),
