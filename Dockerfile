@@ -62,7 +62,7 @@ LABEL org.opencontainers.image.title="Azimuth Node" \
       org.opencontainers.image.vendor="Azimuth" \
       org.opencontainers.image.authors="Azimuth <contact@azimuth.day>" \
       org.opencontainers.image.source="https://github.com/Azimuth-Official/azimuth-daemon" \
-      org.opencontainers.image.version="0.4.0"
+      org.opencontainers.image.version="0.4.1"
 
 USER azimuth
 VOLUME ["/var/lib/azimuth"]
