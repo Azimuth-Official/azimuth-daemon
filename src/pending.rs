@@ -35,8 +35,11 @@ pub const MAX_REQUEST_OBSERVATIONS: usize = 100;
 /// Observations / bytes kept in the parked set; over this the OLDEST are evicted.
 pub const PARKED_MAX_ITEMS: usize = 1000;
 pub const PARKED_MAX_BYTES: usize = 2 * 1024 * 1024;
-/// First wait after a failure without `Retry-After` (the default submit interval).
-pub const BASE_BACKOFF: Duration = Duration::from_secs(30);
+/// First wait after a failure without `Retry-After`; it doubles per consecutive
+/// failure of the same chunk (5, 10, 20 ... up to [`MAX_BACKOFF`]) and starts over
+/// after a 2xx. A 30 s base (tried first) throttled delivery to about a third of a
+/// 20 observations/s production rate under 18 % transient faults.
+pub const BASE_BACKOFF: Duration = Duration::from_secs(5);
 /// Longest exponential backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Shortest wait after any retryable failure; also the floor for `Retry-After`.
@@ -639,7 +642,7 @@ mod tests {
         let buf = PendingBuffer::default();
         let t0 = Instant::now();
         buf.push(vec![obs(1)], t0);
-        for secs in [30, 60, 120, 240, 300, 300] {
+        for secs in [5, 10, 20, 40, 80, 160, 300, 300] {
             buf.failed(None, t0);
             assert!(buf.chunk(t0 + Duration::from_secs(secs - 1)).is_none(), "{secs}");
             assert!(buf.chunk(t0 + Duration::from_secs(secs)).is_some(), "{secs}");

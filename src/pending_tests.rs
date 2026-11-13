@@ -332,7 +332,7 @@ async fn item5_rotation_keeps_chunk_order_and_does_not_reset_the_backoff() {
     let back = buf.chunk(now + MAX_BACKOFF).expect("offered again after its backoff");
     assert_eq!(back.iter().filter_map(|(o, _)| o.frequency_hz).collect::<Vec<_>>(), (0..100).collect::<Vec<_>>(), "order inside the chunk unchanged");
     buf.failed_jit(None, now + MAX_BACKOFF, 1.0);
-    assert!(buf.chunk(now + MAX_BACKOFF + Duration::from_secs(60)).is_none(), "the failure count continued, it did not restart at the base wait");
+    assert!(buf.chunk(now + MAX_BACKOFF + Duration::from_secs(30)).is_none(), "the failure count continued (4th failure = 40 s), it did not restart at the 5 s base");
 }
 
 // ---- item 6: hostile server -----------------------------------------------------------------
@@ -364,13 +364,20 @@ async fn item6_first_retry_after_zero_is_floored() {
 
 #[test]
 fn item7_jitter_lowers_a_backoff_by_at_most_a_fifth() {
-    for (f, floor_s) in [(1.0, 30u64), (0.8, 24)] {
+    // fourth consecutive failure: the unjittered wait is 40 s
+    for (f, floor_s) in [(1.0, 40u64), (0.8, 32)] {
         let buf = PendingBuffer::default();
         let t0 = Instant::now();
         buf.push(many(0..1), t0);
-        buf.failed_jit(None, t0, f);
-        assert!(buf.chunk(secs(t0, floor_s - 1)).is_none(), "{f}");
-        assert!(buf.chunk(secs(t0, floor_s)).is_some(), "{f}");
+        for k in 0..3u64 {
+            buf.chunk(secs(t0, 1000 * k)).expect("offered");
+            buf.failed_jit(None, secs(t0, 1000 * k), 1.0);
+        }
+        let t = secs(t0, 5000);
+        buf.chunk(t).expect("offered");
+        buf.failed_jit(None, t, f);
+        assert!(buf.chunk(t + Duration::from_secs(floor_s - 1)).is_none(), "{f}");
+        assert!(buf.chunk(t + Duration::from_secs(floor_s)).is_some(), "{f}");
     }
 }
 
@@ -583,4 +590,60 @@ async fn r2_park_line_says_held_in_memory_and_not_resent() {
     let l = lines_with(&cap, "Observations parked");
     assert_eq!(l.len(), 1);
     assert!(l[0].contains("held in memory") && l[0].contains("NOT resent") && l[0].contains("restart"), "{}", l[0]);
+}
+
+// ---- round 2 addendum: backoff ladder 5, 10, 20 ... 300 s --------------------------------------
+
+#[test]
+fn r2_backoff_ladder_starts_at_the_floor_and_doubles_to_the_cap() {
+    let buf = PendingBuffer::default();
+    let t0 = Instant::now();
+    buf.push(many(0..1), t0);
+    let mut t = 0u64;
+    for wait in [5u64, 10, 20, 40, 80, 160, 300, 300, 300] {
+        assert!(buf.chunk(secs(t0, t)).is_some(), "offered at t={t}");
+        buf.failed_jit(None, secs(t0, t), 1.0);
+        assert!(buf.chunk(secs(t0, t + wait - 1)).is_none(), "wait {wait}");
+        assert!(buf.chunk(secs(t0, t + wait)).is_some(), "wait {wait}");
+        t += wait;
+    }
+}
+
+#[test]
+fn r2_jitter_never_goes_under_the_floor() {
+    let buf = PendingBuffer::default();
+    let t0 = Instant::now();
+    buf.push(many(0..1), t0);
+    buf.failed_jit(None, t0, 0.8);
+    assert!(buf.chunk(secs(t0, 4)).is_none());
+    assert!(buf.chunk(secs(t0, 5)).is_some());
+}
+
+#[test]
+fn r2_the_ladder_restarts_after_a_delivery() {
+    let buf = PendingBuffer::default();
+    let t0 = Instant::now();
+    buf.push(many(0..1), t0);
+    for k in 0..4 {
+        buf.chunk(secs(t0, 1000 * k)).expect("offered");
+        buf.failed_jit(None, secs(t0, 1000 * k), 1.0);
+    }
+    let c = buf.chunk(secs(t0, 5000)).unwrap(); // the fifth attempt succeeds
+    buf.done(&c.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>());
+    buf.push(many(1..2), secs(t0, 5000));
+    buf.chunk(secs(t0, 5000)).unwrap();
+    buf.failed_jit(None, secs(t0, 5000), 1.0);
+    assert!(buf.chunk(secs(t0, 5004)).is_none());
+    assert!(buf.chunk(secs(t0, 5005)).is_some(), "first failure after a 2xx waits the floor again, not 80 s");
+}
+
+#[tokio::test]
+async fn r2_transient_faults_cost_seconds_not_half_a_minute() {
+    // 503 for the first two requests, then 200: the batch is delivered within 20 s of the first send.
+    let (base, seen) = fake(|i, v| if i < 2 { status(503) } else { ok_for(v) }).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    flush(&buf, &client, "n1", many(0..3), t0).await;
+    flush(&buf, &client, "n1", vec![], secs(t0, 6)).await;
+    flush(&buf, &client, "n1", vec![], secs(t0, 17)).await;
+    assert_eq!(buf.len(), 0, "{} requests", seen.lock().unwrap().len());
 }

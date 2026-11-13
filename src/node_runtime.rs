@@ -782,12 +782,12 @@ mod tests {
         let (base_url, seen) = fake_api_ra(|i| if i < 2 { (429, None, "slow down".into()) } else { (200, None, OK_BODY.into()) }).await;
         let (state, client, t0) = (live_state().await, client_to(&base_url), std::time::Instant::now());
         submit_batch_at(&state, &client, vec![obs_at("fm_rds", 1)], t0).await;
-        submit_batch_at(&state, &client, vec![], at(t0, 20)).await;
-        assert_eq!(seen.lock().unwrap().len(), 1, "first wait is the 30 s base interval");
-        submit_batch_at(&state, &client, vec![], at(t0, 31)).await; // second failure -> 60 s
-        submit_batch_at(&state, &client, vec![], at(t0, 31 + 40)).await;
+        submit_batch_at(&state, &client, vec![], at(t0, 3)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "first wait is the 5 s base");
+        submit_batch_at(&state, &client, vec![], at(t0, 6)).await; // second failure -> 10 s
+        submit_batch_at(&state, &client, vec![], at(t0, 6 + 7)).await;
         assert_eq!(seen.lock().unwrap().len(), 2, "second wait doubled");
-        submit_batch_at(&state, &client, vec![], at(t0, 31 + 62)).await;
+        submit_batch_at(&state, &client, vec![], at(t0, 6 + 11)).await;
         let b = seen.lock().unwrap();
         assert_eq!(b.len(), 3);
         assert_eq!(frequencies(&b[2]), vec![1]);
