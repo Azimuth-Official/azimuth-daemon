@@ -175,6 +175,30 @@ async fn item2_single_item_413_is_parked_and_the_rest_flows() {
     assert_eq!(sent_ok, 9);
 }
 
+#[tokio::test]
+async fn item2_a_poison_item_does_not_leave_the_request_size_lowered() {
+    let (base, seen) = fake(|_, v| if freqs(v).contains(&7) { status(413) } else { ok_for(v) }).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    flush(&buf, &client, "n1", many(0..10), t0).await; // the split ends with item 7 parked
+    assert_eq!(buf.stats().parked, 1);
+    seen.lock().unwrap().clear();
+    flush(&buf, &client, "n1", many(100..300), secs(t0, 1)).await;
+    let sizes: Vec<usize> = seen.lock().unwrap().iter().map(|v| freqs(v).len()).collect();
+    assert_eq!(sizes[0], 100, "the 413 was one item's fault, not the server cap: full-size requests again ({sizes:?})");
+}
+
+#[tokio::test]
+async fn item2_a_lowered_request_size_recovers_after_a_run_of_successes() {
+    let (base, seen) = fake(|_, v| if v["observations"].as_array().unwrap().len() > 10 { status(413) } else { ok_for(v) }).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    for c in 0..12u64 {
+        flush(&buf, &client, "n1", many(c * 100..c * 100 + 100), secs(t0, c)).await;
+    }
+    let sizes: Vec<usize> = seen.lock().unwrap().iter().map(|v| v["observations"].as_array().unwrap().len()).collect();
+    assert!(sizes.iter().filter(|s| **s > 10).count() >= 2, "it probes the larger size again after a run of successes: {sizes:?}");
+    assert_eq!(buf.stats().parked, 0);
+}
+
 // ---- item 3: byte bound, counted eviction, exactly one warn per event ----------------------
 
 #[tokio::test]

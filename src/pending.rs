@@ -53,7 +53,7 @@ pub const POISON_AFTER: u32 = 3;
 pub const DRAIN_MAX_REQUESTS: usize = 8;
 pub const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// Successful requests at a lowered size before the size doubles again.
-const RECOVER_AFTER: u32 = 20;
+const RECOVER_AFTER: u32 = 5;
 /// Lowest factor jitter applies to a backoff.
 const JITTER_MIN: f64 = 0.8;
 
@@ -99,6 +99,8 @@ struct Inner {
     /// Current request size; lowered by a 413, restored after a run of successes.
     max_req: usize,
     ok_streak: u32,
+    /// Request size before the current run of 413 splits began.
+    pre_split: Option<usize>,
     next_seq: u64,
     next_group: u64,
     /// First key and length of the chunk last handed out.
@@ -121,6 +123,7 @@ impl Default for Inner {
             not_before: None,
             max_req: MAX_REQUEST_OBSERVATIONS,
             ok_streak: 0,
+            pre_split: None,
             next_seq: 0,
             next_group: 1,
             cur: None,
@@ -316,6 +319,9 @@ impl PendingBuffer {
                 if g.ok_streak >= RECOVER_AFTER {
                     g.max_req = (g.max_req * 2).min(MAX_REQUEST_OBSERVATIONS);
                     g.ok_streak = 0;
+                    if g.max_req >= MAX_REQUEST_OBSERVATIONS {
+                        g.pre_split = None;
+                    }
                 }
             }
         }
@@ -358,9 +364,22 @@ impl PendingBuffer {
     /// A 413 for `len` items: halve the request size (down to 1).
     fn shrink(&self, len: usize) {
         let mut g = self.lock();
+        if g.pre_split.is_none() {
+            g.pre_split = Some(g.max_req);
+        }
         g.max_req = (len / 2).max(1);
         g.ok_streak = 0;
         g.cur = None;
+    }
+
+    /// A single item answered 413 on its own: the size was never the problem,
+    /// so go back to the size in use before the splits began.
+    fn unshrink(&self) {
+        let mut g = self.lock();
+        if let Some(n) = g.pre_split.take() {
+            g.max_req = n;
+        }
+        g.ok_streak = 0;
     }
 
     /// Keep the chunk after a retryable failure (no jitter; see [`failed_jit`]).
@@ -508,6 +527,9 @@ pub async fn flush(
                         kept = true;
                     } else {
                         parked = buf.park(&keys, status);
+                        if status == 413 {
+                            buf.unshrink();
+                        }
                         stop = crate::api_client::is_unauthorized(e);
                         requests += 1;
                     }
