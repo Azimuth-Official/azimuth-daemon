@@ -19,8 +19,46 @@ pub struct HttpStatusError {
 
 impl std::fmt::Display for HttpStatusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HTTP {}: {}", self.status, self.body)
+        write!(f, "HTTP {}: {}", self.status, truncated(&self.body, MAX_ERROR_DISPLAY_BYTES))
     }
+}
+
+/// Most bytes of a server response body kept in an error's text.
+const MAX_ERROR_DISPLAY_BYTES: usize = 512;
+/// Most bytes read from an error response body (the rest is never read).
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+/// Most bytes read from a success response body.
+const MAX_OK_BODY_BYTES: usize = 64 * 1024;
+
+fn truncated(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+/// Reads at most `max` bytes of the body (lossy UTF-8) and stops; a hostile
+/// server cannot make the daemon buffer an unbounded body.
+async fn read_limited(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < max {
+        match resp.chunk().await {
+            Ok(Some(c)) => buf.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    buf.truncate(max);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Control characters (newlines, escape sequences, NUL ...) become spaces, so a
+/// response body cannot forge log lines or drive a terminal.
+fn clean_for_log(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 impl std::error::Error for HttpStatusError {}
@@ -254,7 +292,7 @@ impl ApiClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
-            let text = resp.text().await.unwrap_or_default();
+            let text = clean_for_log(&read_limited(resp, MAX_ERROR_BODY_BYTES).await);
             return Err(anyhow::Error::new(HttpStatusError {
                 status,
                 body: format!("Observation submit failed: {}", text),
@@ -264,7 +302,7 @@ impl ApiClient {
 
         // Any 2xx means the server took the batch. The body is optional: a 204,
         // an async-queue 202 or an unknown shape counts every item as accepted.
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_limited(resp, MAX_OK_BODY_BYTES).await;
         let outcome = match serde_json::from_str::<SubmitObservationsResponse>(&text) {
             Ok(data) => SubmitOutcome { accepted: data.accepted, rejected: data.rejected },
             Err(_) => {
