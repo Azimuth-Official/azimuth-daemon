@@ -339,33 +339,36 @@ pub(crate) async fn submit_batch_at(
 
     // New observations join the pending ones (oldest first); a failed upload
     // that is worth retrying stays in the buffer for a later cycle.
-    let Some(sent) = pending::flush(&buffer, client, &node_id, observations, now).await else {
+    let sent_all = pending::flush(&buffer, client, &node_id, observations, now).await;
+    if sent_all.is_empty() {
         debug!("Observation submit waiting — retry delay in force");
         return;
-    };
-    let (count, types) = (sent.count, sent.types);
-    match sent.result {
-        Ok(outcome) => {
-            log_rejected(&outcome.rejected, &types);
-            let mut s = state.write().await;
-            s.observations_submitted += outcome.accepted as u64;
-            if outcome.accepted > 0 {
-                s.last_accepted_at = Some(chrono::Utc::now());
-            }
-            info!(submitted = count, accepted = outcome.accepted,
-                rejected = outcome.rejected.len(), total = s.observations_submitted, "Batch submitted");
-            s.auth_error = None;
-        }
-        Err(e) => {
-            if api_client::is_unauthorized(&e) {
+    }
+    for sent in sent_all {
+        let (count, types) = (sent.count, sent.types);
+        match sent.result {
+            Ok(outcome) => {
+                log_rejected(&outcome.rejected, &types);
                 let mut s = state.write().await;
-                if s.auth_error.is_none() {
-                    error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
-                    s.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                s.observations_submitted += outcome.accepted as u64;
+                if outcome.accepted > 0 {
+                    s.last_accepted_at = Some(chrono::Utc::now());
                 }
-            } else if !sent.kept {
-                log_rejected(&api_client::rejected_from_error(&e), &types);
-                warn!(error = %e, "Observation submit failed; this batch is dropped");
+                info!(submitted = count, accepted = outcome.accepted,
+                    rejected = outcome.rejected.len(), total = s.observations_submitted, "Batch submitted");
+                s.auth_error = None;
+            }
+            Err(e) => {
+                if api_client::is_unauthorized(&e) {
+                    let mut s = state.write().await;
+                    if s.auth_error.is_none() {
+                        error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
+                        s.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
+                    }
+                } else if !sent.kept {
+                    log_rejected(&api_client::rejected_from_error(&e), &types);
+                    warn!(error = %e, "Observation submit failed; this batch is dropped");
+                }
             }
         }
     }

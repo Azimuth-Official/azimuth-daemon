@@ -138,6 +138,8 @@ pub struct Flushed {
     pub result: anyhow::Result<SubmitOutcome>,
     /// The batch stays buffered for a later cycle (retryable failure).
     pub kept: bool,
+    /// Observations moved to the parked set by this request.
+    pub parked: usize,
 }
 
 /// Queue `new` observations and send the oldest pending chunk (at most
@@ -150,12 +152,12 @@ pub async fn flush(
     node_id: &str,
     new: Vec<Observation>,
     now: Instant,
-) -> Option<Flushed> {
+) -> Vec<Flushed> {
     let dropped = buf.push(new, now);
     if dropped > 0 {
         warn!(dropped, cap = MAX_PENDING_OBSERVATIONS, "Pending observations over the size or age cap; oldest dropped");
     }
-    let chunk = buf.chunk(now)?;
+    let Some(chunk) = buf.chunk(now) else { return Vec::new() };
     let count = chunk.len();
     let types = chunk.iter().map(|(o, _)| o.signal_type.clone()).collect();
     let body = KeyedRequest {
@@ -176,7 +178,7 @@ pub async fn flush(
             false
         }
     };
-    Some(Flushed { count, types, result, kept })
+    vec![Flushed { count, types, result, kept, parked: 0 }]
 }
 
 #[cfg(test)]

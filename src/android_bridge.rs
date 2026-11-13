@@ -387,7 +387,7 @@ fn pipeline_thread(fd: i32, android_config: AndroidConfig) {
         // Pending observations from failed uploads are resent even on a cycle
         // that captured nothing.
         if let Some(id) = node_id.clone() {
-            if let Some(sent) = rt.block_on(pending::flush(&retry_buf, &client, &id, observations, Instant::now())) {
+            for sent in rt.block_on(pending::flush(&retry_buf, &client, &id, observations, Instant::now())) {
                 let count = sent.count;
                 match sent.result {
                     Ok(outcome) => {
