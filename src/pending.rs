@@ -29,6 +29,33 @@ pub const BASE_BACKOFF: Duration = Duration::from_secs(30);
 /// Longest wait after a failure, also the cap on a server `Retry-After`.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+/// Shortest wait after any retryable failure (also the floor for `Retry-After`).
+pub const MIN_BACKOFF: Duration = Duration::from_secs(5);
+/// Longest `Retry-After` honoured.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+/// Requests one `flush` may make.
+pub const DRAIN_MAX_REQUESTS: usize = 8;
+/// Bytes kept for resend.
+pub const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+/// Observations kept in the parked set.
+pub const PARKED_MAX_ITEMS: usize = 1000;
+/// Consecutive failures of one chunk before it is moved behind the others.
+pub const POISON_AFTER: u32 = 3;
+
+/// Counters of what the buffer holds and has done (visible, never silent).
+#[derive(Debug, Default, Clone)]
+pub struct PendingStats {
+    pub pending: usize,
+    pub pending_bytes: usize,
+    pub parked: usize,
+    pub submitted: usize,
+    pub delivered: usize,
+    pub parked_total: usize,
+    pub evicted_total: usize,
+    pub parked_evicted_total: usize,
+    pub rotated_total: usize,
+}
+
 #[derive(Debug)]
 struct Entry {
     obs: Observation,
@@ -53,6 +80,14 @@ impl PendingBuffer {
 
     pub fn len(&self) -> usize {
         self.lock().items.len()
+    }
+
+    pub fn stats(&self) -> PendingStats {
+        PendingStats { pending: self.len(), ..Default::default() }
+    }
+
+    fn failed_jit(&self, server_wait: Option<Duration>, now: Instant, _factor: f64) {
+        self.failed(server_wait, now)
     }
 
     /// Queue new observations (newest last), then enforce the age and size
@@ -100,6 +135,10 @@ impl PendingBuffer {
         let backoff = BASE_BACKOFF.saturating_mul(1 << (g.failures - 1).min(8)).min(MAX_BACKOFF);
         g.not_before = Some(now + server_wait.map_or(backoff, |d| d.min(MAX_BACKOFF)));
     }
+}
+
+fn jitter_factor() -> f64 {
+    1.0
 }
 
 /// `Some(wait)` when the failure is worth retrying: network/timeout errors,
@@ -246,3 +285,7 @@ mod tests {
         assert!(retry_wait(&anyhow::anyhow!("connection refused")).is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "pending_tests.rs"]
+mod n8_tests;

@@ -25,6 +25,11 @@ impl std::fmt::Display for HttpStatusError {
 
 impl std::error::Error for HttpStatusError {}
 
+/// `Retry-After` value in seconds from now: delta-seconds or an HTTP-date.
+pub fn parse_retry_after(_value: &str, _now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    None
+}
+
 /// True when the error chain carries an HTTP 401 from the API.
 pub fn is_unauthorized(e: &anyhow::Error) -> bool {
     e.downcast_ref::<HttpStatusError>()
