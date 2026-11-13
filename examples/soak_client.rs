@@ -63,12 +63,18 @@ async fn main() {
     let buf = pending::PendingBuffer::default();
     let start = Instant::now();
     let mut next_id = 0u64;
+    let (mut max_pending, mut first_eviction): (usize, Option<u64>) = (0, None);
     loop {
         let e = start.elapsed().as_secs();
         let generating = e < duration;
         let new: Vec<_> = if generating { (next_id..next_id + per_cycle).map(obs).collect() } else { vec![] };
         next_id += new.len() as u64;
         pending::flush(&buf, &client, &node, new, Instant::now()).await;
+        let st = buf.stats();
+        max_pending = max_pending.max(st.pending);
+        if first_eviction.is_none() && st.evicted_total > 0 {
+            first_eviction = Some(e);
+        }
         if !generating && (buf.len() == 0 || e > duration + drain) {
             break;
         }
@@ -87,6 +93,14 @@ async fn main() {
     println!(
         "SOAK-DETAIL pending={} delivered={} parked_total={} evicted={} parked_evicted={} rotated={} server_requests={} by_status={}",
         s.pending, s.delivered, s.parked_total, s.evicted_total, s.parked_evicted_total, s.rotated_total, server["requests"], server["by_status"]
+    );
+    let total = start.elapsed().as_secs_f64().max(1.0);
+    println!(
+        "SOAK-RATE produced_per_s={:.1} delivered_per_s={:.1} max_pending={} first_eviction_t={}",
+        next_id as f64 / (duration.max(1) as f64),
+        s.delivered as f64 / total,
+        max_pending,
+        first_eviction.map_or("none".to_string(), |t| format!("{t}s"))
     );
     // Exit 0 only when nothing is unaccounted for, nothing is pending, and the server stored nothing twice.
     if s.pending > 0 {
