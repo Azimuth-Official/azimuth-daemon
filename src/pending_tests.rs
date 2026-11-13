@@ -182,7 +182,7 @@ async fn item2_a_poison_item_does_not_leave_the_request_size_lowered() {
     flush(&buf, &client, "n1", many(0..10), t0).await; // the split ends with item 7 parked
     assert_eq!(buf.stats().parked, 1);
     seen.lock().unwrap().clear();
-    flush(&buf, &client, "n1", many(100..300), secs(t0, 1)).await;
+    flush(&buf, &client, "n1", many(100..300), secs(t0, 10)).await;
     let sizes: Vec<usize> = seen.lock().unwrap().iter().map(|v| freqs(v).len()).collect();
     assert_eq!(sizes[0], 100, "the 413 was one item's fault, not the server cap: full-size requests again ({sizes:?})");
 }
@@ -319,7 +319,7 @@ async fn item5_rotation_keeps_chunk_order_and_does_not_reset_the_backoff() {
         buf.failed_jit(None, secs(t0, 1000 * k as u64), 1.0);
     }
     let now = secs(t0, 1000 * (POISON_AFTER as u64 - 1)); // the moment of the rotation
-    let second = buf.chunk(now).expect("the healthy chunk is next");
+    let second = buf.chunk(now + MIN_BACKOFF).expect("the healthy chunk is next, after the minimum wait");
     assert_eq!(second[0].0.frequency_hz, Some(100), "the poisoned chunk went behind the others");
     // drain the healthy chunks
     let keys: Vec<String> = second.iter().map(|(_, k)| k.clone()).collect();

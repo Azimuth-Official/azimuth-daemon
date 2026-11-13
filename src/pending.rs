@@ -101,6 +101,8 @@ struct Inner {
     ok_streak: u32,
     /// Request size before the current run of 413 splits began.
     pre_split: Option<usize>,
+    /// A `flush` is in progress (the buffer has one sender).
+    flushing: bool,
     next_seq: u64,
     next_group: u64,
     /// First key and length of the chunk last handed out.
@@ -124,6 +126,7 @@ impl Default for Inner {
             max_req: MAX_REQUEST_OBSERVATIONS,
             ok_streak: 0,
             pre_split: None,
+            flushing: false,
             next_seq: 0,
             next_group: 1,
             cur: None,
@@ -346,7 +349,7 @@ impl PendingBuffer {
         g.parked_total += n;
         g.cur = None;
         warn!(status, class = %format!("{}xx", status / 100), items = n, parked = g.parked.len(), parked_total = g.parked_total,
-            "Observations parked (kept in memory, not resent)");
+            "Observations parked: held in memory, NOT resent automatically, lost at restart");
         let mut evicted = 0;
         while g.parked.len() > PARKED_MAX_ITEMS || g.parked_bytes > PARKED_MAX_BYTES {
             let Some(e) = g.parked.pop_front() else { break };
@@ -359,6 +362,12 @@ impl PendingBuffer {
                 "Parked observations over bound; oldest dropped");
         }
         n
+    }
+
+    /// No request before `until` (never shortens a wait already in force).
+    fn hold(&self, until: Instant) {
+        let mut g = self.lock();
+        g.not_before = Some(g.not_before.map_or(until, |t| t.max(until)));
     }
 
     /// A 413 for `len` items: halve the request size (down to 1).
@@ -419,6 +428,10 @@ impl PendingBuffer {
             g.pending_bytes += block.iter().map(|e| e.bytes).sum::<usize>();
             g.items.extend(block);
             g.rotated_total += 1;
+            // The failure that triggered the rotation still sets a wait for the whole
+            // queue: the server's Retry-After, else the minimum backoff.
+            let global = if server_wait.is_some() { wait } else { MIN_BACKOFF };
+            g.not_before = Some(now + global);
             warn!(failures = n, items = len, wait_s = wait.as_secs(),
                 "Chunk failed repeatedly; moved behind the others (kept), the rest keeps draining");
         } else {
@@ -465,6 +478,27 @@ struct KeyedRequest<'a> {
     observations: Vec<KeyedObservation<'a>>,
 }
 
+/// Held for the duration of a `flush`; dropping it (also when the future is
+/// cancelled) lets the next call send.
+struct FlushGuard<'a>(&'a PendingBuffer);
+
+impl<'a> FlushGuard<'a> {
+    fn enter(buf: &'a PendingBuffer) -> Option<Self> {
+        let mut g = buf.lock();
+        if g.flushing {
+            return None;
+        }
+        g.flushing = true;
+        Some(FlushGuard(buf))
+    }
+}
+
+impl Drop for FlushGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().flushing = false;
+    }
+}
+
 /// What one request of a flush sent and how it ended.
 pub struct Flushed {
     pub count: usize,
@@ -482,7 +516,12 @@ pub struct Flushed {
 /// of time per call. Empty result = no request was made. Effects per answer:
 /// 2xx removes the chunk; a retryable failure keeps it, sets the wait and ends
 /// the call; 413 halves the request size and resends at once (a single item is
-/// parked); any other 4xx parks the chunk (a 401 also ends the call).
+/// parked); any other 4xx parks the chunk (a 401 also ends the call). Every
+/// request, a 413 split included, counts toward the budget, and a call that
+/// ends on a 413 holds the buffer for [`MIN_BACKOFF`].
+///
+/// One sender per buffer: a call made while another is in progress only queues
+/// `new` and returns empty (the running call sends it).
 pub async fn flush(
     buf: &PendingBuffer,
     client: &ApiClient,
@@ -491,11 +530,17 @@ pub async fn flush(
     now: Instant,
 ) -> Vec<Flushed> {
     buf.push(new, now);
+    let Some(_guard) = FlushGuard::enter(buf) else {
+        warn!("flush re-entered; the new observations are queued, this call sends nothing");
+        return Vec::new();
+    };
     let started = Instant::now();
     let mut out = Vec::new();
     let (mut requests, mut steps) = (0usize, 0usize);
+    let mut last_413 = false;
     while requests < DRAIN_MAX_REQUESTS && steps < 64 && started.elapsed() < DRAIN_BUDGET {
         steps += 1;
+        last_413 = false;
         let Some(chunk) = buf.chunk(now + started.elapsed()) else { break };
         let count = chunk.len();
         let keys: Vec<&str> = chunk.iter().map(|(_, k)| k.as_str()).collect();
@@ -525,10 +570,13 @@ pub async fn flush(
                         buf.shrink(count);
                         warn!(count, new_size = (count / 2).max(1), "Server answered 413; resending in smaller pieces");
                         kept = true;
+                        last_413 = true;
+                        requests += 1;
                     } else {
                         parked = buf.park(&keys, status);
                         if status == 413 {
                             buf.unshrink();
+                            last_413 = true;
                         }
                         stop = crate::api_client::is_unauthorized(e);
                         requests += 1;
@@ -540,6 +588,9 @@ pub async fn flush(
         if stop {
             break;
         }
+    }
+    if last_413 {
+        buf.hold(now + started.elapsed() + MIN_BACKOFF);
     }
     out
 }
