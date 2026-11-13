@@ -511,3 +511,76 @@ async fn harness_responses_lost_after_commit_are_covered_by_the_server_rule() {
     assert_eq!((stored, lost), (5, 0), "never lost");
     assert_eq!(dup, 10, "without the server rule a committed-then-failed batch is stored again; the stable key is what lets the server collapse it");
 }
+
+// ---- round 2: hostile-server hardening -----------------------------------------------------
+
+fn status_body(code: u16, body: String) -> Reply {
+    Reply { code, headers: vec![], body }
+}
+
+#[tokio::test]
+async fn r2_413_to_everything_is_bounded_per_flush_and_then_waits() {
+    let (base, seen) = fake(|_, _| status(413)).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    flush(&buf, &client, "n1", many(0..300), t0).await;
+    let n = seen.lock().unwrap().len();
+    assert!(n <= DRAIN_MAX_REQUESTS, "{n} requests in one flush against a server that answers 413 to everything");
+    flush(&buf, &client, "n1", vec![], secs(t0, 1)).await;
+    assert_eq!(seen.lock().unwrap().len(), n, "no request within 1 s of the last 413");
+    flush(&buf, &client, "n1", vec![], secs(t0, 7)).await;
+    assert!(seen.lock().unwrap().len() > n, "it keeps trying after the {MIN_BACKOFF:?} wait");
+    let s = buf.stats();
+    assert_eq!(accounted(&s), 300, "{s:?}");
+}
+
+#[tokio::test]
+async fn r2_a_rotation_honours_the_retry_after_that_triggered_it() {
+    let (base, seen) = fake(|_, v| if freqs(v).first() == Some(&0) { status_ra(503, "120") } else { ok_for(v) }).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    flush(&buf, &client, "n1", many(0..300), t0).await;
+    flush(&buf, &client, "n1", vec![], secs(t0, 121)).await;
+    let before = seen.lock().unwrap().len();
+    flush(&buf, &client, "n1", vec![], secs(t0, 242)).await; // third failure: the chunk is rotated
+    assert_eq!(seen.lock().unwrap().len(), before + 1, "no extra request right after a 503 with Retry-After: 120");
+    flush(&buf, &client, "n1", vec![], secs(t0, 242 + 60)).await;
+    assert_eq!(seen.lock().unwrap().len(), before + 1, "still inside the 120 s the server asked for");
+    flush(&buf, &client, "n1", vec![], secs(t0, 242 + 121)).await;
+    assert!(seen.lock().unwrap().len() > before + 1, "after it, the other chunks go");
+}
+
+#[tokio::test]
+async fn r2_a_huge_hostile_body_is_bounded_and_clean_in_the_error() {
+    let body = format!("line1\nline2\x1b[31m\r\x07{}", "x".repeat(10 * 1024 * 1024));
+    let (base, _seen) = fake(move |_, _| status_body(500, body.clone())).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    let sent = flush(&buf, &client, "n1", many(0..1), t0).await;
+    let e = sent[0].result.as_ref().err().expect("error").to_string();
+    assert!(e.len() <= 600, "Display is bounded: {} bytes", e.len());
+    assert!(!e.chars().any(|c| c.is_control()), "no control characters: {e:?}");
+    assert!(e.contains("line1"), "{e:?}");
+    let h = sent[0].result.as_ref().err().unwrap().downcast_ref::<HttpStatusError>().unwrap();
+    assert!(h.body.len() <= 4200 && !h.body.chars().any(|c| c.is_control()), "stored body bounded and clean: {}", h.body.len());
+}
+
+#[tokio::test]
+async fn r2_flush_is_single_caller_a_second_concurrent_call_only_queues() {
+    let (base, seen) = fake(|_, v| ok_for(v)).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    let (a, b) = tokio::join!(flush(&buf, &client, "n1", many(0..100), t0), flush(&buf, &client, "n1", many(100..101), t0));
+    assert!(b.is_empty(), "the re-entrant call made no request");
+    assert!(!a.is_empty());
+    let all: Vec<u64> = seen.lock().unwrap().iter().flat_map(freqs).collect();
+    assert_eq!(all, (0..101).collect::<Vec<_>>(), "every observation sent exactly once, in order");
+    assert_eq!(buf.len(), 0);
+}
+
+#[tokio::test]
+async fn r2_park_line_says_held_in_memory_and_not_resent() {
+    let (cap, _g) = capture_logs();
+    let (base, _seen) = fake(|_, _| status(400)).await;
+    let (buf, client, t0) = (PendingBuffer::default(), client_to(&base), Instant::now());
+    flush(&buf, &client, "n1", many(0..2), t0).await;
+    let l = lines_with(&cap, "Observations parked");
+    assert_eq!(l.len(), 1);
+    assert!(l[0].contains("held in memory") && l[0].contains("NOT resent") && l[0].contains("restart"), "{}", l[0]);
+}
