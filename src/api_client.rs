@@ -13,7 +13,7 @@ use crate::observation::{
 pub struct HttpStatusError {
     pub status: u16,
     pub body: String,
-    /// `Retry-After` (delta-seconds form) when the server sent one.
+    /// `Retry-After` in seconds from now (delta-seconds or HTTP-date form) when the server sent one.
     pub retry_after_secs: Option<u64>,
 }
 
@@ -26,8 +26,14 @@ impl std::fmt::Display for HttpStatusError {
 impl std::error::Error for HttpStatusError {}
 
 /// `Retry-After` value in seconds from now: delta-seconds or an HTTP-date.
-pub fn parse_retry_after(_value: &str, _now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
-    None
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(secs);
+    }
+    // IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT"); a date in the past means "now".
+    let when = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some(when.with_timezone(&chrono::Utc).signed_duration_since(now).num_seconds().max(0) as u64)
 }
 
 /// True when the error chain carries an HTTP 401 from the API.
@@ -247,7 +253,7 @@ impl ApiClient {
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok());
+                .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow::Error::new(HttpStatusError {
                 status,

@@ -404,8 +404,8 @@ fn pipeline_thread(fd: i32, android_config: AndroidConfig) {
                             set_status(|s| {
                                 s.last_error = Some("API key rejected (401)".to_string())
                             });
-                        } else if !sent.kept {
-                            warn!(error = %e, "observation submit failed — batch dropped");
+                        } else if sent.parked > 0 {
+                            warn!(error = %e, parked = sent.parked, "observation submit rejected — batch parked, not resent");
                         }
                     }
                 }

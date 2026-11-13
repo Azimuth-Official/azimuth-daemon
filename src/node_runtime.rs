@@ -365,9 +365,10 @@ pub(crate) async fn submit_batch_at(
                         error!("Observation submit 401 — API key rejected; pausing submissions until the key changes");
                         s.auth_error = Some(status_server::AUTH_ERROR_MSG.to_string());
                     }
-                } else if !sent.kept {
+                } else if sent.parked > 0 {
+                    // Not resent, not deleted: the buffer parked it and logged that.
                     log_rejected(&api_client::rejected_from_error(&e), &types);
-                    warn!(error = %e, "Observation submit failed; this batch is dropped");
+                    warn!(error = %e, parked = sent.parked, "Observation submit rejected; batch parked, not resent");
                 }
             }
         }
