@@ -131,8 +131,17 @@ struct HeartbeatMetadata {
 
 impl ApiClient {
     pub fn new(base_url: &str, api_key: std::sync::Arc<std::sync::RwLock<String>>) -> Self {
+        // Every request carries the daemon's own version, nothing else.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!(
+            "daemon/{}",
+            env!("CARGO_PKG_VERSION")
+        )) {
+            default_headers.insert("x-azimuth-client", v);
+        }
         Self {
             client: Client::builder()
+                .default_headers(default_headers)
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -496,5 +505,61 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].index, 0);
         assert_eq!(rejected[0].reason, "invalid signal_type");
+    }
+
+    /// Local axum server that records the `X-Azimuth-Client` header of every request.
+    async fn spawn_header_recorder() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in = std::sync::Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let seen = std::sync::Arc::clone(&seen_in);
+            async move {
+                let v = headers
+                    .get("x-azimuth-client")
+                    .map(|v| v.to_str().unwrap_or("<non-ascii>").to_string());
+                seen.lock().unwrap().push(v);
+                r#"{"node_id":"n","accepted":0}"#.to_string()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{}", addr), seen)
+    }
+
+    /// `^(daemon|android)/[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$`
+    fn is_valid_client_header(v: &str) -> bool {
+        let Some(version) = v.strip_prefix("daemon/").or_else(|| v.strip_prefix("android/")) else {
+            return false;
+        };
+        let mut chars = version.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+        first_ok && version.len() <= 32 && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_request_carries_the_client_version_header() {
+        let (base, seen) = spawn_header_recorder().await;
+        let c = client_for(&base);
+        c.heartbeat("node-1", 1, vec![], false, false, None)
+            .await
+            .expect("heartbeat ok");
+        c.submit_observations(&SubmitObservationsRequest {
+            node_id: "node-1".to_string(),
+            observations: vec![],
+        })
+        .await
+        .expect("submit ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both requests must reach the server");
+        let want = format!("daemon/{}", env!("CARGO_PKG_VERSION"));
+        for v in seen.iter() {
+            let v = v.as_deref().expect("X-Azimuth-Client header must be present");
+            assert_eq!(v, want);
+            assert!(is_valid_client_header(v), "header value must match the contract: {v}");
+        }
     }
 }
