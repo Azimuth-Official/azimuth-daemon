@@ -756,10 +756,55 @@ fn z4_d3_failure_after_an_eviction_is_charged_to_the_sent_chunk() {
     let sent = buf.chunk(now).expect("a ready chunk");
     assert_eq!(sent[0].1, q, "Q is the ready chunk although P is in front");
     let (p_before, q_before) = (z4_fails(&buf, &p), z4_fails(&buf, &q));
-    // a later push evicts the old V by age, which clears the in-flight marker
+    // a later push evicts the old V by age; the in-flight marker for Q is kept
     let evicted = buf.push(vec![obs_n(4)], t0 + Duration::from_secs(31 * 60));
     assert!(evicted >= 1, "the old entry must be age-evicted");
     buf.failed(None, now);
     assert_eq!(z4_fails(&buf, &p), p_before, "front chunk P was not the one sent");
     assert_eq!(z4_fails(&buf, &q), q_before + 1, "the sent chunk Q takes the failure");
+}
+
+/// A chunk [A, B, C] in flight whose middle member B has an old `queued_at` (non-monotone
+/// push times), followed by unsent E, F. A push 31 minutes after B was queued evicts only B.
+/// Returns the buffer and the chunk's keys.
+fn z4_chunk_with_old_middle_member() -> (PendingBuffer, Vec<String>, Instant) {
+    let buf = PendingBuffer::default();
+    let t0 = Instant::now();
+    let late = t0 + Duration::from_secs(20 * 60);
+    buf.push(vec![obs_n(1)], late); // A
+    buf.push(vec![obs_n(2)], t0); // B: old queued_at
+    buf.push(vec![obs_n(3)], late); // C
+    let keys: Vec<String> = buf.chunk(late).unwrap().into_iter().map(|(_, k)| k).collect();
+    assert_eq!(keys.len(), 3);
+    buf.push(vec![obs_n(4), obs_n(5)], late); // E, F: not in the chunk
+    let evicted = buf.push(vec![obs_n(6)], t0 + Duration::from_secs(31 * 60)); // G
+    assert_eq!(evicted, 1, "only B is older than the age limit");
+    assert!(!z4_keys(&buf).contains(&keys[1]));
+    (buf, keys, late)
+}
+
+/// D1 (direct): a NON-head member of the chunk in flight is evicted; `done` with the full key
+/// list must never remove an unsent neighbour.
+#[test]
+fn z4_d1_direct_done_after_a_middle_member_was_evicted_keeps_unsent_entries() {
+    let (buf, keys, _) = z4_chunk_with_old_middle_member();
+    let unsent: Vec<String> = z4_keys(&buf).into_iter().filter(|k| !keys.contains(k)).collect();
+    assert_eq!(unsent.len(), 3, "E, F and G are unsent");
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    buf.done(&refs);
+    let after = z4_keys(&buf);
+    for u in &unsent {
+        assert!(after.contains(u), "done() removed the unsent entry {u}");
+    }
+}
+
+/// The marker of the chunk in flight shrinks by the evicted member, and a following failure
+/// is charged to the chunk head.
+#[test]
+fn z4_d3_marker_length_shrinks_by_the_evicted_members() {
+    let (buf, keys, late) = z4_chunk_with_old_middle_member();
+    assert_eq!(buf.lock().cur, Some((keys[0].clone(), 2)), "A and C remain of the 3-entry chunk");
+    buf.failed(None, late);
+    assert_eq!(z4_fails(&buf, &keys[0]), 1);
+    assert_eq!(z4_fails(&buf, &keys[2]), 0);
 }

@@ -144,11 +144,15 @@ impl Default for Inner {
 }
 
 impl Inner {
-    /// Index of the entry holding `keys[0]`, if the whole run is still queued.
+    /// Index of the entry holding `keys[0]`, if the whole run is still queued, in order and
+    /// contiguous. Any mismatch (a member was evicted) counts as not found, so the caller
+    /// never removes entries that were not in the run.
     fn locate(&self, keys: &[&str]) -> Option<usize> {
         let first = keys.first()?;
         let p = self.items.iter().position(|e| e.key == *first)?;
-        (p + keys.len() <= self.items.len()).then_some(p)
+        (p + keys.len() <= self.items.len()
+            && keys.iter().zip(self.items.iter().skip(p)).all(|(k, e)| e.key == *k))
+        .then_some(p)
     }
 
     /// Remove `len` entries from `p`, keeping the byte total right.
