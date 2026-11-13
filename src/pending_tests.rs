@@ -647,3 +647,119 @@ async fn r2_transient_faults_cost_seconds_not_half_a_minute() {
     flush(&buf, &client, "n1", vec![], secs(t0, 17)).await;
     assert_eq!(buf.len(), 0, "{} requests", seen.lock().unwrap().len());
 }
+
+// ---- Z4 review follow-ups (pending.rs data-affecting SHOULDs) ----
+
+fn z4_keys(buf: &PendingBuffer) -> Vec<String> {
+    buf.lock().items.iter().map(|e| e.key.clone()).collect()
+}
+
+/// D1: whatever pushes, evictions and rotations happen while a chunk is in flight,
+/// `done(chunk)` may remove only the keys of that chunk, never an unsent neighbour.
+#[test]
+fn z4_d1_done_removes_only_the_keys_of_the_chunk() {
+    let mut total = (0usize, 0usize, 0usize);
+    for seed in 1..=40u64 {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut rnd = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let buf = PendingBuffer::default();
+        let mut now = Instant::now();
+        let mut n = 0u64;
+        let mut inflight: Option<Vec<String>> = None;
+        for _ in 0..4000 {
+            match rnd(6) {
+                0 | 1 => {
+                    let k = 1 + rnd(30);
+                    buf.push((n..n + k).map(obs_n).collect(), now);
+                    n += k;
+                }
+                2 => {
+                    now += Duration::from_secs(rnd(400));
+                    buf.push(vec![obs_n(n)], now);
+                    n += 1;
+                }
+                3 => {
+                    if inflight.is_none() {
+                        inflight = buf.chunk(now).map(|c| c.into_iter().map(|(_, k)| k).collect());
+                    }
+                }
+                4 => {
+                    // a failed attempt of the current chunk (may rotate it behind the others)
+                    if inflight.take().is_some() {
+                        buf.failed(None, now);
+                    }
+                    now += Duration::from_secs(rnd(120));
+                }
+                _ => {
+                    if let Some(keys) = inflight.take() {
+                        let before = z4_keys(&buf);
+                        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                        buf.done(&refs);
+                        let after = z4_keys(&buf);
+                        for r in before.iter().filter(|k| !after.contains(k)) {
+                            assert!(keys.contains(r), "seed {seed}: done() removed an unsent entry {r}");
+                        }
+                    }
+                }
+            }
+        }
+        // Control: the run really exercised delivery, age/count eviction and rotation.
+        let s = buf.stats();
+        total = (total.0 + s.delivered, total.1 + s.evicted_total, total.2 + s.rotated_total);
+    }
+    assert!(total.0 > 0 && total.1 > 0 && total.2 > 0, "scenario too weak: {total:?}");
+}
+
+fn z4_fails(buf: &PendingBuffer, key: &str) -> u32 {
+    buf.lock().items.iter().find(|e| e.key == key).map_or(u32::MAX, |e| e.fails)
+}
+
+/// D3: an eviction between `chunk()` and `failed()` must not move the failure onto the
+/// front chunk; the chunk that was actually sent (here not the front one) takes it.
+#[test]
+fn z4_d3_failure_after_an_eviction_is_charged_to_the_sent_chunk() {
+    let buf = PendingBuffer::default();
+    let t0 = Instant::now();
+    let mut now = t0 + Duration::from_secs(20 * 60);
+    buf.push(vec![obs_n(1)], now);
+    buf.shrink(2); // one observation per request
+    // P alone fails five times (no rotation without other chunks waiting).
+    let p = buf.chunk(now).unwrap()[0].1.clone();
+    buf.failed(None, now);
+    for _ in 0..4 {
+        now += Duration::from_secs(400);
+        assert_eq!(buf.chunk(now).unwrap()[0].1, p);
+        buf.failed(None, now);
+    }
+    // Q arrives; P's sixth failure rotates it behind Q with a long cooldown.
+    buf.push(vec![obs_n(2)], now);
+    now += Duration::from_secs(400);
+    assert_eq!(buf.chunk(now).unwrap()[0].1, p);
+    buf.failed(None, now);
+    // Q fails three times, the third rotates it behind P; P is still cooling.
+    let mut q = String::new();
+    for gap in [6u64, 6, 11] {
+        now += Duration::from_secs(gap);
+        let c = buf.chunk(now).expect("Q ready");
+        q = c[0].1.clone();
+        assert_ne!(q, p);
+        buf.failed(None, now);
+    }
+    now += Duration::from_secs(21);
+    // Now P is cooling (long) and Q is ready; V (old) sits behind them.
+    buf.push(vec![obs_n(3)], t0);
+    let sent = buf.chunk(now).expect("a ready chunk");
+    assert_eq!(sent[0].1, q, "Q is the ready chunk although P is in front");
+    let (p_before, q_before) = (z4_fails(&buf, &p), z4_fails(&buf, &q));
+    // a later push evicts the old V by age, which clears the in-flight marker
+    let evicted = buf.push(vec![obs_n(4)], t0 + Duration::from_secs(31 * 60));
+    assert!(evicted >= 1, "the old entry must be age-evicted");
+    buf.failed(None, now);
+    assert_eq!(z4_fails(&buf, &p), p_before, "front chunk P was not the one sent");
+    assert_eq!(z4_fails(&buf, &q), q_before + 1, "the sent chunk Q takes the failure");
+}

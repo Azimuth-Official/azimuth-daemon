@@ -206,6 +206,12 @@ impl Inner {
         if total == 0 {
             return (0, 0, 0, 0);
         }
+        // The chunk in flight stays the current one when its head survives (its length
+        // shrinks by the members evicted); otherwise a failure falls back to the front chunk.
+        let cur = self.cur.take().and_then(|(k, len)| {
+            let p = self.items.iter().position(|e| e.key == k)?;
+            (!remove[p]).then(|| (k, (p..(p + len).min(n)).filter(|i| !remove[*i]).count()))
+        });
         // Rebuild; a removed chunk head hands its failure state to the next entry of its group.
         let old = std::mem::take(&mut self.items);
         let mut carry: Option<(u64, u32, Option<Instant>)> = None;
@@ -226,7 +232,7 @@ impl Inner {
         }
         self.pending_bytes = left_bytes;
         self.evicted_total += total;
-        self.cur = None;
+        self.cur = cur;
         (total, by_age, by_count, by_bytes)
     }
 }
